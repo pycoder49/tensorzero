@@ -567,7 +567,10 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
             match message {
                 OpenAICompatibleMessage::System(msg) => {
                     let system_content = convert_openai_message_content(msg.content.clone())?;
+                    println!("Finished converting system message content into InputMessageContent");
+                    println!("System content: {:#?}", system_content);
                     for content in system_content {
+                        println!("############# MATCHING SYSTEM CONTENT TO IMC TYPE #############");
                         system_messages.push(match content {
                             InputMessageContent::Text(TextKind::LegacyValue { value }) => value,
                             InputMessageContent::Text(TextKind::Text { text }) => {
@@ -585,6 +588,7 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
                                 .into())
                             }
                         });
+                        println!("pushed into system_messages: {:#?}", system_messages[system_messages.len() - 1]);
                     }
                 }
                 OpenAICompatibleMessage::User(msg) => {
@@ -592,6 +596,8 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
                         role: Role::User,
                         content: convert_openai_message_content(msg.content)?,
                     });
+                    println!("Converted user message content into InputMessageContent");
+                    println!("from the messages list: {:#?}", messages[messages.len() - 1]);
                 }
                 OpenAICompatibleMessage::Assistant(msg) => {
                     let mut message_content = Vec::new();
@@ -630,6 +636,8 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
                 }
             }
         }
+
+        println!("Everything is converted to InputMessageContent");
 
         if system_messages.len() <= 1 {
             if system_messages.len() == 1 && !first_system {
@@ -670,6 +678,8 @@ enum OpenAICompatibleContentBlock {
     Text(TextContent),
     ImageUrl { image_url: OpenAICompatibleImageUrl },
     File { file: OpenAICompatibleFile },
+    #[serde(rename = "tensorzero::raw_text")]
+    RawText { value: String },
 }
 
 #[derive(Deserialize, Debug)]
@@ -689,8 +699,6 @@ struct OpenAICompatibleFile {
 #[derive(Debug)]
 // Two mutually exclusive modes - the standard OpenAI text, and our special TensorZero mode
 pub enum TextContent {
-    /// "content": [{"type": "tensorzero::raw_text", "value": "Write a haiku about artificial intelligence"}]
-    RawText { value: String },
     /// A normal openai text content block: `{"type": "text", "text": "Some content"}`. The `type` key comes from the parent `OpenAICompatibleContentBlock`
     Text { text: String },
     /// A special TensorZero mode: `{"type": "text", "tensorzero::arguments": {"custom_key": "custom_val"}}`.
@@ -703,10 +711,9 @@ impl<'de> Deserialize<'de> for TextContent {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let mut object: Map<String, Value> = Map::deserialize(de)?;
         let text = object.remove("text");
-        let raw_text = object.remove("tensorzero::raw_text");
         let arguments = object.remove("tensorzero::arguments");
-        match (text, raw_text, arguments) {
-            (Some(text), None, None) => Ok(TextContent::Text {
+        match (text, arguments) {
+            (Some(text), None) => Ok(TextContent::Text {
                 text: match text {
                     Value::String(text) => text,
                     _ => return Err(serde::de::Error::custom(
@@ -714,15 +721,7 @@ impl<'de> Deserialize<'de> for TextContent {
                     )),
                 },
             }),
-            (None, Some(arguments), None) => Ok(TextContent::RawText {
-                value: match arguments {
-                    Value::String(value) => value,
-                    _ => return Err(serde::de::Error::custom(
-                        "`tensorzero::raw_text` must be a string when using `\"type\": \"text\"`",
-                    )),
-                },
-            }),
-            (None, None, Some(arguments)) => Ok(TextContent::TensorZeroArguments {
+            (None, Some(arguments)) => Ok(TextContent::TensorZeroArguments {
                 tensorzero_arguments: match arguments {
                     Value::Object(arguments) => arguments,
                     _ => return Err(serde::de::Error::custom(
@@ -730,15 +729,11 @@ impl<'de> Deserialize<'de> for TextContent {
                     )),
                 },
             }),
-            (Some(_), None, Some(_)) => Err(serde::de::Error::custom(
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
                 "Only one of `text` or `tensorzero::arguments` can be set when using `\"type\": \"text\"`",
             )),
-            (None, None, None) => Err(serde::de::Error::custom(
-                "Either `text` or `tensorzero::arguments` must be set when using `\"type\": \"text\"` or 
-                `tensorzero::raw_text` must be set when using `\"type\": \"tensorzero::raw_text\"`",
-            )),
-            _ => Err(serde::de::Error::custom(
-                "Invalid content block: must be one of `text`, `tensorzero::raw_text`, or `tensorzero::arguments`",
+            (None, None) => Err(serde::de::Error::custom(
+                "Either `text` or `tensorzero::arguments` must be set when using `\"type\": \"text\"`",
             )),
         }
     }
@@ -764,6 +759,7 @@ fn parse_base64_image_data_url(url: &str) -> Result<(MediaType, &str), Error> {
 }
 
 fn convert_openai_message_content(content: Value) -> Result<Vec<InputMessageContent>, Error> {
+    println!("Made it inside convert function");
     match content {
         Value::String(s) => Ok(vec![InputMessageContent::Text(TextKind::Text { text: s })]),
         Value::Array(a) => {
@@ -771,8 +767,18 @@ fn convert_openai_message_content(content: Value) -> Result<Vec<InputMessageCont
             for val in a {
                 let block = serde_json::from_value::<OpenAICompatibleContentBlock>(val.clone());
                 let output = match block {
-                    Ok(OpenAICompatibleContentBlock::Text(TextContent::RawText { text })) => InputMessageContent::Text(TextKind::Text {text }),
-                    Ok(OpenAICompatibleContentBlock::Text(TextContent::TensorZeroArguments { tensorzero_arguments })) => InputMessageContent::Text(TextKind::Arguments { arguments: tensorzero_arguments }),
+                    Ok(OpenAICompatibleContentBlock::RawText{ value }) => {
+                        println!("Parsed raw text block content block ##########: {}", value);
+                        InputMessageContent::RawText{ value }
+                    }
+                    Ok(OpenAICompatibleContentBlock::Text(TextContent::Text { text })) => {
+                        println!("Parsed text: {}", text);
+                        InputMessageContent::Text(TextKind::Text { text })
+                    },
+                    Ok(OpenAICompatibleContentBlock::Text(TextContent::TensorZeroArguments { tensorzero_arguments })) => {
+                        println!("Parsed tensorzero arguments: {:#?}", tensorzero_arguments);
+                        InputMessageContent::Text(TextKind::Arguments { arguments: tensorzero_arguments })
+                    },
                     Ok(OpenAICompatibleContentBlock::ImageUrl { image_url }) => {
                         if image_url.url.scheme() == "data" {
                             let url_str = image_url.url.to_string();
@@ -815,6 +821,8 @@ fn convert_openai_message_content(content: Value) -> Result<Vec<InputMessageCont
                 };
                 outputs.push(output);
             }
+            println!("Got out of convert_openai_message_content function");
+            println!("Outputs: {:#?}", outputs);
             Ok(outputs)
         }
         _ => Err(ErrorDetails::InvalidOpenAICompatibleRequest {

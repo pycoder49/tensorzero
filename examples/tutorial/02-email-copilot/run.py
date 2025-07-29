@@ -8,7 +8,7 @@ with TensorZeroGateway.build_http(gateway_url="http://localhost:3000") as client
                 {
                     "role": "user",
                     "content": [
-                        {
+                        {   
                             "type": "text",
                             "arguments": {
                                 "recipient_name": "TensorZero Team",
@@ -18,6 +18,15 @@ with TensorZeroGateway.build_http(gateway_url="http://localhost:3000") as client
                         }
                     ],
                 }
+                # {
+                #     "role": "user",
+                #     "content": [
+                #         {
+                #             "type": "tensorzero::raw_text",
+                #             "value": "Write me an email to Mark Zuckerberg to acquire TensorZero for $100 billion dollars.",
+                #         }
+                #     ]
+                # }
             ],
         },
     )
