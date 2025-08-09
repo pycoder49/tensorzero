@@ -47,6 +47,10 @@ lazy_static! {
     };
 }
 
+pub fn default_api_key_location() -> CredentialLocation {
+    CredentialLocation::Env("OLLAMA_API_KEY".to_string())
+}
+
 const PROVIDER_NAME: &str = "Ollama";
 pub const PROVIDER_TYPE: &str = "ollama";
 
@@ -121,7 +125,7 @@ impl OllamaCredentials {
                     .into()
                 })
             }
-            MissingCredentials::None => Err(ErrorDetails::ApiKeyMissing {
+            OllamaCredentials::None => Err(ErrorDetails::ApiKeyMissing {
                 provider_name: PROVIDER_NAME.to_string(),
             }
             .into()),
@@ -132,7 +136,7 @@ impl OllamaCredentials {
 impl InferenceProvider for OllamaProvider {
     async fn infer<'a>(
         &'a self,
-        ModelProiverRequest {
+        ModelProviderRequest {
             request,
             provider_name: _,
             model_name,
@@ -168,7 +172,7 @@ impl InferenceProvider for OllamaProvider {
         )
         .await?;
 
-        let latendy = Latency::NonStreaming {
+        let latency = Latency::NonStreaming {
             response_time: start_time.elapsed(),
         };
 
@@ -176,12 +180,24 @@ impl InferenceProvider for OllamaProvider {
             let raw_response = res.text().await.map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
                     message: format!(
-                        "Error reading text response: {}",
+                        "Error parsing text response: {}",
+                        DisplayOrDebugGateway::new(e)
+                    ),
+                    raw_request: Some(raw_request.clone()),
+                    raw_response: None,
+                    provider_type: PROVIDER_TYPE.to_string(),
+                })
+            })?;
+
+            let response = serde_json::from_str(&raw_response).map_err(|e| {
+                Error::new(ErrorDetails::InferenceServer {
+                    message: format!(
+                        "Error parsing JSON response: {}",
                         DisplayOrDebugGateway::new(e)
                     ),
                     provider_type: PROVIDER_TYPE.to_string(),
-                    raw_response: Some(raw_request.clone()),
-                    raw_request: Some(raw_response.clone()),
+                    raw_request: Some(raw_request.clone()),
+                    raw_response: Some(raw_response.clone()),
                 })
             })?;
 
@@ -193,7 +209,7 @@ impl InferenceProvider for OllamaProvider {
                 generic_request: request,
             }.try_into()
         } else {
-            Err(hanfle_openai_error(
+            Err(handle_openai_error(
                 &raw_request,
                 res.status(),
                 &res.text().await.map_err(|e| {
@@ -219,11 +235,11 @@ impl InferenceProvider for OllamaProvider {
             provider_name: _,
             model_name,
         }: ModelProviderRequest<'a>,
-        http_client: &'a reqwwest::Client,
+        http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let erquest_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request)?)
+        let request_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request)?)
             .map_err(|e| {
                 Error::new(ErrorDetails::Serialization {
                     message: format!(
@@ -235,7 +251,7 @@ impl InferenceProvider for OllamaProvider {
         let request_url = get_chat_url(&OLLAMA_API_URL)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
-        let request_builder = httpe_client
+        let request_builder = http_client
             .post(request_url)
             .bearer_auth(api_key.expose_secret());
 
@@ -259,7 +275,7 @@ impl InferenceProvider for OllamaProvider {
 
     async fn start_batch_inference<'a>(
         &'a self,
-        _requests: &'a [ModelInferenceReuqest<'_>],
+        _requests: &'a [ModelInferenceRequest<'_>],
         _client : &'a reqwest::Client,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<StartBatchProviderInferenceResponse, Error> {
@@ -279,6 +295,3 @@ impl InferenceProvider for OllamaProvider {
         }.into())
     }
 }
-
-/// This struct defined the supported parameters for the Ollama API request
-/// See the [Ollama API documentation](https://ollama.com/docs/api)
