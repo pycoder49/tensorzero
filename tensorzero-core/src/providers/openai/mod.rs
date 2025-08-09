@@ -18,7 +18,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::cache::ModelProviderRequest;
-use crate::embeddings::{EmbeddingProvider, EmbeddingProviderResponse, EmbeddingRequest};
+use crate::embeddings::EmbeddingEncodingFormat;
+use crate::embeddings::{
+    Embedding, EmbeddingInput, EmbeddingProvider, EmbeddingProviderResponse, EmbeddingRequest,
+};
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{warn_discarded_thought_block, DisplayOrDebugGateway, Error, ErrorDetails};
 use crate::inference::types::batch::{BatchRequestRow, PollBatchInferenceResponse};
@@ -585,7 +588,12 @@ impl EmbeddingProvider for OpenAIProvider {
         dynamic_api_keys: &InferenceCredentials,
     ) -> Result<EmbeddingProviderResponse, Error> {
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
-        let request_body = OpenAIEmbeddingRequest::new(&self.model_name, &request.input);
+        let request_body = OpenAIEmbeddingRequest::new(
+            &self.model_name,
+            &request.input,
+            request.dimensions,
+            request.encoding_format,
+        );
         let request_url =
             get_embedding_url(self.api_base.as_ref().unwrap_or(&OPENAI_DEFAULT_BASE_URL))?;
         let start_time = Instant::now();
@@ -1132,7 +1140,7 @@ pub fn prepare_openai_messages<'a>(
     provider_type: &str,
 ) -> Result<Vec<OpenAIRequestMessage<'a>>, Error> {
     let mut openai_messages = Vec::with_capacity(messages.len());
-    for message in messages.iter() {
+    for message in messages {
         openai_messages.extend(tensorzero_to_openai_messages(message, provider_type)?);
     }
     if let Some(system_msg) =
@@ -1244,7 +1252,7 @@ fn tensorzero_to_openai_user_messages<'a>(
     let mut messages = Vec::new();
     let mut user_content_blocks = Vec::new();
 
-    for block in content_blocks.iter() {
+    for block in content_blocks {
         match block {
             ContentBlock::Text(Text { text }) => {
                 user_content_blocks.push(OpenAIContentBlock::Text {
@@ -2058,12 +2066,24 @@ fn openai_to_tensorzero_chunk(
 #[derive(Debug, Serialize)]
 struct OpenAIEmbeddingRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    input: &'a EmbeddingInput,
+    dimensions: Option<u32>,
+    encoding_format: EmbeddingEncodingFormat,
 }
 
 impl<'a> OpenAIEmbeddingRequest<'a> {
-    fn new(model: &'a str, input: &'a str) -> Self {
-        Self { model, input }
+    fn new(
+        model: &'a str,
+        input: &'a EmbeddingInput,
+        dimensions: Option<u32>,
+        encoding_format: EmbeddingEncodingFormat,
+    ) -> Self {
+        Self {
+            model,
+            input,
+            dimensions,
+            encoding_format,
+        }
     }
 }
 
@@ -2082,7 +2102,7 @@ struct OpenAIEmbeddingResponseWithMetadata<'a> {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct OpenAIEmbeddingData {
-    embedding: Vec<f32>,
+    embedding: Embedding,
 }
 
 impl<'a> TryFrom<OpenAIEmbeddingResponseWithMetadata<'a>> for EmbeddingProviderResponse {
@@ -2106,31 +2126,15 @@ impl<'a> TryFrom<OpenAIEmbeddingResponseWithMetadata<'a>> for EmbeddingProviderR
             })
         })?;
 
-        if response.data.len() != 1 {
-            return Err(Error::new(ErrorDetails::InferenceServer {
-                message: "Expected exactly one embedding in response".to_string(),
-                raw_request: Some(raw_request.clone()),
-                raw_response: Some(raw_response.clone()),
-                provider_type: PROVIDER_TYPE.to_string(),
-            }));
-        }
-        let embedding = response
+        let embeddings = response
             .data
             .into_iter()
-            .next()
-            .ok_or_else(|| {
-                Error::new(ErrorDetails::InferenceServer {
-                    message: "Expected exactly one embedding in response".to_string(),
-                    raw_request: Some(raw_request.clone()),
-                    raw_response: Some(raw_response.clone()),
-                    provider_type: PROVIDER_TYPE.to_string(),
-                })
-            })?
-            .embedding;
+            .map(|embedding| embedding.embedding)
+            .collect();
 
         Ok(EmbeddingProviderResponse::new(
-            embedding,
-            request.input.to_string(),
+            embeddings,
+            request.input.clone(),
             raw_request,
             raw_response,
             response.usage.into(),
