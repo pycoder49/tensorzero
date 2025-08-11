@@ -1,53 +1,39 @@
-use std::{borrow::Cow, sync::OnceLock, time::Duration};
-
-use futures::StreamExt;
-use lazy_static::lazy_static;
+use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::StatusCode;
-use reqwest_eventsource::{Event, EventSource};
+use reqwest_eventsource::Event;
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::de::IntoDeserializer;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+use std::borrow::Cow;
+use std::sync::OnceLock;
+use std::time::Duration;
+use minijinja::filters::default;
 use tokio::time::Instant;
-use url::Url;
 
-use crate::{
-    cache::ModelProviderRequest,
-    endpoints::inference::InferenceCredentials,
-    error::{DisplayOrDebugGateway, Error, ErrorDetails},
-    inference::{
-        types::{
-            batch::{
-                BatchRequestRow, PollBatchInferenceResponse, StartBatchProviderInferenceResponse,
-            },
-            ContentBlockChunk, ContentBlockOutput, FinishReason, Latency, ModelInferenceRequest,
-            ModelInferenceRequestJsonMode, PeekableProviderInferenceResponseStream,
-            ProviderInferenceResponse, ProviderInferenceResponseArgs,
-            ProviderInferenceResponseChunk, ProviderInferenceResponseStreamInner, TextChunk, Usage,
-        },
-        InferenceProvider,
-    },
-    model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider},
-    providers::helpers::{
-        check_new_tool_call_name, inject_extra_request_data_and_send,
-        inject_extra_request_data_and_send_eventsource,
-    },
-    tool::{ToolCall, ToolCallChunk, ToolChoice},
+use crate::cache::ModelProviderRequest;
+use crate::endpoints::inference::InferenceCredentials;
+use crate::error::{warn_discarded_thought_block, DisplayOrDebugGateway, Error, ErrorDetails};
+use crate::inference::types::batch::{BatchRequestRow, PollBatchInferenceResponse};
+use crate::inference::types::resolved_input::FileWithPath;
+use crate::inference::types::{
+    batch::StartBatchProviderInferenceResponse, ContentBlock, ContentBlockChunk,
+    ContentBlockOutput, Latency, ModelInferenceRequest, ModelInferenceRequestJsonMode,
+    PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
+    ProviderInferenceResponseChunk, RequestMessage, Role, Text, TextChunk, Usage,
+};
+use crate::inference::types::{
+    FinishReason, ProviderInferenceResponseArgs, ProviderInferenceResponseStreamInner,
+};
+use crate::inference::{InferenceProvider, TensorZeroEventError};
+use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
+use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
+
+use crate::providers::helpers::{
+    inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
 
-use super::openai::{
-    get_chat_url, handle_openai_error, prepare_openai_messages, prepare_openai_tools,
-    stream_openai, OpenAIRequestMessage, OpenAIResponse, OpenAIResponseChoice, OpenAITool,
-    OpenAIToolChoice, StreamOptions,
-};
-use crate::inference::TensorZeroEventError;
-
-lazy_static! {
-    static ref OLLAMA_API_URL: Url = {
-        #[expect(clippy::expect_used)]
-        Url::parse("http://localhost:11434/api").expect("Failed to parse OLLAMA_API_URL")
-    };
-}
-
-pub fn default_api_key_location() -> CredentialLocation {
+fn default_api_key_location() -> CredentialLocation {
     CredentialLocation::Env("OLLAMA_API_KEY".to_string())
 }
 
@@ -57,7 +43,7 @@ pub const PROVIDER_TYPE: &str = "ollama";
 #[derive(Debug, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export))]
-pub struct OllamaProvider{
+pub struct OllamaProvider {
     model_name: String,
     #[serde(skip)]
     credentials: OllamaCredentials,
@@ -65,7 +51,7 @@ pub struct OllamaProvider{
 
 static DEFAULT_CREDENTIALS: OnceLock<OllamaCredentials> = OnceLock::new();
 
-impl OllamaProvider{
+impl OllamaProvider {
     pub fn new(
         model_name: String,
         api_key_location: Option<CredentialLocation>,
@@ -74,16 +60,15 @@ impl OllamaProvider{
             api_key_location,
             default_api_key_location(),
             PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS
+            &DEFAULT_CREDENTIALS,
         )?;
-
         Ok(OllamaProvider {
             model_name,
             credentials,
         })
     }
 
-    pub fn model_name(&self) -> &str {
+    pub fn model_name(&self) -> &str{
         &self.model_name
     }
 }
@@ -102,6 +87,7 @@ impl TryFrom<Credential> for OllamaCredentials {
         match credentials {
             Credential::Static(key) => Ok(OllamaCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(OllamaCredentials::Dynamic(key_name)),
+            Credential::None => Ok(OllamaCredentials::None),
             Credential::Missing => Ok(OllamaCredentials::None),
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for Ollama provider".to_string(),
@@ -114,21 +100,17 @@ impl OllamaCredentials {
     pub fn get_api_key<'a>(
         &'a self,
         dynamic_api_keys: &'a InferenceCredentials,
-    ) -> Result<&'a SecretString, Error> {
+    ) -> Result<Option<&'a SecretString>, Error> {
         match self {
-            OllamaCredentials::Static(api_key) => Ok(api_key),
+            OllamaCredentials::Static(api_key) => Ok(Some(api_key)),
             OllamaCredentials::Dynamic(key_name) => {
-                dynamic_api_keys.get(key_name).ok_or_else({
+                Some(dynamic_api_keys.get(key_name).ok_or_else(|| {
                     ErrorDetails::ApiKeyMissing {
                         provider_name: PROVIDER_NAME.to_string(),
-                    }
-                    .into()
-                })
+                    }.into()
+                })).transpose()
             }
-            OllamaCredentials::None => Err(ErrorDetails::ApiKeyMissing {
-                provider_name: PROVIDER_NAME.to_string(),
-            }
-            .into()),
+            OllamaCredentials::None => Ok(None),
         }
     }
 }
@@ -136,51 +118,51 @@ impl OllamaCredentials {
 impl InferenceProvider for OllamaProvider {
     async fn infer<'a>(
         &'a self,
-        ModelProviderRequest {
-            request,
-            provider_name: _,
-            model_name,
-        }: ModelProviderRequest<'a>,
+        request: ModelProviderRequest<'a>,
         http_client: &'a reqwest::Client,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing Ollama request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
-        let request_url = get_chat_url(&OLLAMA_API_URL)?;
+        let request_url = "http://localhost:11434/api/generate".to_string();
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
-        let request_builder = http_client
-            .post(request_url)
-            .bearer_auth(api_key.expose_secret());
+
+        let request_body =
+            serde_json::to_value(OllamaRequest::new(&self.model_name, request.request)?).map_err(
+                |e| {
+                    Error::new(ErrorDetails::Serialization {
+                        message: format!(
+                            "Error serializing Ollama request: {}",
+                            DisplayOrDebugGateway::new(e)
+                        ),
+                    })
+                },
+            )?;
+
+        let mut request_builder = http_client.post(request_url);
+        if let Some(key) = api_key {
+            request_builder = request_builder.bearer_auth(key.expose_secret());
+        }
 
         let (res, raw_request) = inject_extra_request_data_and_send(
             PROVIDER_TYPE,
-            &request.extra_body,
-            &request.extra_headers,
+            &request.request.extra_body,
+            &request.request.extra_headers,
             model_provider,
-            model_name,
+            request.model_name,
             request_body,
             request_builder,
-        )
-        .await?;
+        ).await?;
 
-        let latency = Latency::NonStreaming {
+        let latency = Latency::NonStreaming{
             response_time: start_time.elapsed(),
         };
 
         if res.status().is_success() {
             let raw_response = res.text().await.map_err(|e| {
-                Error::new(ErrorDetails::InferenceServer {
+                Error::new(ErrorDetails::InfereceServer {
                     message: format!(
-                        "Error parsing text response: {}",
+                        "Error parsing response: {}",
                         DisplayOrDebugGateway::new(e)
                     ),
                     raw_request: Some(raw_request.clone()),
@@ -189,28 +171,27 @@ impl InferenceProvider for OllamaProvider {
                 })
             })?;
 
-            let response = serde_json::from_str(&raw_response).map_err(|e| {
+            let response_body = serde_json::from_str(&raw_response).map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
                     message: format!(
-                        "Error parsing JSON response: {}",
+                        "Error parsing response: {}",
                         DisplayOrDebugGateway::new(e)
                     ),
-                    provider_type: PROVIDER_TYPE.to_string(),
                     raw_request: Some(raw_request.clone()),
                     raw_response: Some(raw_response.clone()),
+                    provider_type: PROVIDER_TYPE.to_string(),
                 })
             })?;
 
-            OllamaResponseWithMetaData {
-                response,
+            Ok(OllamaResponseWithMetadata {
+                response: response_body,
                 latency,
                 raw_response,
-                raw_request,
+                raw_request: raw_request.clone(),
                 generic_request: request,
-            }.try_into()
+            }.try_into()?)
         } else {
-            Err(handle_openai_error(
-                &raw_request,
+            Err(handle_ollama_error(
                 res.status(),
                 &res.text().await.map_err(|e| {
                     Error::new(ErrorDetails::InferenceServer {
@@ -226,72 +207,5 @@ impl InferenceProvider for OllamaProvider {
                 PROVIDER_TYPE,
             ))
         }
-    }
-
-    async fn infer_stream<'a>(
-        &'a self,
-        ModelProviderRequest {
-            request,
-            provider_name: _,
-            model_name,
-        }: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
-        dynamic_api_keys: &'a InferenceCredentials,
-        model_provider: &'a ModelProvider,
-    ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing Ollama request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
-        let request_url = get_chat_url(&OLLAMA_API_URL)?;
-        let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
-        let start_time = Instant::now();
-        let request_builder = http_client
-            .post(request_url)
-            .bearer_auth(api_key.expose_secret());
-
-        let (event_source, raw_request) = inject_extra_request_data_and_send_eventsource(
-            PROVIDER_TYPE,
-            &request.extra_body,
-            &request.extra_headers,
-            model_provider,
-            model_name,
-            request_body,
-            request_builder,
-        ).await?;
-
-        let stream = stream_openai(
-            PROVIDER_TYPE.to_string(),
-            event_source.map_err(TensorZeroEventError::EventSource),
-            start_time,
-        ).peekable();
-        Ok((stream, raw_request))
-    }
-
-    async fn start_batch_inference<'a>(
-        &'a self,
-        _requests: &'a [ModelInferenceRequest<'_>],
-        _client : &'a reqwest::Client,
-        _dynamic_api_keys: &'a InferenceCredentials,
-    ) -> Result<StartBatchProviderInferenceResponse, Error> {
-        Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
-            provider_type: "Ollama".to_string(),
-        }.into())
-    }
-
-    async fn poll_batch_inference<'a>(
-        &'a self,
-        _batch_request: &'a BatchRequestRow<'a>,
-        _http_client: &'a reqwest::Client,
-        _synamic_api_keys: &'a InferenceCredentials,
-    ) -> Result<PollBatchInferenceResponse, Error> {
-        Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
-            provider_type: PROVIDER_TYPE.to_string(),
-        }.into())
     }
 }
