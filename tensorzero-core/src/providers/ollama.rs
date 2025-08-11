@@ -208,4 +208,132 @@ impl InferenceProvider for OllamaProvider {
             ))
         }
     }
+
+    async fn infer_stream<'a>(
+        &'a self,
+        ModelProviderRequest {
+            request,
+            provider_name: _,
+            model_name,
+        }: ModelProviderRequest<'a>,
+        http_client: &'a reqwest::Client,
+        dynamic_api_keys: &'a InferenceCredentials,
+        model_provider: &'a ModelProvider,
+    ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
+        let request_body = serde_json::to_value(GroupRequest::new(&self.model_name, request)?)
+            .map_err(|e| {
+                Error::new(ErrorDetails::Serialization {
+                    message: format!(
+                        "Error serializing Ollama request: {}",
+                        DisplayOrDebugGateway::new(e)
+                    ),
+                })
+            })?;
+        let request_url = "http://localhost:11434/api/generate".to_string();
+        let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
+        let start_time = Instant::now();
+        let mut request_builder = http_client.post(request_url);
+        if let Some(key) = api_key {
+            request_builder = request_builder.bearer_auth(key.expose_secret());
+        }
+        let (event_source, raw_request) = inject_extra_request_data_and_send_eventsource(
+            PROVIDER_TYPE,
+            &request.extra_body,
+            &request.extra_headers,
+            model_provider,
+            model_name,
+            request_body,
+            request_builder,
+        ).await?;
+        let stream = stream_ollama(
+            PROVIDER_TYPE.to_string(),
+            event_source.map_err(TensorZeroEventError::EventSource),
+            start_time,
+        ).peekable();
+        Ok((stream, raw_request))
+    }
+
+    async fn start_batch_inference<'a>(
+        &'a self,
+        _requests: &'a [ModelInferenceRequest<'_>],
+        _client: &'a reqwest::Client,
+        _dynamic_api_keys: &'a InferenceCredentials,
+    ) -> Result<StartBatchProviderInferenceResponse, Error> {
+        Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
+            provider_type: PROVIDER_TYPE.to_string();
+        }.into())
+    }
+
+    async fn poll_batch_inference<'a>(
+        &'a self,
+        _batch_request: &'a BatchRequestRow<'a>,
+        _http_client: &'a reqwest::Client,
+        _dynamic_api_keys: &'a InferenceCredentials,
+    ) -> Result<PollBatchInferenceResponse, Error> {
+        Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
+            provider_type: PROVIDER_TYPE.to_string();
+        }.into())
+    }
+}
+
+pub async fn convert_stream_error(provider_type: String, e: reqwest_eventsource::Error) -> Error {
+    let message = e.to_string();
+    let mut raw_response = None;
+    if let reqwest_eventsource::Error::InvalidStatusCode(_, resp) = e {
+        raw_response = resp.text().await.ok();
+    }
+    ErrorDetails::InferenceServer {
+        message,
+        raw_request: None,
+        raw_response,
+        provider_type,
+    }.into()
+}
+
+pub fn stream_groq(
+    provider_type: String,
+    event_source: impl Stream<Item = Result<Event, TensorZeroEventError>> + Send + 'static,
+    start_time: Instant,
+) -> ProviderInferenceResponseStreamInner {
+    let mut tool_call_ids = Vec::new();
+    Box::pin(async_stream::stream! {
+        futures::pin_mut!(event_source);
+        while let Some(ev) = event_source.next().await {
+            match ev {
+                Err(e) => {
+                    match e {
+                        TensorZeroEventError::TensorZero(e) => {
+                            yield Err(e);
+                        }
+                        TensorZeroEventError::EventSource(e) => {
+                            yield Err(convert_stream_error(provider_type.clone(), e).await);
+                        }
+                    }
+                }
+                Ok(event) => match event {
+                    Event::Open => continue,
+                    Event::Message(message) => {
+                        if message.data == "[DONE]" {
+                            break;
+                        }
+                        let data: Result<OllamaChatChunk, Error> =
+                            serde_json::from_str(&message.data).map_err(|e| Error::new(ErrorDetails::InferenceServer {
+                                message: format!(
+                                    "Error parsing Ollama chunk. Error: {e}",
+                                    ),
+                                raw_request: None,
+                                raw_response: Some(message.data.clone()),
+                                provider_type: provider_type.clone(),
+                            }));
+
+                        let latency = start_time.elapsed();
+                        let stream_message = data.and_then(|d| {
+                            ollama_to_tensorzero_chunk(d, latency, &mut tool_call_ids)
+                        });
+                        yield stream_message;
+                    }
+                },
+            }
+        }
+    })
 }
