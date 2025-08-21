@@ -26,7 +26,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::cache::CacheParamsOptions;
-use crate::config_parser::UninitializedVariantInfo;
+use crate::config::UninitializedVariantInfo;
 use crate::embeddings::{Embedding, EmbeddingInput};
 use crate::endpoints::embeddings::Params as EmbeddingParams;
 use crate::endpoints::inference::{
@@ -107,7 +107,7 @@ pub async fn inference_handler(
         .into()),
     }?;
 
-    let response = inference(config, &http_client, clickhouse_connection_info, params).await?;
+    let response = inference(config, &http_client, clickhouse_connection_info, params, ()).await?;
 
     match response {
         InferenceOutput::NonStreaming(response) => {
