@@ -151,6 +151,42 @@ function renderContentBlock(
 
     case "file_error":
       return <FileErrorMessage key={key} error="Failed to retrieve file" />;
+
+    case "unknown":
+      // TODO: code editor should format as JSON by default
+      return (
+        <TextMessage
+          key={key}
+          label="Unknown Content"
+          content={JSON.stringify(block.data)}
+        />
+      );
+
+    case "thought":
+      return (
+        <TextMessage
+          key={key}
+          label="Thought"
+          content={block.text || ""}
+          isEditing={isEditing}
+          onChange={(updatedText) => {
+            onChange?.({ ...block, text: updatedText });
+          }}
+        />
+      );
+
+    case "template":
+      return (
+        <ParameterizedMessage
+          key={key}
+          parameters={block.arguments}
+          templateName={block.name}
+          isEditing={isEditing}
+          onChange={(updatedArguments) => {
+            onChange?.({ ...block, arguments: updatedArguments });
+          }}
+        />
+      );
   }
 }
 

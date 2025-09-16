@@ -50,9 +50,7 @@ async fn test_datapoint_insert_synthetic_chat() {
     let status = resp.status();
     let resp_json = resp.json::<Value>().await.unwrap();
 
-    if !status.is_success() {
-        panic!("Bad request: {resp_json:?}");
-    }
+    assert!(status.is_success(), "Bad request: {resp_json:?}");
 
     let id: Uuid = resp_json
         .get("id")
@@ -686,9 +684,7 @@ async fn test_datapoint_insert_synthetic_json() {
     let status = resp.status();
     let resp_json = resp.json::<Value>().await.unwrap();
 
-    if !status.is_success() {
-        panic!("Bad request: {resp_json:?}");
-    }
+    assert!(status.is_success(), "Bad request: {resp_json:?}");
 
     let id: Uuid = resp_json
         .get("id")
@@ -727,7 +723,7 @@ async fn test_datapoint_insert_synthetic_json() {
       "function_name": "json_success",
       "id": id,
       "episode_id": null,
-      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"US\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"US\"}}]}]}",
       "output": "{\"raw\":\"{\\\"answer\\\":\\\"Hello\\\"}\",\"parsed\":{\"answer\":\"Hello\"}}",
       "output_schema": "{}",
       "tags": {},
@@ -844,7 +840,7 @@ async fn test_datapoint_insert_synthetic_json() {
       "function_name": "json_success",
       "id": id,
       "episode_id": null,
-      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"US\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"US\"}}]}]}",
       "output": "{\"raw\":\"{\\\"answer\\\":\\\"New answer\\\"}\",\"parsed\":{\"answer\":\"New answer\"}}",
       "output_schema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}",
       "tags": {},
@@ -950,7 +946,7 @@ async fn test_datapoint_insert_synthetic_json() {
       "function_name": "json_success",
       "id": new_datapoint_id.to_string(),
       "episode_id": null,
-      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"US\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"US\"}}]}]}",
       "output": "{\"raw\":\"{\\\"answer\\\":\\\"New answer\\\"}\",\"parsed\":{\"answer\":\"New answer\"}}",
       "output_schema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}",
       "tags": {},
@@ -1085,11 +1081,7 @@ async fn test_create_delete_datapoint_json() {
         let first_content = content[0].clone();
         assert!(matches!(
             first_content,
-            StoredInputMessageContent::Text { .. }
-        ));
-        assert!(matches!(
-            first_content,
-            StoredInputMessageContent::Text { value: _, .. }
+            StoredInputMessageContent::Template { .. }
         ));
 
         // Verify the list datapoint input structure and content
@@ -1108,7 +1100,7 @@ async fn test_create_delete_datapoint_json() {
         let first_content = content[0].clone();
         assert!(matches!(
             first_content,
-            StoredInputMessageContent::Text { .. }
+            StoredInputMessageContent::Template { .. }
         ));
 
         // Get the output schema
@@ -1476,9 +1468,11 @@ async fn test_datapoint_insert_output_inherit_chat() {
         .await
         .unwrap();
 
-    if !resp.status().is_success() {
-        panic!("Bad request: {:?}", resp.text().await.unwrap());
-    }
+    assert!(
+        resp.status().is_success(),
+        "Bad request: {:?}",
+        resp.text().await.unwrap()
+    );
     let datapoint_id =
         Uuid::parse_str(resp.json::<Value>().await.unwrap()["id"].as_str().unwrap()).unwrap();
     assert_ne!(datapoint_id, inference_id);
@@ -1589,9 +1583,11 @@ async fn test_datapoint_insert_output_none_chat() {
         .await
         .unwrap();
 
-    if !resp.status().is_success() {
-        panic!("Bad request: {:?}", resp.text().await.unwrap());
-    }
+    assert!(
+        resp.status().is_success(),
+        "Bad request: {:?}",
+        resp.text().await.unwrap()
+    );
     let datapoint_id =
         Uuid::parse_str(resp.json::<Value>().await.unwrap()["id"].as_str().unwrap()).unwrap();
     assert_ne!(datapoint_id, inference_id);
@@ -1731,9 +1727,11 @@ async fn test_datapoint_insert_output_demonstration_chat() {
         .send()
         .await
         .unwrap();
-    if !response.status().is_success() {
-        panic!("Bad request: {:?}", response.text().await.unwrap());
-    }
+    assert!(
+        response.status().is_success(),
+        "Bad request: {:?}",
+        response.text().await.unwrap()
+    );
 
     // Sleep to ensure that we wrote to ClickHouse
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1753,9 +1751,11 @@ async fn test_datapoint_insert_output_demonstration_chat() {
         .await
         .unwrap();
 
-    if !resp.status().is_success() {
-        panic!("Bad request: {:?}", resp.text().await.unwrap());
-    }
+    assert!(
+        resp.status().is_success(),
+        "Bad request: {:?}",
+        resp.text().await.unwrap()
+    );
     let datapoint_id =
         Uuid::parse_str(resp.json::<Value>().await.unwrap()["id"].as_str().unwrap()).unwrap();
     assert_ne!(datapoint_id, inference_id);
@@ -1854,9 +1854,11 @@ async fn test_datapoint_insert_output_inherit_json() {
         .await
         .unwrap();
 
-    if !resp.status().is_success() {
-        panic!("Bad request: {:?}", resp.text().await.unwrap());
-    }
+    assert!(
+        resp.status().is_success(),
+        "Bad request: {:?}",
+        resp.text().await.unwrap()
+    );
     let datapoint_id =
         Uuid::parse_str(resp.json::<Value>().await.unwrap()["id"].as_str().unwrap()).unwrap();
     assert_ne!(datapoint_id, inference_id);
@@ -1889,7 +1891,7 @@ async fn test_datapoint_insert_output_inherit_json() {
       "function_name": "json_success",
       "id": datapoint_id.to_string(),
       "episode_id": episode_id.to_string(),
-      "input": "{\"system\":{\"assistant_name\":\"Alfred Pennyworth\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"Japan\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Alfred Pennyworth\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"Japan\"}}]}]}",
       "output": "{\"raw\":\"{\\\"answer\\\":\\\"Hello\\\"}\",\"parsed\":{\"answer\":\"Hello\"}}",
       "output_schema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}",
       "tags": {},
@@ -1967,9 +1969,11 @@ async fn test_datapoint_insert_output_none_json() {
         .await
         .unwrap();
 
-    if !resp.status().is_success() {
-        panic!("Bad request: {:?}", resp.text().await.unwrap());
-    }
+    assert!(
+        resp.status().is_success(),
+        "Bad request: {:?}",
+        resp.text().await.unwrap()
+    );
     let datapoint_id =
         Uuid::parse_str(resp.json::<Value>().await.unwrap()["id"].as_str().unwrap()).unwrap();
     assert_ne!(datapoint_id, inference_id);
@@ -2002,7 +2006,7 @@ async fn test_datapoint_insert_output_none_json() {
       "function_name": "json_success",
       "id": datapoint_id.to_string(),
       "episode_id": episode_id.to_string(),
-      "input": "{\"system\":{\"assistant_name\":\"Alfred Pennyworth\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"Japan\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Alfred Pennyworth\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"Japan\"}}]}]}",
       "output":null,
       "output_schema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}",
       "tags": {},
@@ -2055,9 +2059,11 @@ async fn test_datapoint_insert_output_demonstration_json() {
         .send()
         .await
         .unwrap();
-    if !response.status().is_success() {
-        panic!("Bad request: {:?}", response.text().await.unwrap());
-    }
+    assert!(
+        response.status().is_success(),
+        "Bad request: {:?}",
+        response.text().await.unwrap()
+    );
 
     // Sleep to allow writing demonstration before making datapoint
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -2077,9 +2083,11 @@ async fn test_datapoint_insert_output_demonstration_json() {
         .await
         .unwrap();
 
-    if !resp.status().is_success() {
-        panic!("Bad request: {:?}", resp.text().await.unwrap());
-    }
+    assert!(
+        resp.status().is_success(),
+        "Bad request: {:?}",
+        resp.text().await.unwrap()
+    );
     let datapoint_id =
         Uuid::parse_str(resp.json::<Value>().await.unwrap()["id"].as_str().unwrap()).unwrap();
     assert_ne!(datapoint_id, inference_id);
@@ -2117,7 +2125,7 @@ async fn test_datapoint_insert_output_demonstration_json() {
       "function_name": "json_success",
       "id": datapoint_id.to_string(),
       "episode_id": episode_id.to_string(),
-      "input": "{\"system\":{\"assistant_name\":\"Alfred Pennyworth\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"Japan\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Alfred Pennyworth\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"Japan\"}}]}]}",
       "output": "{\"raw\":\"{\\\"answer\\\":\\\"My demonstration answer\\\"}\",\"parsed\":{\"answer\":\"My demonstration answer\"}}",
       "output_schema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}},\"required\":[\"answer\"],\"additionalProperties\":false}",
       "tags": {},
@@ -2395,7 +2403,7 @@ async fn test_datapoint_insert_missing_output_json() {
       "function_name": "json_success",
       "id": id,
       "episode_id": null,
-      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"US\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"US\"}}]}]}",
       "output": null,
       "output_schema": "{}",
       "tags": {},
@@ -2461,7 +2469,7 @@ async fn test_datapoint_insert_null_output_json() {
       "function_name": "json_success",
       "id": id,
       "episode_id": null,
-      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"value\":{\"country\":\"US\"}}]}]}",
+      "input": "{\"system\":{\"assistant_name\":\"Dummy\"},\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"template\",\"name\":\"user\",\"arguments\":{\"country\":\"US\"}}]}]}",
       "output": null,
       "output_schema": "{}",
       "tags": {},

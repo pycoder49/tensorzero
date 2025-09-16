@@ -104,6 +104,7 @@ class RenderedSample:
     input: ModelInput
     stored_input: ResolvedInput
     output: Optional[ChatInferenceOutput]
+    stored_output: Optional[Union[ChatInferenceOutput, JsonInferenceOutput]]
     episode_id: Optional[UUID]
     inference_id: Optional[UUID]
     tool_params: Optional[ToolCallConfigDatabaseInsert]
@@ -115,6 +116,7 @@ class RenderedSample:
 class OptimizationJobHandle:
     Dicl: Type["OptimizationJobHandle"]
     OpenAISFT: Type["OptimizationJobHandle"]
+    OpenAIRFT: Type["OptimizationJobHandle"]
     FireworksSFT: Type["OptimizationJobHandle"]
     GCPVertexGeminiSFT: Type["OptimizationJobHandle"]
     TogetherSFT: Type["OptimizationJobHandle"]
@@ -129,6 +131,7 @@ class OptimizationJobStatus:
 class OptimizationJobInfo:
     Dicl: Type["OptimizationJobInfo"]
     OpenAISFT: Type["OptimizationJobInfo"]
+    OpenAIRFT: Type["OptimizationJobInfo"]
     FireworksSFT: Type["OptimizationJobInfo"]
     GCPVertexGeminiSFT: Type["OptimizationJobInfo"]
     TogetherSFT: Type["OptimizationJobInfo"]
@@ -142,7 +145,7 @@ class OptimizationJobInfo:
     def estimated_finish(self) -> Optional[int]: ...
 
 @final
-class DiclOptimizationConfig:
+class DICLOptimizationConfig:
     def __init__(
         self,
         *,
@@ -154,6 +157,7 @@ class DiclOptimizationConfig:
         max_concurrency: Optional[int] = None,
         k: Optional[int] = None,
         model: Optional[str] = None,
+        append_to_existing_variants: Optional[bool] = None,
         credentials: Optional[str] = None,
     ) -> None: ...
 
@@ -166,6 +170,27 @@ class OpenAISFTConfig:
         batch_size: Optional[int] = None,
         learning_rate_multiplier: Optional[float] = None,
         n_epochs: Optional[int] = None,
+        credentials: Optional[str] = None,
+        api_base: Optional[str] = None,
+        seed: Optional[int] = None,
+        suffix: Optional[str] = None,
+    ) -> None: ...
+
+@final
+class OpenAIRFTConfig:
+    def __init__(
+        self,
+        *,
+        model: str,
+        grader: Dict[str, Any],
+        response_format: Optional[Dict[str, Any]] = None,
+        batch_size: Optional[int] = None,
+        compute_multiplier: Optional[float] = None,
+        eval_interval: Optional[int] = None,
+        eval_samples: Optional[int] = None,
+        learning_rate_multiplier: Optional[float] = None,
+        n_epochs: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         credentials: Optional[str] = None,
         api_base: Optional[str] = None,
         seed: Optional[int] = None,
@@ -294,8 +319,8 @@ class BestOfNSamplingConfig:
     pass
 
 @final
-class DiclConfig:
-    pass
+class DICLConfig:
+    __deprecated__: str = ...
 
 @final
 class MixtureOfNConfig:
@@ -313,7 +338,7 @@ class VariantsConfig:
     ) -> Union[
         ChatCompletionConfig,
         BestOfNSamplingConfig,
-        DiclConfig,
+        DICLConfig,
         MixtureOfNConfig,
         ChainOfThoughtConfig,
     ]: ...
@@ -392,6 +417,7 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         *,
         config_file: Optional[str] = None,
         clickhouse_url: Optional[str] = None,
+        postgres_url: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> "TensorZeroGateway":
         """
@@ -399,7 +425,8 @@ class TensorZeroGateway(BaseTensorZeroGateway):
 
         :param config_file: (Optional) The path to the TensorZero configuration file.
         :param clickhouse_url: (Optional) The URL of the ClickHouse database.
-        :param timeout: The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
+        :param postgres_url: (Optional) The URL of the Postgres database.
+        :param timeout: (Optional) The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
         """
 
     def inference(
@@ -732,6 +759,7 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         *,
         config_file: Optional[str] = None,
         clickhouse_url: Optional[str] = None,
+        postgres_url: Optional[str] = None,
         timeout: Optional[float] = None,
         async_setup: bool = True,
     ) -> Union[Awaitable["AsyncTensorZeroGateway"], "AsyncTensorZeroGateway"]:
@@ -740,7 +768,8 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
 
         :param config_file: (Optional) The path to the TensorZero configuration file.
         :param clickhouse_url: (Optional) The URL of the ClickHouse database.
-        :param timeout: The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
+        :param postgres_url: (Optional) The URL of the Postgres database.
+        :param timeout: (Optional) The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
         :param async_setup (Optional): If True, this method will return a `Future` that resolves to an `AsyncTensorZeroGateway` instance. Otherwise, it will block and return an `AsyncTensorZeroGateway` directly.
         """
 
@@ -1046,6 +1075,7 @@ def _start_http_gateway(
     *,
     config_file: Optional[str],
     clickhouse_url: Optional[str],
+    postgres_url: Optional[str],
     async_setup: bool,
 ) -> Union[Any, Awaitable[Any]]: ...
 @final
@@ -1062,8 +1092,8 @@ __all__ = [
     "ChainOfThoughtConfig",
     "Config",
     "Datapoint",
-    "DiclOptimizationConfig",
-    "DiclConfig",
+    "DICLOptimizationConfig",
+    "DICLConfig",
     "FunctionConfigChat",
     "FunctionConfigJson",
     "FunctionsConfig",
@@ -1073,6 +1103,7 @@ __all__ = [
     "LocalHttpGateway",
     "MixtureOfNConfig",
     "_start_http_gateway",
+    "OpenAIRFTConfig",
     "OpenAISFTConfig",
     "OptimizationJobHandle",
     "OptimizationJobInfo",

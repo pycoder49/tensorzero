@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::time::error::Elapsed;
 use tokio::time::Duration;
@@ -91,7 +92,7 @@ pub struct BestOfNSamplingConfigPyClass {
 }
 
 #[cfg(feature = "pyo3")]
-#[pyclass(name = "DiclConfig")]
+#[pyclass(name = "DICLConfig")]
 pub struct DiclConfigPyClass {
     pub inner: Arc<VariantInfo>,
 }
@@ -229,6 +230,7 @@ pub trait Variant {
     ) -> Result<(), Error>;
 
     fn get_all_template_paths(&self) -> Vec<&PathWithContents>;
+    fn get_all_explicit_template_names(&self) -> HashSet<String>;
 
     async fn start_batch_inference<'a>(
         &'a self,
@@ -568,6 +570,16 @@ impl Variant for VariantInfo {
             VariantConfig::ChainOfThought(params) => params.get_all_template_paths(),
         }
     }
+
+    fn get_all_explicit_template_names(&self) -> HashSet<String> {
+        match &self.inner {
+            VariantConfig::ChatCompletion(params) => params.get_all_explicit_template_names(),
+            VariantConfig::BestOfNSampling(params) => params.get_all_explicit_template_names(),
+            VariantConfig::Dicl(params) => params.get_all_explicit_template_names(),
+            VariantConfig::MixtureOfN(params) => params.get_all_explicit_template_names(),
+            VariantConfig::ChainOfThought(params) => params.get_all_explicit_template_names(),
+        }
+    }
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -754,17 +766,27 @@ async fn infer_model_request_stream<'request>(
 #[derive(Debug, Deserialize, Copy, Clone, Serialize, ts_rs::TS)]
 #[ts(export)]
 pub struct RetryConfig {
+    #[serde(default = "default_num_retries")]
     pub num_retries: usize,
+    #[serde(default = "default_max_delay_s")]
     pub max_delay_s: f32,
 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
         RetryConfig {
-            num_retries: 0,
-            max_delay_s: 10.0,
+            num_retries: default_num_retries(),
+            max_delay_s: default_max_delay_s(),
         }
     }
+}
+
+fn default_num_retries() -> usize {
+    0
+}
+
+fn default_max_delay_s() -> f32 {
+    10.0
 }
 
 impl RetryConfig {
@@ -785,8 +807,8 @@ impl<'a> BatchInferenceConfig<'a> {
         variant_name: &'a str,
     ) -> Self {
         Self {
-            templates,
             tool_configs,
+            templates,
             dynamic_output_schemas,
             function_name,
             variant_name,
@@ -816,7 +838,7 @@ impl ChatCompletionConfigPyClass {
         let config = Self::extract_chat_completion_config(&self.inner)?;
         Ok(config
             .templates
-            .system
+            .get_implicit_system_template()
             .as_ref()
             .map(|t| t.template.contents.clone()))
     }
@@ -826,7 +848,7 @@ impl ChatCompletionConfigPyClass {
         let config = Self::extract_chat_completion_config(&self.inner)?;
         Ok(config
             .templates
-            .user
+            .get_implicit_template(crate::inference::types::Role::User)
             .as_ref()
             .map(|t| t.template.contents.clone()))
     }
@@ -836,7 +858,7 @@ impl ChatCompletionConfigPyClass {
         let config = Self::extract_chat_completion_config(&self.inner)?;
         Ok(config
             .templates
-            .assistant
+            .get_implicit_template(crate::inference::types::Role::Assistant)
             .as_ref()
             .map(|t| t.template.contents.clone()))
     }
@@ -857,6 +879,7 @@ mod tests {
     use crate::endpoints::inference::{ChatCompletionInferenceParams, InferenceCredentials};
     use crate::error::ErrorDetails;
     use crate::function::{FunctionConfigChat, FunctionConfigJson};
+    use crate::http::TensorzeroHttpClient;
     use crate::inference::types::{
         ContentBlockChunk, ModelInferenceRequestJsonMode, RequestMessage, Role, Usage,
     };
@@ -868,7 +891,7 @@ mod tests {
         DUMMY_STREAMING_RESPONSE,
     };
     use crate::tool::{ToolCallConfig, ToolChoice};
-    use reqwest::Client;
+
     use serde_json::json;
     use std::collections::HashMap;
     use tracing_test::traced_test;
@@ -937,6 +960,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
             description: None,
+            all_explicit_templates_names: HashSet::new(),
         });
         let json_mode = JsonMode::Off;
 
@@ -984,6 +1008,7 @@ mod tests {
             output_schema: output_schema.clone(),
             implicit_tool_call_config: implicit_tool_call_config.clone(),
             description: None,
+            all_template_names: HashSet::new(),
         });
 
         let json_mode = JsonMode::On;
@@ -1103,7 +1128,7 @@ mod tests {
     async fn test_infer_model_request() {
         // Setup common variables
         let api_keys = InferenceCredentials::default();
-        let client = Client::new();
+        let client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &client,
@@ -1140,6 +1165,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
             description: None,
+            all_explicit_templates_names: HashSet::new(),
         });
 
         let request_messages = vec![RequestMessage {
@@ -1231,7 +1257,7 @@ mod tests {
                     expected_content
                 );
             }
-            _ => panic!("Expected Chat inference result"),
+            InferenceResult::Json(_) => panic!("Expected Chat inference result"),
         }
 
         // Test case 2: Successful inference with FunctionConfigJson
@@ -1253,6 +1279,7 @@ mod tests {
                 parallel_tool_calls: None,
             },
             description: None,
+            all_template_names: HashSet::new(),
         });
         let output_schema = json!({
             "type": "object",
@@ -1344,7 +1371,7 @@ mod tests {
                     vec![DUMMY_JSON_RESPONSE_RAW.to_string().into()]
                 );
             }
-            _ => panic!("Expected Json inference result"),
+            InferenceResult::Chat(_) => panic!("Expected Json inference result"),
         }
 
         // Test case 3: Model inference failure
@@ -1398,7 +1425,7 @@ mod tests {
     async fn test_infer_model_request_errors() {
         // Setup common variables
         let api_keys = InferenceCredentials::default();
-        let client = Client::new();
+        let client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &client,
@@ -1435,6 +1462,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
             description: None,
+            all_explicit_templates_names: HashSet::new(),
         });
 
         let request_messages = vec![RequestMessage {
@@ -1545,7 +1573,7 @@ mod tests {
                     expected_content
                 );
             }
-            _ => panic!("Expected Chat inference result"),
+            InferenceResult::Json(_) => panic!("Expected Chat inference result"),
         }
         assert!(logs_contain(
             r#"ERROR test_infer_model_request_errors:infer_model_request{model_name=dummy_chat_model}:infer{model_name="dummy_chat_model" otel.name="model_inference" stream=false}:infer{provider_name="error"}:infer{provider_name="error" otel.name="model_provider_inference" gen_ai.operation.name="chat" gen_ai.system="dummy" gen_ai.request.model="error" stream=false}: tensorzero_core::error: Error from dummy client: Error sending request to Dummy provider for model 'error'."#
@@ -1555,7 +1583,7 @@ mod tests {
     #[tokio::test]
     async fn test_infer_model_request_stream() {
         // Set up the HTTP client and ClickHouse connection info
-        let client = reqwest::Client::new();
+        let client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let api_keys = InferenceCredentials::default();
         let clients = InferenceClients {
@@ -1576,6 +1604,7 @@ mod tests {
             tool_choice: crate::tool::ToolChoice::Auto,
             parallel_tool_calls: None,
             description: None,
+            all_explicit_templates_names: HashSet::new(),
         });
 
         // Create an input message
@@ -1700,7 +1729,7 @@ mod tests {
     async fn test_infer_model_request_errors_stream() {
         // Setup common variables
         let api_keys = InferenceCredentials::default();
-        let client = Client::new();
+        let client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &client,
@@ -1722,6 +1751,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: None,
             description: None,
+            all_explicit_templates_names: HashSet::new(),
         })));
 
         let request_messages = vec![RequestMessage {

@@ -93,6 +93,12 @@ pub async fn run_evaluation(
     let clickhouse_url = std::env::var("TENSORZERO_CLICKHOUSE_URL")
         .map_err(|_| anyhow!("Missing ClickHouse URL at TENSORZERO_CLICKHOUSE_URL"))?;
     debug!(clickhouse_url = %clickhouse_url, "ClickHouse URL resolved");
+    let postgres_url = std::env::var("TENSORZERO_POSTGRES_URL").ok();
+    if let Some(postgres_url) = postgres_url.as_ref() {
+        debug!(postgres_url = %postgres_url, "PostgreSQL URL resolved");
+    } else {
+        debug!("PostgreSQL URL not provided");
+    }
 
     // We do not validate credentials here since we just want the evaluator config
     // If we are using an embedded gateway, credentials are validated when that is initialized
@@ -108,7 +114,7 @@ pub async fn run_evaluation(
     let evaluation_config = config
         .evaluations
         .get(&args.evaluation_name)
-        .ok_or(anyhow!("evaluation not found"))?
+        .ok_or_else(|| anyhow!("evaluation not found"))?
         .clone();
     debug!(evaluation_name = %args.evaluation_name, "Evaluation config found");
 
@@ -127,6 +133,7 @@ pub async fn run_evaluation(
         }
         None => ClientBuilder::new(ClientBuilderMode::EmbeddedGateway {
             config_file: Some(args.config_file),
+            postgres_url,
             clickhouse_url: Some(clickhouse_url.clone()),
             timeout: None,
             verify_credentials: true,
@@ -184,7 +191,7 @@ pub async fn run_evaluation(
         let datapoint = Arc::new(datapoint);
         let datapoint_id = datapoint.id();
         let abort_handle = join_set.spawn(async move {
-            let input = Arc::new(resolved_input_to_client_input(datapoint.input().clone().reresolve(&clients_clone.tensorzero_client).await?)?);
+            let input = Arc::new(resolved_input_to_client_input(datapoint.input().clone().reresolve(&clients_clone.tensorzero_client).await?));
             let inference_response = Arc::new(
                 infer_datapoint(InferDatapointParams {
                     clients: &clients_clone,
@@ -287,6 +294,21 @@ pub async fn run_evaluation(
             let failure_messages = format_cutoff_failures(&failures);
             bail!("Failed cutoffs for evaluators: {}", failure_messages);
         }
+    }
+
+    // Since we construct our own `ClickHouseConnectionInfo` outside of our `TensorZeroClient`,
+    // we need to wait for the batch writer to finish.
+    // This happens automatically when `run_evaluation` is called from the standalone `evaluations` binary
+    // (since Tokio will wait for the `spawn_blocking` task to finish before shutting down the runtime).
+    // We explicitly wait here for the batch writer to finish, so that `run_evaluation` can be called
+    // from other places in the codebase (e.g. e2e tests), and subsequently query ClickHouse for the evaluation results.
+    if let Some(handle) = clients.clickhouse_client.batcher_join_handle() {
+        drop(clients);
+        tracing::info!("Waiting for evaluations ClickHouse batch writer to finish");
+        handle
+            .await
+            .map_err(|e| anyhow!("Error waiting for ClickHouse batch writer: {e}"))?;
+        tracing::info!("Evaluations ClickHouse batch writer finished");
     }
 
     Ok(())

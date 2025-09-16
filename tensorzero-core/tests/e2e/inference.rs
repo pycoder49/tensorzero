@@ -1,4 +1,4 @@
-#![expect(clippy::print_stdout)]
+#![expect(clippy::print_stdout, clippy::print_stderr)]
 use std::collections::HashMap;
 use std::{collections::HashSet, sync::Arc};
 
@@ -20,6 +20,7 @@ use tensorzero::{
     ClientBuilder, ClientBuilderMode, ClientInferenceParams, ClientInput, ClientInputMessage,
     ClientInputMessageContent, InferenceOutput, InferenceResponse,
 };
+use tensorzero_core::inference::types::StoredInput;
 use tensorzero_core::{
     db::clickhouse::test_helpers::get_clickhouse_replica,
     db::clickhouse::{
@@ -31,8 +32,8 @@ use tensorzero_core::{
     },
     endpoints::inference::ChatInferenceResponse,
     inference::types::{
-        ContentBlock, ContentBlockOutput, File, RequestMessage, ResolvedInput,
-        ResolvedInputMessageContent, Role, Text, TextKind,
+        ContentBlock, ContentBlockOutput, File, RequestMessage, Role, StoredInputMessageContent,
+        Text, TextKind,
     },
     providers::dummy::{
         DUMMY_BAD_TOOL_RESPONSE, DUMMY_INFER_RESPONSE_CONTENT, DUMMY_INFER_RESPONSE_RAW,
@@ -1118,7 +1119,7 @@ async fn e2e_test_inference_json_success() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"country": "Japan"}}]
+                "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
             }
         ]
     });
@@ -1269,7 +1270,7 @@ async fn e2e_test_variant_failover() {
             "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"type": "tacos", "quantity": 13}}]
+                "content": [{"type": "template", "name": "user", "arguments": {"type": "tacos", "quantity": 13}}]
             }
         ]}
     );
@@ -2654,7 +2655,10 @@ pub async fn e2e_test_dynamic_api_key() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let response_json = response.json::<Value>().await.unwrap();
     let error_message = response_json.get("error").unwrap().as_str().unwrap();
-    assert!(error_message.contains("API key missing for provider: Dummy"));
+    assert!(
+        error_message.contains("API key missing for provider Dummy"),
+        "Unexpected error message: {error_message}"
+    );
 
     let payload = json!({
         "function_name": "basic_test",
@@ -3129,7 +3133,7 @@ async fn test_dummy_only_inference_invalid_default_function_arg() {
     let response_text = response.text().await.unwrap();
     assert!(
         response_text.contains(
-            "Message has non-string content but there is no schema given for role system."
+            "System message has non-string content but there is no template `system` in any variant"
         ),
         "Unexpected error message: {response_text}",
     );
@@ -3675,7 +3679,7 @@ async fn check_json_cot_inference_response(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"country": "Japan"}}]
+                "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
             }
         ]
     });
@@ -3852,16 +3856,16 @@ async fn test_multiple_text_blocks_in_message() {
 
     // Check that the inference has multiple content blocks
     let input = result.get("input").unwrap().as_str().unwrap();
-    let input: ResolvedInput = serde_json::from_str(input).unwrap();
+    let input: StoredInput = serde_json::from_str(input).unwrap();
     assert_eq!(input.messages.len(), 1);
     assert_eq!(input.messages[0].content.len(), 2);
     assert!(matches!(
         input.messages[0].content[0],
-        ResolvedInputMessageContent::Text { .. }
+        StoredInputMessageContent::Text { .. }
     ));
     assert!(matches!(
         input.messages[0].content[1],
-        ResolvedInputMessageContent::Text { .. }
+        StoredInputMessageContent::Text { .. }
     ));
 }
 
@@ -3941,6 +3945,7 @@ async fn test_clickhouse_bulk_insert() {
                 .unwrap()
         });
     }
+
     let mut expected_inference_ids = HashSet::new();
     while let Some(result) = join_set.join_next().await {
         let result = result.unwrap();
@@ -3952,6 +3957,13 @@ async fn test_clickhouse_bulk_insert() {
     assert_eq!(expected_inference_ids.len(), inference_count);
 
     assert_eq!(Arc::strong_count(&client), 1);
+    drop(batch_sender);
+    eprintln!("Dropping client");
+    // Drop the last client, which will drop all of our `ClickhouseConnectionInfo`s
+    // and allow the batch writer to shut down.
+    drop(client);
+    eprintln!("Dropped client");
+    // Wait for ClickHouse to finish processing batch writes.
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
     let clickhouse_client = get_clickhouse().await;

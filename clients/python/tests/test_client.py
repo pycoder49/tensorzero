@@ -35,6 +35,7 @@ import pytest
 import tensorzero
 from clickhouse_connect import get_client  # type: ignore
 from openai import AsyncOpenAI, OpenAI
+from pytest import CaptureFixture
 from tensorzero import (
     AsyncTensorZeroGateway,
     ChatInferenceResponse,
@@ -61,6 +62,7 @@ from tensorzero.types import (
     ChatChunk,
     JsonChunk,
     ProviderExtraBody,
+    Template,
     Thought,
     ToolCallChunk,
     VariantExtraBody,
@@ -1008,6 +1010,7 @@ async def test_async_feedback(async_client: AsyncTensorZeroGateway):
         metric_name="user_rating", value=5, episode_id=episode_id
     )
     assert isinstance(result, FeedbackResponse)
+    assert isinstance(result.feedback_id, UUID)
 
     result = await async_client.feedback(
         metric_name="task_success", value=True, inference_id=inference_id
@@ -2076,6 +2079,7 @@ def test_sync_feedback(sync_client: TensorZeroGateway):
         metric_name="task_success", value=True, inference_id=inference_id
     )
     assert isinstance(result, FeedbackResponse)
+    assert isinstance(result.feedback_id, UUID)
 
     result = sync_client.feedback(
         metric_name="demonstration",
@@ -3392,3 +3396,102 @@ async def test_async_cannot_enable_batch_writes():
             str(exc_info.value)
             == """Failed to construct TensorZero client: Clickhouse(Other { source: TensorZeroInternalError(Error(Config { message: "[gateway.observability.batch_writes] is not yet supported in embedded gateway mode" })) })"""
         )
+
+
+def test_sync_chat_function_named_template(sync_client: TensorZeroGateway):
+    """
+    Test that an chat inference with null response (i.e. no generated content blocks) works as expected.
+    """
+    result = sync_client.inference(
+        function_name="basic_test_template_no_schema",
+        variant_name="test",
+        input={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        Template(
+                            name="my_custom_template",
+                            arguments={
+                                "first_variable": "first_from_python",
+                                "second_variable": "second_from_python",
+                            },
+                        ),
+                        {
+                            "type": "template",
+                            "name": "my_custom_template",
+                            "arguments": {
+                                "first_variable": "first_from_dict",
+                                "second_variable": "second_from_dict",
+                            },
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+    assert isinstance(result, ChatInferenceResponse)
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], Text)
+    assert (
+        result.content[0].text
+        == """{"system":"The system text was `none`","messages":[{"role":"user","content":[{"type":"text","text":"New template: first_variable=first_from_python second_variable=second_from_python"},{"type":"text","text":"New template: first_variable=first_from_dict second_variable=second_from_dict"}]}]}"""
+    )
+
+
+def test_http_client_no_spurious_log(capfd: CaptureFixture[str]):
+    client = TensorZeroGateway.build_http(
+        gateway_url="http://localhost:3000",
+        verbose_errors=True,
+    )
+    assert client is not None
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+@pytest.mark.asyncio
+async def test_async_http_client_no_spurious_log(capfd: CaptureFixture[str]):
+    client_fut = AsyncTensorZeroGateway.build_http(
+        gateway_url="http://localhost:3000",
+        verbose_errors=True,
+    )
+    assert inspect.isawaitable(client_fut)
+    client = await client_fut
+    assert client is not None
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_embedded_client_no_spurious_log(capfd: CaptureFixture[str]):
+    client = TensorZeroGateway.build_embedded(
+        config_file=TEST_CONFIG_FILE,
+        clickhouse_url="http://chuser:chpassword@localhost:8123/tensorzero-python-e2e",
+    )
+    assert client is not None
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+@pytest.mark.asyncio
+async def test_async_embedded_client_no_spurious_log(capfd: CaptureFixture[str]):
+    client_fut = AsyncTensorZeroGateway.build_embedded(
+        config_file=TEST_CONFIG_FILE,
+        clickhouse_url="http://chuser:chpassword@localhost:8123/tensorzero-python-e2e",
+    )
+    assert inspect.isawaitable(client_fut)
+    client = await client_fut
+    assert client is not None
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_capfd_captured_warnings(capfd: CaptureFixture[str]):
+    client = TensorZeroGateway.build_embedded()
+    assert client is not None
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert "Disabling observability:" in captured.out

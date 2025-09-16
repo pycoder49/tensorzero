@@ -14,9 +14,10 @@ use tensorzero_core::{
         UninitializedEmbeddingProviderConfig,
     },
     endpoints::inference::InferenceCredentials,
+    http::TensorzeroHttpClient,
     inference::types::{
         ContentBlock, ContentBlockChatOutput, JsonInferenceOutput, RequestMessage, ResolvedInput,
-        ResolvedInputMessage, ResolvedInputMessageContent, Role,
+        ResolvedInputMessage, ResolvedInputMessageContent, Role, TemplateInput,
     },
 };
 use tokio::time::sleep;
@@ -372,9 +373,11 @@ async fn embed_insert_example(
             .await
             .unwrap();
 
-    let client = Client::new();
+    let client = TensorzeroHttpClient::new().unwrap();
     let request = EmbeddingRequest {
-        input: serde_json::to_string(&input).unwrap().into(),
+        input: serde_json::to_string(&input.clone().into_stored_input())
+            .unwrap()
+            .into(),
         dimensions: None,
         encoding_format: EmbeddingEncodingFormat::Float,
     };
@@ -387,7 +390,7 @@ async fn embed_insert_example(
     let id = Uuid::now_v7();
     let embedding = &response.embeddings[0];
 
-    let input_string = serde_json::to_string(&input).unwrap();
+    let input_string = serde_json::to_string(&input.clone().into_stored_input()).unwrap();
     let row = serde_json::json!({
         "id": id,
         "function_name": function_name,
@@ -436,7 +439,7 @@ pub async fn test_dicl_inference_request_simple() {
         messages: vec![ResolvedInputMessage {
             role: Role::User,
             content: vec![ResolvedInputMessageContent::Text {
-                value: json!("What is the boiling point of water?"),
+                text: "What is the boiling point of water?".to_string(),
             }],
         }],
     };
@@ -456,7 +459,7 @@ pub async fn test_dicl_inference_request_simple() {
         messages: vec![ResolvedInputMessage {
             role: Role::User,
             content: vec![ResolvedInputMessageContent::Text {
-                value: json!("What the capital city of India?"),
+                text: "What the capital city of India?".to_string(),
             }],
         }],
     };
@@ -477,7 +480,7 @@ pub async fn test_dicl_inference_request_simple() {
         messages: vec![ResolvedInputMessage {
             role: Role::User,
             content: vec![ResolvedInputMessageContent::Text {
-                value: json!("What is an example of a computationally hard problem?"),
+                text: "What is an example of a computationally hard problem?".to_string(),
             }],
         }],
     };
@@ -500,7 +503,7 @@ pub async fn test_dicl_inference_request_simple() {
         messages: vec![ResolvedInputMessage {
             role: Role::User,
             content: vec![ResolvedInputMessageContent::Text {
-                value: json!("Who wrote Lord of the Rings?"),
+                text: "Who wrote Lord of the Rings?".to_string(),
             }],
         }],
     };
@@ -1015,9 +1018,10 @@ async fn test_dicl_json_request() {
         system: Some(json!({"assistant_name": "Dr. Mehta"})),
         messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![ResolvedInputMessageContent::Text {
-                value: json!({"country": "Canada"}),
-            }],
+            content: vec![ResolvedInputMessageContent::Template(TemplateInput {
+                name: "user".to_string(),
+                arguments: json!({"country": "Canada"}).as_object().unwrap().clone(),
+            })],
         }],
     };
     let output = JsonInferenceOutput {
@@ -1038,9 +1042,10 @@ async fn test_dicl_json_request() {
         system: Some(json!({"assistant_name": "Pinocchio"})),
         messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![ResolvedInputMessageContent::Text {
-                value: json!({"country": "India"}),
-            }],
+            content: vec![ResolvedInputMessageContent::Template(TemplateInput {
+                name: "user".to_string(),
+                arguments: json!({"country": "India"}).as_object().unwrap().clone(),
+            })],
         }],
     };
     let output = JsonInferenceOutput {
@@ -1061,9 +1066,10 @@ async fn test_dicl_json_request() {
         system: Some(json!({"assistant_name": "Pinocchio"})),
         messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![ResolvedInputMessageContent::Text {
-                value: json!({"country": "USA"}),
-            }],
+            content: vec![ResolvedInputMessageContent::Template(TemplateInput {
+                name: "user".to_string(),
+                arguments: json!({"country": "USA"}).as_object().unwrap().clone(),
+            })],
         }],
     };
     let output = JsonInferenceOutput {
@@ -1083,9 +1089,10 @@ async fn test_dicl_json_request() {
         system: Some(json!({"assistant_name": "Pinocchio"})),
         messages: vec![ResolvedInputMessage {
             role: Role::User,
-            content: vec![ResolvedInputMessageContent::Text {
-                value: json!({"country": "England"}),
-            }],
+            content: vec![ResolvedInputMessageContent::Template(TemplateInput {
+                name: "user".to_string(),
+                arguments: json!({"country": "England"}).as_object().unwrap().clone(),
+            })],
         }],
     };
     let output = JsonInferenceOutput {
@@ -1190,7 +1197,7 @@ async fn test_dicl_json_request() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"country": "Brazil"}}]
+                "content": [{"type": "template", "name" : "user", "arguments": {"country": "Brazil"}}]
             }
         ]
     });

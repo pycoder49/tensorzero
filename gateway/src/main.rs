@@ -16,8 +16,9 @@ use tower_http::trace::{DefaultOnFailure, TraceLayer};
 use tracing::Level;
 
 use tensorzero_core::config::{Config, ConfigFileGlob};
-use tensorzero_core::db::clickhouse::migration_manager::manual_run_migrations;
+use tensorzero_core::db::clickhouse::migration_manager::manual_run_clickhouse_migrations;
 use tensorzero_core::db::clickhouse::ClickHouseConnectionInfo;
+use tensorzero_core::db::postgres::manual_run_postgres_migrations;
 use tensorzero_core::endpoints;
 use tensorzero_core::endpoints::openai_compatible::RouterExt as _;
 use tensorzero_core::endpoints::status::TENSORZERO_VERSION;
@@ -95,9 +96,18 @@ async fn main() {
 
     let git_sha = tensorzero_core::built_info::GIT_COMMIT_HASH_SHORT.unwrap_or("unknown");
     if args.run_migrations_only {
-        manual_run_migrations()
+        manual_run_clickhouse_migrations()
             .await
-            .expect_pretty("Failed to run migrations");
+            .expect_pretty("Failed to run ClickHouse migrations");
+        // Remove once we are ready for Postgres in prime time.
+        // We also should remove the expect behavior from ClickHouse so this command will warn
+        // if it doesn't have clickhouse or doesn't have postgres and then run migrations for the
+        // databases it does have URLs for
+        if std::env::var("TENSORZERO_POSTGRES_URL").is_ok() {
+            manual_run_postgres_migrations()
+                .await
+                .expect_pretty("Failed to run PostgreSQL migrations");
+        }
         return;
     }
 
@@ -356,14 +366,7 @@ async fn main() {
     }
 
     // Print the configuration being used
-    if let Some(glob) = &glob {
-        tracing::info!("├ Configuration: glob `{}` resolved to:", glob.glob);
-        for path in &glob.paths {
-            tracing::info!("│  ├ {}", path.to_string_lossy());
-        }
-    } else {
-        tracing::info!("├ Configuration: default");
-    }
+    print_configuration_info(glob.as_ref());
 
     // Print whether observability is enabled
     tracing::info!("├ Observability: {observability_enabled_pretty}");
@@ -390,11 +393,9 @@ async fn main() {
         .await
         .expect_pretty("Failed to start server");
 
-    if let Some(sdk_tracer_provider) = delayed_log_config.sdk_tracer_provider {
+    if let Some(tracer_wrapper) = delayed_log_config.otel_tracer {
         tracing::info!("Shutting down OpenTelemetry exporter");
-        observability::shutdown_otel(sdk_tracer_provider)
-            .await
-            .expect_pretty("Failed to shutdown OpenTelemetry");
+        tracer_wrapper.shutdown().await;
         tracing::info!("OpenTelemetry exporter shut down");
     }
 }
@@ -478,5 +479,133 @@ impl<T> ExpectPretty<T> for Option<T> {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// Trait for configuration glob information, so that we can create a mocked version in tests
+trait ConfigGlobInfo {
+    fn glob(&self) -> &str;
+    fn paths(&self) -> &[std::path::PathBuf];
+}
+
+impl ConfigGlobInfo for tensorzero_core::config::ConfigFileGlob {
+    fn glob(&self) -> &str {
+        &self.glob
+    }
+
+    fn paths(&self) -> &[std::path::PathBuf] {
+        &self.paths
+    }
+}
+
+fn print_configuration_info(glob: Option<&impl ConfigGlobInfo>) {
+    if let Some(glob) = glob {
+        match glob.paths().len() {
+            0 => {
+                tracing::warn!(
+                    "├ Configuration: glob `{}` did not match any files.",
+                    glob.glob()
+                );
+            }
+            _ => {
+                tracing::info!("├ Configuration: glob `{}` resolved to:", glob.glob());
+
+                for (i, path) in glob.paths().iter().enumerate() {
+                    if i < glob.paths().len() - 1 {
+                        tracing::info!("│ ├ {}", path.to_string_lossy());
+                    } else {
+                        tracing::info!("│ └ {}", path.to_string_lossy());
+                    }
+                }
+            }
+        }
+    } else {
+        tracing::info!("├ Configuration: default");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tracing_test::traced_test;
+
+    // Mock implementation for testing
+    struct MockConfigGlob {
+        glob: String,
+        paths: Vec<PathBuf>,
+    }
+
+    impl ConfigGlobInfo for MockConfigGlob {
+        fn glob(&self) -> &str {
+            &self.glob
+        }
+
+        fn paths(&self) -> &[PathBuf] {
+            &self.paths
+        }
+    }
+
+    #[test]
+    #[traced_test]
+    fn test_print_configuration_info_default() {
+        let glob: Option<&MockConfigGlob> = None;
+        print_configuration_info(glob);
+
+        assert!(logs_contain("├ Configuration: default"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn test_print_configuration_info_glob_no_matches() {
+        // Create a mock with no paths for testing
+        let glob = MockConfigGlob {
+            glob: "*.nonexistent".to_string(),
+            paths: vec![],
+        };
+
+        print_configuration_info(Some(&glob));
+
+        assert!(logs_contain(
+            "├ Configuration: glob `*.nonexistent` did not match any files."
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn test_print_configuration_info_glob_single_path() {
+        let glob = MockConfigGlob {
+            glob: "config/*.toml".to_string(),
+            paths: vec![PathBuf::from("config/app.toml")],
+        };
+
+        print_configuration_info(Some(&glob));
+
+        assert!(logs_contain(
+            "├ Configuration: glob `config/*.toml` resolved to:"
+        ));
+        assert!(logs_contain("│ └ config/app.toml"));
+    }
+
+    #[test]
+    #[traced_test]
+    fn test_print_configuration_info_glob_multiple_paths() {
+        let glob = MockConfigGlob {
+            glob: "config/**/*.toml".to_string(),
+            paths: vec![
+                PathBuf::from("config/app.toml"),
+                PathBuf::from("config/database.toml"),
+                PathBuf::from("config/prod/settings.toml"),
+            ],
+        };
+
+        print_configuration_info(Some(&glob));
+
+        assert!(logs_contain(
+            "├ Configuration: glob `config/**/*.toml` resolved to:"
+        ));
+        assert!(logs_contain("│ ├ config/app.toml"));
+        assert!(logs_contain("│ ├ config/database.toml"));
+        assert!(logs_contain("│ └ config/prod/settings.toml"));
     }
 }

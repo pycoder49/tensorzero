@@ -14,14 +14,14 @@ use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tensorzero_derive::TensorZeroDeserialize;
 use tracing::instrument;
 
 use crate::config::gateway::{GatewayConfig, UninitializedGatewayConfig};
-use crate::config::path::TomlRelativePath;
+use crate::config::path::ResolvedTomlPath;
 use crate::config::span_map::SpanMap;
 use crate::embeddings::{EmbeddingModelTable, UninitializedEmbeddingModelConfig};
 use crate::endpoints::inference::DEFAULT_FUNCTION_NAME;
@@ -57,6 +57,9 @@ tokio::task_local! {
     /// This is used when running in e2e test mode, and by the 'evaluations' binary
     /// We need to access this from async code (e.g. when looking up GCP SDK credentials),
     /// so this needs to be a tokio task-local (as a task may be moved between threads)
+    ///
+    /// Since this needs to be accessed from a `Deserialize` impl, it needs to
+    /// be stored in a `static`, since we cannot pass in extra parameters when calling `Deserialize::deserialize`
     pub(crate) static SKIP_CREDENTIAL_VALIDATION: ();
 }
 
@@ -123,7 +126,7 @@ pub struct TemplateFilesystemAccess {
     /// Defaults to `false`
     #[serde(default)]
     enabled: bool,
-    base_path: Option<TomlRelativePath>,
+    base_path: Option<ResolvedTomlPath>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -532,13 +535,13 @@ impl MetricConfigLevel {
 //    Instead, we 'remap' paths by walking the merged `DeTable`, and replacing entries
 //    at known paths with their fully qualified paths (using the `SpanMap` to obtain
 //    the base path for each entry). Each value is changed to a nested map that can be
-//    deserialized into a `TomlRelativePath`. If we forget to remap any parts of the config
-//    in `resolve_toml_relative_paths`, then deserializing the `TomlRelativePath` will fail
+//    deserialized into a `ResolvedTomlPath`. If we forget to remap any parts of the config
+//    in `resolve_toml_relative_paths`, then deserializing the `ResolvedTomlPath` will fail
 //    (rather than succeed with an incorrect path).
 //
 // At this point, we have a `DeTable` that can be successfully deserialized into an `UninitializedConfig`.
 // From this point onward, none of the config-handling code needs to interact with globs, remapped config files,
-// or even be aware of whether or not we have multiple config files. All path access goes through `TomlRelativePath`,
+// or even be aware of whether or not we have multiple config files. All path access goes through `ResolvedTomlPath`,
 // which is self-contained (it stores the absolute path that we resolved earlier).
 
 /// A glob pattern together with the resolved config file paths.
@@ -906,6 +909,7 @@ impl Config {
                     tool_choice: ToolChoice::None,
                     parallel_tool_calls: None,
                     description: None,
+                    all_explicit_templates_names: HashSet::new(),
                 },
             ))))
         } else {
@@ -1132,11 +1136,26 @@ pub enum UninitializedFunctionConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UninitializedSchema {
+    path: ResolvedTomlPath,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(transparent)]
+pub struct UninitializedSchemas {
+    inner: HashMap<String, UninitializedSchema>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UninitializedFunctionConfigChat {
     variants: HashMap<String, UninitializedVariantInfo>, // variant name => variant config
-    system_schema: Option<TomlRelativePath>,
-    user_schema: Option<TomlRelativePath>,
-    assistant_schema: Option<TomlRelativePath>,
+    system_schema: Option<ResolvedTomlPath>,
+    user_schema: Option<ResolvedTomlPath>,
+    assistant_schema: Option<ResolvedTomlPath>,
+    #[serde(default)]
+    schemas: UninitializedSchemas,
     #[serde(default)]
     tools: Vec<String>, // tool names
     #[serde(default)]
@@ -1151,10 +1170,12 @@ pub struct UninitializedFunctionConfigChat {
 #[serde(deny_unknown_fields)]
 pub struct UninitializedFunctionConfigJson {
     variants: HashMap<String, UninitializedVariantInfo>, // variant name => variant config
-    system_schema: Option<TomlRelativePath>,
-    user_schema: Option<TomlRelativePath>,
-    assistant_schema: Option<TomlRelativePath>,
-    output_schema: Option<TomlRelativePath>, // schema will default to {} if not specified
+    system_schema: Option<ResolvedTomlPath>,
+    user_schema: Option<ResolvedTomlPath>,
+    assistant_schema: Option<ResolvedTomlPath>,
+    #[serde(default)]
+    schemas: UninitializedSchemas,
+    output_schema: Option<ResolvedTomlPath>, // schema will default to {} if not specified
     #[serde(default)]
     description: Option<String>,
 }
@@ -1165,32 +1186,80 @@ pub struct UninitializedFunctionConfigJson {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export))]
 pub struct SchemaData {
-    pub user: Option<StaticJSONSchema>,
-    pub assistant: Option<StaticJSONSchema>,
-    pub system: Option<StaticJSONSchema>,
+    #[serde(flatten)]
+    pub inner: HashMap<String, StaticJSONSchema>,
+}
+
+impl SchemaData {
+    pub fn get_implicit_system_schema(&self) -> Option<&StaticJSONSchema> {
+        self.inner.get("system")
+    }
+
+    pub fn get_implicit_user_schema(&self) -> Option<&StaticJSONSchema> {
+        self.inner.get("user")
+    }
+
+    pub fn get_implicit_assistant_schema(&self) -> Option<&StaticJSONSchema> {
+        self.inner.get("assistant")
+    }
+
+    pub fn get_named_schema(&self, name: &str) -> Option<&StaticJSONSchema> {
+        self.inner.get(name)
+    }
+
+    pub(super) fn load(
+        user_schema: Option<StaticJSONSchema>,
+        assistant_schema: Option<StaticJSONSchema>,
+        system_schema: Option<StaticJSONSchema>,
+        schemas: UninitializedSchemas,
+        function_name: &str,
+    ) -> Result<Self, Error> {
+        let mut map = HashMap::new();
+        if let Some(user_schema) = user_schema {
+            map.insert("user".to_string(), user_schema);
+        }
+        if let Some(assistant_schema) = assistant_schema {
+            map.insert("assistant".to_string(), assistant_schema);
+        }
+        if let Some(system_schema) = system_schema {
+            map.insert("system".to_string(), system_schema);
+        }
+        for (name, schema) in schemas.inner {
+            if map
+                .insert(name.to_string(), StaticJSONSchema::from_path(schema.path)?)
+                .is_some()
+            {
+                return Err(Error::new(ErrorDetails::Config {
+                    message: format!(
+                        "functions.{function_name}: Cannot specify both `schemas.{name}.path` and `{name}_schema`"
+                    ),
+                }));
+            }
+        }
+        Ok(Self { inner: map })
+    }
 }
 
 impl UninitializedFunctionConfig {
     pub fn load(self, function_name: &str) -> Result<FunctionConfig, Error> {
         match self {
             UninitializedFunctionConfig::Chat(params) => {
-                let system_schema = params
-                    .system_schema
-                    .map(StaticJSONSchema::from_path)
-                    .transpose()?;
-                let user_schema = params
-                    .user_schema
-                    .map(StaticJSONSchema::from_path)
-                    .transpose()?;
-                let assistant_schema = params
-                    .assistant_schema
-                    .map(StaticJSONSchema::from_path)
-                    .transpose()?;
-                let schema_data = SchemaData {
-                    user: user_schema,
-                    assistant: assistant_schema,
-                    system: system_schema,
-                };
+                let schema_data = SchemaData::load(
+                    params
+                        .user_schema
+                        .map(StaticJSONSchema::from_path)
+                        .transpose()?,
+                    params
+                        .assistant_schema
+                        .map(StaticJSONSchema::from_path)
+                        .transpose()?,
+                    params
+                        .system_schema
+                        .map(StaticJSONSchema::from_path)
+                        .transpose()?,
+                    params.schemas,
+                    function_name,
+                )?;
                 let variants = params
                     .variants
                     .into_iter()
@@ -1206,7 +1275,9 @@ impl UninitializedFunctionConfig {
                             .map(|v| (name, Arc::new(v)))
                     })
                     .collect::<Result<HashMap<_, _>, Error>>()?;
+                let mut all_template_names = HashSet::new();
                 for (name, variant) in &variants {
+                    all_template_names.extend(variant.get_all_explicit_template_names());
                     if let VariantConfig::ChatCompletion(chat_config) = &variant.inner {
                         if chat_config.json_mode.is_some() {
                             return Err(ErrorDetails::Config {
@@ -1225,26 +1296,26 @@ impl UninitializedFunctionConfig {
                     tool_choice: params.tool_choice,
                     parallel_tool_calls: params.parallel_tool_calls,
                     description: params.description,
+                    all_explicit_templates_names: all_template_names,
                 }))
             }
             UninitializedFunctionConfig::Json(params) => {
-                let system_schema = params
-                    .system_schema
-                    .map(StaticJSONSchema::from_path)
-                    .transpose()?;
-                let user_schema = params
-                    .user_schema
-                    .map(StaticJSONSchema::from_path)
-                    .transpose()?;
-                let assistant_schema = params
-                    .assistant_schema
-                    .map(StaticJSONSchema::from_path)
-                    .transpose()?;
-                let schema_data = SchemaData {
-                    user: user_schema,
-                    assistant: assistant_schema,
-                    system: system_schema,
-                };
+                let schema_data = SchemaData::load(
+                    params
+                        .user_schema
+                        .map(StaticJSONSchema::from_path)
+                        .transpose()?,
+                    params
+                        .assistant_schema
+                        .map(StaticJSONSchema::from_path)
+                        .transpose()?,
+                    params
+                        .system_schema
+                        .map(StaticJSONSchema::from_path)
+                        .transpose()?,
+                    params.schemas,
+                    function_name,
+                )?;
                 let output_schema = match params.output_schema {
                     Some(path) => StaticJSONSchema::from_path(path)?,
                     None => StaticJSONSchema::default(),
@@ -1267,8 +1338,11 @@ impl UninitializedFunctionConfig {
                     })
                     .collect::<Result<HashMap<_, _>, Error>>()?;
 
+                let mut all_template_names = HashSet::new();
+
                 for (name, variant) in &variants {
                     let mut variant_missing_mode = None;
+                    all_template_names.extend(variant.get_all_explicit_template_names());
                     match &variant.inner {
                         VariantConfig::ChatCompletion(chat_config) => {
                             if chat_config.json_mode.is_none() {
@@ -1311,6 +1385,7 @@ impl UninitializedFunctionConfig {
                     output_schema,
                     implicit_tool_call_config,
                     description: params.description,
+                    all_template_names: HashSet::new(),
                 }))
             }
         }
@@ -1352,6 +1427,16 @@ pub struct ErrorContext {
     pub variant_name: String,
 }
 
+impl ErrorContext {
+    #[cfg(test)]
+    pub fn new_test() -> Self {
+        Self {
+            function_name: "test".to_string(),
+            variant_name: "test".to_string(),
+        }
+    }
+}
+
 impl UninitializedVariantInfo {
     pub fn load(
         self,
@@ -1384,7 +1469,7 @@ impl UninitializedVariantInfo {
 #[serde(deny_unknown_fields)]
 pub struct UninitializedToolConfig {
     pub description: String,
-    pub parameters: TomlRelativePath,
+    pub parameters: ResolvedTomlPath,
     pub name: Option<String>,
     #[serde(default)]
     pub strict: bool,
@@ -1407,12 +1492,12 @@ impl UninitializedToolConfig {
 #[cfg_attr(test, ts(export))]
 pub struct PathWithContents {
     #[cfg_attr(test, ts(type = "string"))]
-    pub path: TomlRelativePath,
+    pub path: ResolvedTomlPath,
     pub contents: String,
 }
 
 impl PathWithContents {
-    pub fn from_path(path: TomlRelativePath) -> Result<Self, Error> {
+    pub fn from_path(path: ResolvedTomlPath) -> Result<Self, Error> {
         let contents = path.read()?;
         Ok(Self { path, contents })
     }
