@@ -24,6 +24,7 @@ use super::helpers::peek_first_chunk;
 use crate::cache::ModelProviderRequest;
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{DisplayOrDebugGateway, Error, ErrorDetails};
+use crate::http::TensorzeroHttpClient;
 use crate::inference::types::batch::BatchRequestRow;
 use crate::inference::types::batch::PollBatchInferenceResponse;
 use crate::inference::types::file::mime_type_to_ext;
@@ -81,7 +82,7 @@ impl InferenceProvider for AWSBedrockProvider {
             provider_name: _,
             model_name,
         }: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
@@ -169,12 +170,19 @@ impl InferenceProvider for AWSBedrockProvider {
         let InterceptorAndRawBody {
             interceptor,
             get_raw_request,
+            get_raw_response,
         } = build_interceptor(request, model_provider, model_name.to_string());
 
+        // We need to use the `aws_http_client::Client` wrapper type, which currently
+        // doesn't work with the `TensorzeroHttpClient` type.
+        // This causes us to lose out on things like connection pooling and outgoing OTEL headers.
+        // TODO: make this use `TensorzeroHttpClient`
         let new_config = self
             .base_config
             .clone()
-            .http_client(super::aws_http_client::Client::new(http_client.clone()));
+            .http_client(super::aws_http_client::Client::new(
+                http_client.dangerous_get_fallback_client().clone(),
+            ));
         let start_time = Instant::now();
         let output = bedrock_request
             .customize()
@@ -189,7 +197,7 @@ impl InferenceProvider for AWSBedrockProvider {
                         DisplayErrorContext(&e)
                     ),
                     raw_request: get_raw_request().ok(),
-                    raw_response: None,
+                    raw_response: get_raw_response().ok(),
                     provider_type: PROVIDER_TYPE.to_string(),
                 })
             })?;
@@ -199,11 +207,13 @@ impl InferenceProvider for AWSBedrockProvider {
         };
 
         let raw_request = get_raw_request()?;
+        let raw_response = get_raw_response()?;
 
         ConverseOutputWithMetadata {
             output,
             latency,
             raw_request,
+            raw_response,
             system: request.system.clone(),
             input_messages: request.messages.clone(),
             model_id: &self.model_id,
@@ -220,7 +230,7 @@ impl InferenceProvider for AWSBedrockProvider {
             provider_name: _,
             model_name,
         }: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
@@ -307,11 +317,19 @@ impl InferenceProvider for AWSBedrockProvider {
         let InterceptorAndRawBody {
             interceptor,
             get_raw_request,
+            get_raw_response,
         } = build_interceptor(request, model_provider, model_name.to_string());
+
+        // We need to use the `aws_http_client::Client` wrapper type, which currently
+        // doesn't work with the `TensorzeroHttpClient` type.
+        // This causes us to lose out on things like connection pooling and outgoing OTEL headers.
+        // TODO: make this use `TensorzeroHttpClient`
         let new_config = self
             .base_config
             .clone()
-            .http_client(super::aws_http_client::Client::new(http_client.clone()));
+            .http_client(super::aws_http_client::Client::new(
+                http_client.dangerous_get_fallback_client().clone(),
+            ));
 
         let start_time = Instant::now();
         let stream = bedrock_request
@@ -326,8 +344,8 @@ impl InferenceProvider for AWSBedrockProvider {
                         "Error sending request to AWS Bedrock: {}",
                         DisplayErrorContext(&e)
                     ),
-                    raw_request: None,
-                    raw_response: None,
+                    raw_request: get_raw_request().ok(),
+                    raw_response: get_raw_response().ok(),
                     provider_type: PROVIDER_TYPE.to_string(),
                 })
             })?;
@@ -352,7 +370,7 @@ impl InferenceProvider for AWSBedrockProvider {
     async fn start_batch_inference<'a>(
         &'a self,
         _requests: &'a [ModelInferenceRequest<'_>],
-        _client: &'a reqwest::Client,
+        _client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<StartBatchProviderInferenceResponse, Error> {
         Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
@@ -364,7 +382,7 @@ impl InferenceProvider for AWSBedrockProvider {
     async fn poll_batch_inference<'a>(
         &'a self,
         _batch_request: &'a BatchRequestRow<'a>,
-        _http_client: &'a reqwest::Client,
+        _http_client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<PollBatchInferenceResponse, Error> {
         Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
@@ -837,6 +855,7 @@ struct ConverseOutputWithMetadata<'a> {
     output: ConverseOutput,
     latency: Latency,
     raw_request: String,
+    raw_response: String,
     system: Option<String>,
     input_messages: Vec<RequestMessage>,
     model_id: &'a str,
@@ -865,15 +884,13 @@ impl TryFrom<ConverseOutputWithMetadata<'_>> for ProviderInferenceResponse {
             output,
             latency,
             raw_request,
+            raw_response,
             system,
             input_messages,
             model_id,
             function_type,
             json_mode,
         } = value;
-
-        let raw_response = serialize_aws_bedrock_struct(&output)?;
-
         let message = match output.output {
             Some(ConverseOutputType::Message(message)) => Some(message),
             _ => {

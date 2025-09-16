@@ -980,6 +980,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nodeenv"
+version = "1.9.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/43/16/fc88b08840de0e0a72a2f9d8c6bae36be573e475a6326ae854bcc549fc45/nodeenv-1.9.1.tar.gz", hash = "sha256:6ec12890a2dab7946721edbfbcd91f3319c6ccc9aec47be7c7e6b7011ee6645f", size = 47437, upload_time = "2024-06-04T18:44:11.171Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/1d/1b658dbd2b9fa9c4c9f32accbfc0205d532c8c6194dc0f2a4c0428e7128a/nodeenv-1.9.1-py2.py3-none-any.whl", hash = "sha256:ba11c9782d29c27c70ffbdda2d7415098754709be8a7056d79a737cd901155c9", size = 22314, upload_time = "2024-06-04T18:44:08.352Z" },
+]
+
+[[package]]
 name = "notebook"
 version = "7.4.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1134,6 +1143,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b0/77/a5b8c569bf593b0140bde72ea885a803b82086995367bf2037de0159d924/pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887", size = 4968631, upload_time = "2025-06-21T13:39:12.283Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/21/705964c7812476f378728bdf590ca4b771ec72385c533964653c68e86bdc/pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b", size = 1225217, upload_time = "2025-06-21T13:39:07.939Z" },
+]
+
+[[package]]
+name = "pyright"
+version = "1.1.404"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nodeenv" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e2/6e/026be64c43af681d5632722acd100b06d3d39f383ec382ff50a71a6d5bce/pyright-1.1.404.tar.gz", hash = "sha256:455e881a558ca6be9ecca0b30ce08aa78343ecc031d37a198ffa9a7a1abeb63e", size = 4065679, upload_time = "2025-08-20T18:46:14.029Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/30/89aa7f7d7a875bbb9a577d4b1dc5a3e404e3d2ae2657354808e905e358e0/pyright-1.1.404-py3-none-any.whl", hash = "sha256:c7b7ff1fdb7219c643079e4c3e7d4125f0dafcc19d253b47e898d130ea426419", size = 5902951, upload_time = "2025-08-20T18:46:12.096Z" },
 ]
 
 [[package]]
@@ -1503,22 +1525,22 @@ wheels = [
 
 [[package]]
 name = "tensorzero"
-version = "2025.6.2"
+version = "2025.8.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "typing-extensions" },
     { name = "uuid-utils" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/90/f8/3f7492efc88006f071dda09a16b195de841ce6e73eab7ae57ce277fcc48e/tensorzero-2025.6.2.tar.gz", hash = "sha256:ef0f15f01f3d90e3c59aef37090f26d1407f3c5e65b90e2accb1b2e50c82d4fb", size = 1120510, upload_time = "2025-06-15T23:05:19.998Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7d/75/d44f4670fd902739580a5d9654e14df76860f0220cbfb377fd11509a2cf5/tensorzero-2025.8.5.tar.gz", hash = "sha256:78b4247f1ab9c6880d1f506d0cb7c237cb33e884da73f9554a67489f22cd4c8d", size = 1358661, upload_time = "2025-08-29T01:33:09.748Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d5/36/7fe87766994e87c449a2855de02748e23223cb7dac2a98c428cd305a60b0/tensorzero-2025.6.2-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:67364b6d0de2a74fbd55db2d158203bf27f15caeed7b87f2b357ee857366f39f", size = 14616435, upload_time = "2025-06-15T23:05:11.921Z" },
-    { url = "https://files.pythonhosted.org/packages/a4/d7/60188bbdece95ede7d95940ad9110c3254bd27e638776d8e6dcb47efe3ae/tensorzero-2025.6.2-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:6b31ccea665232fdd70c923fcd41cf86c008b2d9a313fff80f1977a32ae2bfcf", size = 13821008, upload_time = "2025-06-15T23:05:09.231Z" },
-    { url = "https://files.pythonhosted.org/packages/4d/f2/796202cdc54e240dc47f6de2d79a660ab1702e51c330ad76adcd1057cf45/tensorzero-2025.6.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:4e8b90b9cd71210471ab746ff8e2ca2a292419ebb01e2d300e14bac9f44dd08b", size = 14304590, upload_time = "2025-06-15T23:05:03.736Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/f2/5b85351da429b497c6f3dcd0f6c45547428585ed5f9d07d3a40f85846547/tensorzero-2025.6.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:179c6371fcc7c3dc731f4f5f0fc4df25f70b0bafa109a74971b2b1905985240f", size = 15331220, upload_time = "2025-06-15T23:05:06.762Z" },
-    { url = "https://files.pythonhosted.org/packages/15/94/d0adc7badb97501b147425b588d413c7e6747637f5b312cf955918b52b9b/tensorzero-2025.6.2-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:95efe4ba31def003512a954e00a3b76b538cc23e23c9053080d3b721c2f7167b", size = 14396445, upload_time = "2025-06-15T23:05:14.741Z" },
-    { url = "https://files.pythonhosted.org/packages/b5/d4/87e1d171750e5f0f486a98406bd1671d35ca84671d36d754cd07de4c50e7/tensorzero-2025.6.2-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:4e1f7901cca4ee0cb68450405baf20923a42213590d623d13b040fb1fd2e3c78", size = 15541794, upload_time = "2025-06-15T23:05:17.215Z" },
-    { url = "https://files.pythonhosted.org/packages/24/e6/c487051c42d296b5af71f96a6125d95b5e21f8dccdb5b929c33856357f5c/tensorzero-2025.6.2-cp39-abi3-win_amd64.whl", hash = "sha256:26f4c099cd4ef2b4775ad86728faa58fb81b085ba2aacb51095345817b0678f8", size = 15271786, upload_time = "2025-06-15T23:05:22.163Z" },
+    { url = "https://files.pythonhosted.org/packages/41/2c/1e630081db2769929df217c07fe1007a885fbb459695d20526116a80df39/tensorzero-2025.8.5-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:cbec01cb68f4be8fbb53670e7e737e1b0872a4c6d30ef3cde1a4b078931a3b9e", size = 20800860, upload_time = "2025-08-29T01:33:03.135Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/77/f7ddd01088a4accbec24b0fb77670ab7f6189a4c1907cc6b07556484d90a/tensorzero-2025.8.5-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:3016d9e999899775c583a55385860e90d6020df2213fa14e244b4ef570529f26", size = 19939013, upload_time = "2025-08-29T01:33:00.727Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/3b/843c54a6f12eb9b5a304f6f29b9fb5a94df795c30f4163bfe080569ecc98/tensorzero-2025.8.5-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a022ae72f743531800063adff3d7154fe03d2ba4895352f36e088a20c8bc8c1e", size = 21828249, upload_time = "2025-08-29T01:32:54.673Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/27/4b015c4a8e89020af84efa24b3209aacacb509b0bf63c9d606429bc3105e/tensorzero-2025.8.5-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:eacac182f4a34e713056dbc3442982f38f092d3a452e1505d449000e2de90d4a", size = 22479084, upload_time = "2025-08-29T01:32:57.484Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/4e/b811d086714850fd3d69358a4ff6c7a76ea3b536c6b5c30957400bea4463/tensorzero-2025.8.5-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:944efe60dce1f8838aa2f6cc54cbd47714d0a64ddbd9dab617c033ef7bb275b4", size = 21883887, upload_time = "2025-08-29T01:33:05.312Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/e2/f1316eb949abc9a8e1391239b1b28b6a607b48ec11add063b86e94ba5ae3/tensorzero-2025.8.5-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:298511a573c608a0601af28b92995d76990b6d77bd44d2b3d290e3b59eba2635", size = 22685365, upload_time = "2025-08-29T01:33:07.838Z" },
+    { url = "https://files.pythonhosted.org/packages/86/2b/c87502f99a994787d9d0f85f4db0f4a255aa0bdb2894b32bdda6dda43088/tensorzero-2025.8.5-cp39-abi3-win_amd64.whl", hash = "sha256:4cbdfeaac7464c78760152442a54de937cd2cece8237dfe8f06e0a12008f5ab6", size = 19187350, upload_time = "2025-08-29T01:33:11.129Z" },
 ]
 
 [[package]]
@@ -1534,15 +1556,23 @@ dependencies = [
     { name = "wikipedia" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pyright" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "ipykernel" },
     { name = "jupyter" },
     { name = "markdownify" },
-    { name = "tensorzero" },
+    { name = "tensorzero", specifier = ">=2025.8.5" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "wikipedia" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pyright" }]
 
 [[package]]
 name = "terminado"

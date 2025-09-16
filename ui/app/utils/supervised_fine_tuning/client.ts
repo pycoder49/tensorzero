@@ -31,7 +31,11 @@ export async function launch_sft_job(
   if (data.metric === "demonstration") {
     output_source = "Demonstration";
   } else if (data.metric) {
-    filters = await createFilters(data.metric, data.threshold);
+    const threshold =
+      typeof data.threshold === "string"
+        ? parseFloat(data.threshold)
+        : data.threshold;
+    filters = await createFilters(data.metric, threshold);
   }
   const client = await getNativeTensorZeroClient();
   let optimizerConfig: UninitializedOptimizerInfo;
@@ -55,6 +59,21 @@ export async function launch_sft_job(
     optimizerConfig = {
       type: "fireworks_sft",
       model: data.model.name,
+      early_stop: null,
+      epochs: null,
+      learning_rate: null,
+      max_context_length: null,
+      lora_rank: null,
+      batch_size: null,
+      display_name: null,
+      output_model: null,
+      warm_start_from: null,
+      is_turbo: null,
+      eval_auto_carveout: null,
+      nodes: null,
+      mtp_enabled: null,
+      mtp_num_draft_tokens: null,
+      mtp_freeze_base_model: null,
       credentials: null,
       api_base: fireworksNativeSFTBase,
       account_id: accountId,

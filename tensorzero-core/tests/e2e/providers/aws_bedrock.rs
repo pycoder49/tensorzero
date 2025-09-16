@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::common::get_gateway_endpoint;
 use crate::providers::common::{E2ETestProvider, E2ETestProviders};
 
-use tensorzero_core::clickhouse::test_helpers::{
+use tensorzero_core::db::clickhouse::test_helpers::{
     get_clickhouse, select_chat_inference_clickhouse, select_model_inference_clickhouse,
 };
 
@@ -214,7 +214,13 @@ async fn test_inference_with_explicit_region() {
     assert!(result.get("ttft_ms").unwrap().is_null());
     let raw_response = result.get("raw_response").unwrap();
     let raw_response_json: Value = serde_json::from_str(raw_response.as_str().unwrap()).unwrap();
-    let _ = raw_response_json.get("debug").unwrap().as_str().unwrap();
+    assert!(
+        !raw_response_json["output"]["message"]["content"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "Unexpected raw response: {raw_response_json}"
+    );
 }
 
 #[tokio::test]

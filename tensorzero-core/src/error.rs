@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -23,12 +24,11 @@ use crate::inference::types::Thought;
 ///
 /// WARNING: Setting this to true will expose potentially sensitive request/response
 /// data in logs and error responses. Use with caution.
-static DEBUG: OnceCell<bool> =
-    if cfg!(feature = "e2e_tests") || cfg!(feature = "optimization_tests") {
-        OnceCell::const_new_with(true)
-    } else {
-        OnceCell::const_new()
-    };
+static DEBUG: OnceCell<bool> = if cfg!(feature = "e2e_tests") {
+    OnceCell::const_new_with(true)
+} else {
+    OnceCell::const_new()
+};
 
 pub fn set_debug(debug: bool) -> Result<(), Error> {
     // We already initialized `DEBUG`, so do nothing
@@ -101,28 +101,28 @@ impl<T: Debug + Display> Display for DisplayOrDebugGateway<T> {
     }
 }
 
-#[derive(Debug, Error, Serialize)]
+#[derive(Clone, Debug, Error, Serialize)]
 #[cfg_attr(any(test, feature = "e2e_tests"), derive(PartialEq))]
 #[error(transparent)]
 // As long as the struct member is private, we force people to use the `new` method and log the error.
-// We box `ErrorDetails` per the `clippy::result_large_err` lint
-pub struct Error(Box<ErrorDetails>);
+// We arc `ErrorDetails` per the `clippy::result_large_err` lint, as well as to make it cloneable
+pub struct Error(Arc<ErrorDetails>);
 
 impl Error {
     pub fn new(details: ErrorDetails) -> Self {
         details.log();
-        Error(Box::new(details))
+        Error(Arc::new(details))
     }
 
     pub fn new_with_err_logging(details: ErrorDetails, err_logging: bool) -> Self {
         if err_logging {
             details.log();
         }
-        Error(Box::new(details))
+        Error(Arc::new(details))
     }
 
     pub fn new_without_logging(details: ErrorDetails) -> Self {
-        Error(Box::new(details))
+        Error(Arc::new(details))
     }
 
     pub fn status_code(&self) -> StatusCode {
@@ -131,10 +131,6 @@ impl Error {
 
     pub fn get_details(&self) -> &ErrorDetails {
         &self.0
-    }
-
-    pub fn get_owned_details(self) -> ErrorDetails {
-        *self.0
     }
 
     pub fn log(&self) {
@@ -182,6 +178,7 @@ pub enum ErrorDetails {
     },
     ApiKeyMissing {
         provider_name: String,
+        message: String,
     },
     AppState {
         message: String,
@@ -204,6 +201,10 @@ pub enum ErrorDetails {
         message: String,
     },
     Cache {
+        message: String,
+    },
+    Glob {
+        glob: String,
         message: String,
     },
     ChannelWrite {
@@ -235,8 +236,12 @@ pub enum ErrorDetails {
         dataset_name: String,
         datapoint_id: Uuid,
     },
+    DiclMissingOutput,
     DuplicateTool {
         name: String,
+    },
+    DynamicEndpointNotFound {
+        key_name: String,
     },
     DynamicJsonSchema {
         message: String,
@@ -278,6 +283,9 @@ pub enum ErrorDetails {
     },
     InvalidDynamicTemplatePath {
         name: String,
+    },
+    InvalidDynamicEndpoint {
+        url: String,
     },
     InvalidEncodedJobHandle,
     InvalidJobHandle {
@@ -436,6 +444,13 @@ pub enum ErrorDetails {
     OutputValidation {
         source: Box<Error>,
     },
+    // TODO once 3496 merges: change both of these to taking sqlx errors rather than string
+    PostgresConnectionInitialization {
+        message: String,
+    },
+    PostgresMigration {
+        message: String,
+    },
     ProviderNotFound {
         provider_name: String,
     },
@@ -537,8 +552,10 @@ impl ErrorDetails {
             ErrorDetails::ObjectStoreWrite { .. } => tracing::Level::ERROR,
             ErrorDetails::Config { .. } => tracing::Level::ERROR,
             ErrorDetails::DatapointNotFound { .. } => tracing::Level::WARN,
+            ErrorDetails::DiclMissingOutput => tracing::Level::ERROR,
             ErrorDetails::DuplicateTool { .. } => tracing::Level::WARN,
             ErrorDetails::DynamicJsonSchema { .. } => tracing::Level::WARN,
+            ErrorDetails::DynamicEndpointNotFound { .. } => tracing::Level::WARN,
             ErrorDetails::FileRead { .. } => tracing::Level::ERROR,
             ErrorDetails::GCPCredentials { .. } => tracing::Level::ERROR,
             ErrorDetails::Inference { .. } => tracing::Level::ERROR,
@@ -554,6 +571,7 @@ impl ErrorDetails {
             ErrorDetails::InvalidBaseUrl { .. } => tracing::Level::ERROR,
             ErrorDetails::InvalidBatchParams { .. } => tracing::Level::ERROR,
             ErrorDetails::InvalidCandidate { .. } => tracing::Level::ERROR,
+            ErrorDetails::Glob { .. } => tracing::Level::ERROR,
             ErrorDetails::InvalidClientMode { .. } => tracing::Level::ERROR,
             ErrorDetails::InvalidDiclConfig { .. } => tracing::Level::ERROR,
             ErrorDetails::InvalidDatasetName { .. } => tracing::Level::WARN,
@@ -576,6 +594,7 @@ impl ErrorDetails {
             ErrorDetails::InvalidTemplatePath => tracing::Level::ERROR,
             ErrorDetails::InvalidTool { .. } => tracing::Level::ERROR,
             ErrorDetails::InvalidUuid { .. } => tracing::Level::ERROR,
+            ErrorDetails::InvalidDynamicEndpoint { .. } => tracing::Level::WARN,
             ErrorDetails::InvalidValFraction { .. } => tracing::Level::WARN,
             ErrorDetails::JsonRequest { .. } => tracing::Level::WARN,
             ErrorDetails::JsonSchema { .. } => tracing::Level::ERROR,
@@ -595,6 +614,8 @@ impl ErrorDetails {
             ErrorDetails::OutputValidation { .. } => tracing::Level::WARN,
             ErrorDetails::OptimizationResponse { .. } => tracing::Level::ERROR,
             ErrorDetails::ProviderNotFound { .. } => tracing::Level::ERROR,
+            ErrorDetails::PostgresConnectionInitialization { .. } => tracing::Level::ERROR,
+            ErrorDetails::PostgresMigration { .. } => tracing::Level::ERROR,
             ErrorDetails::Serialization { .. } => tracing::Level::ERROR,
             ErrorDetails::StreamError { .. } => tracing::Level::ERROR,
             ErrorDetails::ToolNotFound { .. } => tracing::Level::WARN,
@@ -622,6 +643,7 @@ impl ErrorDetails {
         match self {
             ErrorDetails::AllVariantsFailed { .. } => StatusCode::BAD_GATEWAY,
             ErrorDetails::ApiKeyMissing { .. } => StatusCode::BAD_REQUEST,
+            ErrorDetails::Glob { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::ExtraBodyReplacement { .. } => StatusCode::BAD_REQUEST,
             ErrorDetails::AppState { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::BadCredentialsPreInference { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -637,8 +659,10 @@ impl ErrorDetails {
             ErrorDetails::ObjectStoreUnconfigured { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::DatapointNotFound { .. } => StatusCode::NOT_FOUND,
             ErrorDetails::Config { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorDetails::DiclMissingOutput => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::DuplicateTool { .. } => StatusCode::BAD_REQUEST,
             ErrorDetails::DynamicJsonSchema { .. } => StatusCode::BAD_REQUEST,
+            ErrorDetails::DynamicEndpointNotFound { .. } => StatusCode::NOT_FOUND,
             ErrorDetails::FileRead { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::GCPCredentials { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::InvalidInferenceTarget { .. } => StatusCode::BAD_REQUEST,
@@ -669,6 +693,7 @@ impl ErrorDetails {
             ErrorDetails::InvalidCandidate { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::InvalidDiclConfig { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::InvalidDatasetName { .. } => StatusCode::BAD_REQUEST,
+            ErrorDetails::InvalidDynamicEndpoint { .. } => StatusCode::BAD_REQUEST,
             ErrorDetails::InvalidDynamicEvaluationRun { .. } => StatusCode::BAD_REQUEST,
             ErrorDetails::InvalidDynamicTemplatePath { .. } => StatusCode::BAD_REQUEST,
             ErrorDetails::InvalidFunctionVariants { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -702,6 +727,10 @@ impl ErrorDetails {
             ErrorDetails::OutputParsing { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::OutputValidation { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::ProviderNotFound { .. } => StatusCode::NOT_FOUND,
+            ErrorDetails::PostgresConnectionInitialization { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            ErrorDetails::PostgresMigration { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::Serialization { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::StreamError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorDetails::ToolNotFound { .. } => StatusCode::BAD_REQUEST,
@@ -826,8 +855,14 @@ impl std::fmt::Display for ErrorDetails {
                     "Error replacing extra body: `{message}` with pointer: `{pointer}`"
                 )
             }
-            ErrorDetails::ApiKeyMissing { provider_name } => {
-                write!(f, "API key missing for provider: {provider_name}")
+            ErrorDetails::Glob { glob, message } => {
+                write!(f, "Error using glob: `{glob}`: {message}")
+            }
+            ErrorDetails::ApiKeyMissing {
+                provider_name,
+                message,
+            } => {
+                write!(f, "API key missing for provider {provider_name}: {message}")
             }
             ErrorDetails::AppState { message } => {
                 write!(f, "Error initializing AppState: {message}")
@@ -880,6 +915,9 @@ impl std::fmt::Display for ErrorDetails {
                     "Datapoint not found for dataset: {dataset_name} and id: {datapoint_id}"
                 )
             }
+            ErrorDetails::DiclMissingOutput => {
+                write!(f, "DICL example missing output. There was a bug in a notebook from 2025-08 that may have caused the output to not be written to ClickHouse. You can remove the examples with missing output by running the query `DELETE FROM DynamicInContextLearningExample WHERE empty(output)`.")
+            }
             ErrorDetails::DuplicateTool { name } => {
                 write!(f, "Duplicate tool name: {name}. Tool names must be unique.")
             }
@@ -889,6 +927,10 @@ impl std::fmt::Display for ErrorDetails {
                     "Error in compiling client-provided JSON schema: {message}"
                 )
             }
+            ErrorDetails::DynamicEndpointNotFound { key_name } => {
+                write!(f, "Dynamic endpoint '{key_name}' not found in credentials")
+            }
+
             ErrorDetails::FileRead { message, file_path } => {
                 write!(f, "Error reading file {file_path}: {message}")
             }
@@ -990,6 +1032,9 @@ impl std::fmt::Display for ErrorDetails {
                     f,
                     "Dynamic evaluation run not found for episode id: {episode_id}",
                 )
+            }
+            ErrorDetails::InvalidDynamicEndpoint { url } => {
+                write!(f, "Invalid dynamic endpoint URL: {url}")
             }
             ErrorDetails::InvalidDynamicTemplatePath { name } => {
                 write!(f, "Invalid dynamic template path: {name}. There is likely a duplicate template in the config.")
@@ -1151,6 +1196,15 @@ impl std::fmt::Display for ErrorDetails {
             ErrorDetails::OutputValidation { source } => {
                 write!(f, "Output validation failed with messages: {source}")
             }
+            ErrorDetails::PostgresConnectionInitialization { message } => {
+                write!(
+                    f,
+                    "Postgres connection initialization failed with message: {message}"
+                )
+            }
+            ErrorDetails::PostgresMigration { message } => {
+                write!(f, "Postgres migration failed with message: {message}")
+            }
             ErrorDetails::ProviderNotFound { provider_name } => {
                 write!(f, "Provider not found: {provider_name}")
             }
@@ -1232,5 +1286,13 @@ impl IntoResponse for Error {
                 serde_json::to_value(self.get_details()).unwrap_or_else(|e| json!(e.to_string()));
         }
         (self.status_code(), Json(body)).into_response()
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(err: serde_json::Error) -> Self {
+        Self::new(ErrorDetails::Serialization {
+            message: err.to_string(),
+        })
     }
 }

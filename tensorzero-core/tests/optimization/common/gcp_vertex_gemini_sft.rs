@@ -1,4 +1,4 @@
-use crate::common::OptimizationTestCase;
+use crate::common::{mock_inference_provider_base, OptimizationTestCase};
 use tensorzero_core::{
     model::CredentialLocation,
     optimization::{
@@ -7,6 +7,8 @@ use tensorzero_core::{
     },
 };
 
+// Currently unused in 'mock_tests.rs'
+#[allow(clippy::allow_attributes, dead_code)]
 pub struct GCPVertexGeminiSFTTestCase();
 
 impl OptimizationTestCase for GCPVertexGeminiSFTTestCase {
@@ -30,7 +32,11 @@ impl OptimizationTestCase for GCPVertexGeminiSFTTestCase {
                     credentials: Some(CredentialLocation::Sdk),
                     seed: None,
                     api_base: if use_mock_inference_provider {
-                        Some("http://localhost:3030/gcp_vertex_gemini/".parse().unwrap())
+                        Some(
+                            mock_inference_provider_base()
+                                .join("gcp_vertex_gemini/")
+                                .unwrap(),
+                        )
                     } else {
                         None
                     },

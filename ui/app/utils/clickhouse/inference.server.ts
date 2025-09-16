@@ -7,7 +7,7 @@ import {
   JsonValueSchema,
 } from "./common";
 import {
-  contentBlockSchema,
+  contentBlockOutputSchema,
   getInferenceTableName,
   inputSchema,
 } from "./common";
@@ -556,7 +556,7 @@ export async function queryInferenceById(
             variant_name,
             episode_id,
             function_type
-        FROM InferenceById FINAL
+        FROM InferenceById
         WHERE id_uint = toUInt128({id:UUID})
         LIMIT 1
     )
@@ -631,7 +631,7 @@ async function parseModelInferenceRow(
   const processedRow = {
     ...row,
     input_messages: resolvedMessages,
-    output: z.array(contentBlockSchema).parse(JSON.parse(row.output)),
+    output: z.array(contentBlockOutputSchema).parse(JSON.parse(row.output)),
   };
   return parsedModelInferenceRowSchema.parse(processedRow);
 }

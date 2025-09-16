@@ -5,12 +5,11 @@ use axum::response::{IntoResponse, Response};
 use axum::{debug_handler, Json};
 use futures::stream::Stream;
 use metrics::counter;
-use object_store::{ObjectStore, PutMode, PutOptions};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,33 +17,32 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::StreamExt;
 use tracing::instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::cache::{CacheOptions, CacheParamsOptions};
-use crate::clickhouse::{ClickHouseConnectionInfo, TableName};
-use crate::config_parser::{Config, ObjectStoreInfo, UninitializedVariantInfo};
+use crate::config::{Config, ErrorContext, SchemaData, UninitializedVariantInfo};
+use crate::db::clickhouse::{ClickHouseConnectionInfo, TableName};
 use crate::embeddings::EmbeddingModelTable;
 use crate::error::{Error, ErrorDetails};
 use crate::function::FunctionConfig;
 use crate::function::{sample_variant, FunctionConfigChat};
 use crate::gateway_util::{AppState, AppStateData, StructuredJson};
+use crate::http::TensorzeroHttpClient;
 use crate::inference::types::extra_body::UnfilteredInferenceExtraBody;
 use crate::inference::types::extra_headers::UnfilteredInferenceExtraHeaders;
-use crate::inference::types::resolved_input::FileWithPath;
-use crate::inference::types::storage::StoragePath;
 use crate::inference::types::{
-    collect_chunks, Base64File, ChatInferenceDatabaseInsert, ChatInferenceResultChunk,
-    CollectChunksArgs, ContentBlockChatOutput, ContentBlockChunk, FetchContext, FinishReason,
-    InferenceResult, InferenceResultChunk, InferenceResultStream, Input,
-    InternalJsonInferenceOutput, JsonInferenceDatabaseInsert, JsonInferenceOutput,
-    JsonInferenceResultChunk, ModelInferenceResponseWithMetadata, RequestMessage, ResolvedInput,
-    ResolvedInputMessageContent, Usage,
+    collect_chunks, ChatInferenceDatabaseInsert, ChatInferenceResultChunk, CollectChunksArgs,
+    ContentBlockChatOutput, ContentBlockChunk, FetchContext, FinishReason, InferenceResult,
+    InferenceResultChunk, InferenceResultStream, Input, InternalJsonInferenceOutput,
+    JsonInferenceDatabaseInsert, JsonInferenceOutput, JsonInferenceResultChunk,
+    ModelInferenceResponseWithMetadata, RequestMessage, ResolvedInput, Usage,
 };
 use crate::jsonschema_util::DynamicJSONSchema;
 use crate::minijinja_util::TemplateConfig;
 use crate::model::ModelTable;
 use crate::tool::{DynamicToolParams, ToolCallConfig, ToolChoice};
-use crate::variant::chat_completion::ChatCompletionConfig;
+use crate::variant::chat_completion::UninitializedChatCompletionConfig;
 use crate::variant::dynamic::load_dynamic_variant_info;
 use crate::variant::{InferenceConfig, JsonMode, Variant, VariantConfig, VariantInfo};
 
@@ -205,7 +203,7 @@ pub struct InferenceIds {
 )]
 pub async fn inference(
     config: Arc<Config>,
-    http_client: &reqwest::Client,
+    http_client: &TensorzeroHttpClient,
     clickhouse_connection_info: ClickHouseConnectionInfo,
     params: Params,
 ) -> Result<InferenceOutput, Error> {
@@ -222,6 +220,9 @@ pub async fn inference(
     if let Some(episode_id) = &params.episode_id {
         span.record("episode_id", episode_id.to_string());
     }
+    for (tag_key, tag_value) in &params.tags {
+        span.set_attribute(format!("tags.{tag_key}"), tag_value.clone());
+    }
     // To be used for the Inference table processing_time measurements
     let start_time = Instant::now();
     let inference_id = Uuid::now_v7();
@@ -229,7 +230,7 @@ pub async fn inference(
     validate_tags(&params.tags, params.internal)?;
 
     // Retrieve or generate the episode ID
-    let episode_id = params.episode_id.unwrap_or(Uuid::now_v7());
+    let episode_id = params.episode_id.unwrap_or_else(Uuid::now_v7);
     let mut params = params;
     validate_inference_episode_id_and_apply_dynamic_evaluation_run(
         episode_id,
@@ -279,6 +280,8 @@ pub async fn inference(
         params.variant_name.as_deref(),
         params.internal_dynamic_variant_config,
         &mut templates,
+        &function,
+        function_name.clone(),
     )?;
     let templates = &*templates;
 
@@ -524,21 +527,29 @@ fn find_function(params: &Params, config: &Config) -> Result<(Arc<FunctionConfig
                         model_name.clone(),
                         Arc::new(VariantInfo {
                             timeouts: Default::default(),
-                            inner: VariantConfig::ChatCompletion(ChatCompletionConfig {
-                                model: (&**model_name).into(),
-                                ..Default::default()
-                            }),
+                            inner: VariantConfig::ChatCompletion(
+                                UninitializedChatCompletionConfig {
+                                    model: (&**model_name).into(),
+                                    ..Default::default()
+                                }
+                                .load(
+                                    &SchemaData::default(),
+                                    &ErrorContext {
+                                        function_name: "tensorzero::default".to_string(),
+                                        variant_name: model_name.clone(),
+                                    },
+                                )?,
+                            ),
                         }),
                     )]
                     .into_iter()
                     .collect(),
-                    system_schema: None,
-                    user_schema: None,
-                    assistant_schema: None,
+                    schemas: SchemaData::default(),
                     tools: vec![],
                     tool_choice: ToolChoice::Auto,
                     parallel_tool_calls: None,
                     description: None,
+                    all_explicit_templates_names: HashSet::new(),
                 })),
                 DEFAULT_FUNCTION_NAME.to_string(),
             ))
@@ -707,6 +718,7 @@ fn create_stream(
                         ).await;
 
                 }
+                drop(clickhouse_connection_info);
             };
             if async_write {
                 tokio::spawn(write_future);
@@ -776,51 +788,6 @@ pub struct InferenceDatabaseInsertMetadata {
     pub extra_headers: UnfilteredInferenceExtraHeaders,
 }
 
-async fn write_file(
-    object_store: &Option<ObjectStoreInfo>,
-    raw: &Base64File,
-    storage_path: &StoragePath,
-) -> Result<(), Error> {
-    if let Some(object_store) = object_store {
-        // The store might be explicitly disabled
-        if let Some(store) = object_store.object_store.as_ref() {
-            let data = raw.data()?;
-            let bytes = aws_smithy_types::base64::decode(data).map_err(|e| {
-                Error::new(ErrorDetails::ObjectStoreWrite {
-                    message: format!("Failed to decode file as base64: {e:?}"),
-                    path: storage_path.clone(),
-                })
-            })?;
-            let res = store
-                .put_opts(
-                    &storage_path.path,
-                    bytes.into(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            match res {
-                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
-                Err(e) => {
-                    return Err(ErrorDetails::ObjectStoreWrite {
-                        message: format!("Failed to write file to object store: {e:?}"),
-                        path: storage_path.clone(),
-                    }
-                    .into());
-                }
-            }
-        }
-    } else {
-        return Err(ErrorDetails::InternalError {
-            message: "Called `write_file` with no object store configured".to_string(),
-        }
-        .into());
-    }
-    Ok(())
-}
-
 async fn write_inference(
     clickhouse_connection_info: &ClickHouseConnectionInfo,
     config: &Config,
@@ -828,49 +795,36 @@ async fn write_inference(
     result: InferenceResult,
     metadata: InferenceDatabaseInsertMetadata,
 ) {
-    let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
-    if config.gateway.observability.enabled.unwrap_or(true) {
-        for message in &input.messages {
-            for content_block in &message.content {
-                if let ResolvedInputMessageContent::File(file) = content_block {
-                    let FileWithPath {
-                        file: raw,
-                        storage_path,
-                    } = &**file;
-
-                    futures.push(Box::pin(async {
-                        if let Err(e) =
-                            write_file(&config.object_store_info, raw, storage_path).await
-                        {
-                            tracing::error!("Failed to write image to object store: {e:?}");
-                        }
-                    }));
-                }
-            }
-        }
-    }
+    let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
+        input.clone().write_all_files(config);
     let model_responses: Vec<serde_json::Value> = result.get_serialized_model_inferences();
     futures.push(Box::pin(async {
         // Write the model responses to the ModelInference table
         for response in model_responses {
             let _ = clickhouse_connection_info
-                .write(&[response], TableName::ModelInference)
+                .write_batched(&[response], TableName::ModelInference)
                 .await;
         }
         // Write the inference to the Inference table
         match result {
             InferenceResult::Chat(result) => {
-                let chat_inference =
-                    ChatInferenceDatabaseInsert::new(result, input.clone(), metadata);
+                let chat_inference = ChatInferenceDatabaseInsert::new(
+                    result,
+                    input.clone().into_stored_input(),
+                    metadata,
+                );
                 let _ = clickhouse_connection_info
-                    .write(&[chat_inference], TableName::ChatInference)
+                    .write_batched(&[chat_inference], TableName::ChatInference)
                     .await;
             }
             InferenceResult::Json(result) => {
-                let json_inference =
-                    JsonInferenceDatabaseInsert::new(result, input.clone(), metadata);
+                let json_inference = JsonInferenceDatabaseInsert::new(
+                    result,
+                    input.clone().into_stored_input(),
+                    metadata,
+                );
                 let _ = clickhouse_connection_info
-                    .write(&[json_inference], TableName::JsonInference)
+                    .write_batched(&[json_inference], TableName::JsonInference)
                     .await;
             }
         }
@@ -1127,7 +1081,7 @@ impl InferenceResponseChunk {
 
 // Carryall struct for clients used in inference
 pub struct InferenceClients<'a> {
-    pub http_client: &'a reqwest::Client,
+    pub http_client: &'a TensorzeroHttpClient,
     pub clickhouse_connection_info: &'a ClickHouseConnectionInfo,
     pub credentials: &'a InferenceCredentials,
     pub cache_options: &'a CacheOptions,
@@ -1213,6 +1167,8 @@ fn prepare_candidate_variants(
     pinned_variant_name: Option<&str>,
     dynamic_variant_config: Option<UninitializedVariantInfo>,
     template_config: &mut Cow<'_, TemplateConfig>,
+    function: &FunctionConfig,
+    function_name: String,
 ) -> Result<(), Error> {
     match (pinned_variant_name, dynamic_variant_config) {
         // If a variant is pinned, only that variant should be attempted
@@ -1233,7 +1189,11 @@ fn prepare_candidate_variants(
         }
         (None, Some(dynamic_variant_config)) => {
             // Replace the variant config with just the dynamic variant
-            let candidate_variant_info = load_dynamic_variant_info(dynamic_variant_config)?;
+            let candidate_variant_info = load_dynamic_variant_info(
+                dynamic_variant_config,
+                function.schemas(),
+                function_name,
+            )?;
 
             // Replace templates in the template config with the ones passed in
             // We Clone here so that we can still reference the old templates that don't conflict

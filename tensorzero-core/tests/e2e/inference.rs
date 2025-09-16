@@ -1,5 +1,6 @@
-#![expect(clippy::print_stdout)]
+#![expect(clippy::print_stdout, clippy::print_stderr)]
 use std::collections::HashMap;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     otel::{
@@ -19,12 +20,20 @@ use tensorzero::{
     ClientBuilder, ClientBuilderMode, ClientInferenceParams, ClientInput, ClientInputMessage,
     ClientInputMessageContent, InferenceOutput, InferenceResponse,
 };
+use tensorzero_core::inference::types::StoredInput;
 use tensorzero_core::{
-    clickhouse::test_helpers::get_clickhouse_replica,
+    db::clickhouse::test_helpers::get_clickhouse_replica,
+    db::clickhouse::{
+        test_helpers::{
+            select_all_model_inferences_by_chat_episode_id_clickhouse,
+            select_chat_inferences_clickhouse,
+        },
+        ClickHouseConnectionInfo,
+    },
     endpoints::inference::ChatInferenceResponse,
     inference::types::{
-        ContentBlock, ContentBlockOutput, File, RequestMessage, ResolvedInput,
-        ResolvedInputMessageContent, Role, Text, TextKind,
+        ContentBlock, ContentBlockOutput, File, RequestMessage, Role, StoredInputMessageContent,
+        Text, TextKind,
     },
     providers::dummy::{
         DUMMY_BAD_TOOL_RESPONSE, DUMMY_INFER_RESPONSE_CONTENT, DUMMY_INFER_RESPONSE_RAW,
@@ -33,11 +42,12 @@ use tensorzero_core::{
     },
     tool::{ToolCall, ToolCallInput},
 };
+use tokio::task::JoinSet;
 use tracing_test::traced_test;
 use url::Url;
 use uuid::Uuid;
 
-use tensorzero_core::clickhouse::test_helpers::{
+use tensorzero_core::db::clickhouse::test_helpers::{
     get_clickhouse, select_chat_inference_clickhouse, select_json_inference_clickhouse,
     select_model_inference_clickhouse,
 };
@@ -139,8 +149,8 @@ async fn e2e_test_inference_chat_strip_unknown_block_non_stream() {
     let episode_id = response_json.get("episode_id").unwrap().as_str().unwrap();
     let episode_id = Uuid::parse_str(episode_id).unwrap();
 
-    // Sleep for 100ms second to allow time for data to be inserted into ClickHouse (trailing writes from API)
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Sleep for 200ms second to allow time for data to be inserted into ClickHouse (trailing writes from API)
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Check ClickHouse
     let clickhouse = get_clickhouse().await;
@@ -287,8 +297,8 @@ async fn test_dummy_only_inference_chat_strip_unknown_block_stream() {
     let episode_id =
         Uuid::parse_str(chunk_json.get("episode_id").unwrap().as_str().unwrap()).unwrap();
 
-    // Sleep for 100ms second to allow time for data to be inserted into ClickHouse (trailing writes from API)
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Sleep for 200ms second to allow time for data to be inserted into ClickHouse (trailing writes from API)
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Check ClickHouse
     let clickhouse = get_clickhouse().await;
@@ -1109,7 +1119,7 @@ async fn e2e_test_inference_json_success() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"country": "Japan"}}]
+                "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
             }
         ]
     });
@@ -1260,7 +1270,7 @@ async fn e2e_test_variant_failover() {
             "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"type": "tacos", "quantity": 13}}]
+                "content": [{"type": "template", "name": "user", "arguments": {"type": "tacos", "quantity": 13}}]
             }
         ]}
     );
@@ -2645,7 +2655,10 @@ pub async fn e2e_test_dynamic_api_key() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let response_json = response.json::<Value>().await.unwrap();
     let error_message = response_json.get("error").unwrap().as_str().unwrap();
-    assert!(error_message.contains("API key missing for provider: Dummy"));
+    assert!(
+        error_message.contains("API key missing for provider Dummy"),
+        "Unexpected error message: {error_message}"
+    );
 
     let payload = json!({
         "function_name": "basic_test",
@@ -2863,7 +2876,7 @@ async fn test_dummy_only_embedded_gateway_no_config() {
     };
 
     // Sleep to allow time for data to be inserted into ClickHouse (trailing writes from API)
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Check if ClickHouse is ok - ChatInference Table
     let clickhouse = get_clickhouse().await;
@@ -2904,7 +2917,7 @@ async fn test_dummy_only_replicated_clickhouse() {
     };
 
     // Sleep to allow time for data to be inserted into ClickHouse (trailing writes from API)
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Check if ClickHouse is ok - ChatInference Table
     let clickhouse = get_clickhouse().await;
@@ -3120,7 +3133,7 @@ async fn test_dummy_only_inference_invalid_default_function_arg() {
     let response_text = response.text().await.unwrap();
     assert!(
         response_text.contains(
-            "Message has non-string content but there is no schema given for role system."
+            "System message has non-string content but there is no template `system` in any variant"
         ),
         "Unexpected error message: {response_text}",
     );
@@ -3637,7 +3650,7 @@ async fn check_json_cot_inference_response(
     assert!(output_tokens > 0);
 
     // Sleep to allow time for data to be inserted into ClickHouse (trailing writes from API)
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Check if ClickHouse is ok - JsonInference Table
     let clickhouse = get_clickhouse().await;
@@ -3666,7 +3679,7 @@ async fn check_json_cot_inference_response(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": {"country": "Japan"}}]
+                "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
             }
         ]
     });
@@ -3832,6 +3845,9 @@ async fn test_multiple_text_blocks_in_message() {
     let response = response.json::<Value>().await.unwrap();
     let inference_id = response.get("inference_id").unwrap().as_str().unwrap();
     let inference_id = Uuid::parse_str(inference_id).unwrap();
+    // Sleep for 200ms to allow time for data to be inserted into ClickHouse (trailing writes from API)
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
     // Get the ClickHouse inference
     let clickhouse = get_clickhouse().await;
     let result = select_chat_inference_clickhouse(&clickhouse, inference_id)
@@ -3840,15 +3856,151 @@ async fn test_multiple_text_blocks_in_message() {
 
     // Check that the inference has multiple content blocks
     let input = result.get("input").unwrap().as_str().unwrap();
-    let input: ResolvedInput = serde_json::from_str(input).unwrap();
+    let input: StoredInput = serde_json::from_str(input).unwrap();
     assert_eq!(input.messages.len(), 1);
     assert_eq!(input.messages[0].content.len(), 2);
     assert!(matches!(
         input.messages[0].content[0],
-        ResolvedInputMessageContent::Text { .. }
+        StoredInputMessageContent::Text { .. }
     ));
     assert!(matches!(
         input.messages[0].content[1],
-        ResolvedInputMessageContent::Text { .. }
+        StoredInputMessageContent::Text { .. }
     ));
+}
+
+// We don't use the word 'batch' in the test name, since we already
+// group those tests as 'batch inference' tests
+#[tokio::test(flavor = "multi_thread")]
+async fn test_clickhouse_bulk_insert_off_default() {
+    let client = Arc::new(
+        make_embedded_gateway_with_config(
+            "
+    ",
+        )
+        .await,
+    );
+
+    let ClickHouseConnectionInfo::Production { batch_sender, .. } = client
+        .get_app_state_data()
+        .unwrap()
+        .clickhouse_connection_info
+        .clone()
+    else {
+        panic!("Clickhouse client was not production!");
+    };
+    assert!(
+        batch_sender.is_none(),
+        "Batching should not have been enabled!"
+    );
+}
+
+// We don't use the word 'batch' in the test name, since we already
+// group those tests as 'batch inference' tests
+#[tokio::test(flavor = "multi_thread")]
+async fn test_clickhouse_bulk_insert() {
+    let client = Arc::new(
+        make_embedded_gateway_with_config(
+            "
+    [gateway.observability]
+    enabled = true
+    batch_writes = { enabled = true }
+    ",
+        )
+        .await,
+    );
+
+    let ClickHouseConnectionInfo::Production { batch_sender, .. } = client
+        .get_app_state_data()
+        .unwrap()
+        .clickhouse_connection_info
+        .clone()
+    else {
+        panic!("Clickhouse client was not production!");
+    };
+    assert!(batch_sender.is_some(), "Batching was not enabled!");
+
+    let mut join_set = JoinSet::new();
+    let episode_id = Uuid::now_v7();
+    let inference_count = 10_000;
+    for _ in 0..inference_count {
+        let client = client.clone();
+        join_set.spawn(async move {
+            client
+                .inference(ClientInferenceParams {
+                    episode_id: Some(episode_id),
+                    model_name: Some("dummy::my-model".to_string()),
+                    input: ClientInput {
+                        system: None,
+                        messages: vec![ClientInputMessage {
+                            role: Role::User,
+                            content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                                text: "What is the name of the capital city of Japan?".to_string(),
+                            })],
+                        }],
+                    },
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+        });
+    }
+
+    let mut expected_inference_ids = HashSet::new();
+    while let Some(result) = join_set.join_next().await {
+        let result = result.unwrap();
+        let InferenceOutput::NonStreaming(response) = result else {
+            panic!("Expected non-streaming response");
+        };
+        expected_inference_ids.insert(response.inference_id());
+    }
+    assert_eq!(expected_inference_ids.len(), inference_count);
+
+    assert_eq!(Arc::strong_count(&client), 1);
+    drop(batch_sender);
+    eprintln!("Dropping client");
+    // Drop the last client, which will drop all of our `ClickhouseConnectionInfo`s
+    // and allow the batch writer to shut down.
+    drop(client);
+    eprintln!("Dropped client");
+    // Wait for ClickHouse to finish processing batch writes.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    let clickhouse_client = get_clickhouse().await;
+    let inferences = select_chat_inferences_clickhouse(&clickhouse_client, episode_id)
+        .await
+        .unwrap();
+    let actual_inference_ids = inferences
+        .iter()
+        .map(|i| {
+            i.get("id")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap()
+        })
+        .collect::<HashSet<_>>();
+
+    assert_eq!(actual_inference_ids.len(), inference_count);
+    assert_eq!(actual_inference_ids, expected_inference_ids);
+
+    let model_inferences =
+        select_all_model_inferences_by_chat_episode_id_clickhouse(episode_id, &clickhouse_client)
+            .await
+            .unwrap();
+
+    let actual_model_inference_ids = model_inferences
+        .iter()
+        .map(|i| {
+            i.get("inference_id")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(actual_model_inference_ids.len(), inference_count);
+    assert_eq!(actual_model_inference_ids, expected_inference_ids);
 }

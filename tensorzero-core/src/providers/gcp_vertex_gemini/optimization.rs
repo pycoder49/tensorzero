@@ -8,7 +8,7 @@ use super::{
     GCPVertexGeminiFileURI, GCPVertexGeminiSupervisedRow,
 };
 use crate::{
-    config_parser::TimeoutsConfig,
+    config::TimeoutsConfig,
     error::{Error, ErrorDetails},
     inference::types::{ContentBlock, FlattenUnknown},
     model::{
@@ -208,7 +208,7 @@ pub fn convert_to_optimizer_status(
                 },
                 extra_headers: None,
                 extra_body: None,
-                timeouts: None,
+                timeouts: TimeoutsConfig::default(),
                 discard_unknown_chunks: false,
             };
             OptimizationJobInfo::Completed {
@@ -249,9 +249,13 @@ impl Display for GCPVertexGeminiFineTuningJobStatus {
 #[cfg(test)]
 mod tests {
     use crate::{
-        inference::types::{ContentBlockChatOutput, ModelInput, RequestMessage, Role, Text},
+        inference::types::{
+            ContentBlockChatOutput, ModelInput, RequestMessage, Role, StoredInput,
+            StoredInputMessage, StoredInputMessageContent, Text,
+        },
         model::CredentialLocation,
         providers::gcp_vertex_gemini::GCPVertexGeminiContentPart,
+        stored_inference::StoredOutput,
     };
     use serde_json::json;
 
@@ -259,6 +263,9 @@ mod tests {
 
     #[test]
     fn test_convert_to_sft_row() {
+        let output = Some(vec![ContentBlockChatOutput::Text(Text {
+            text: "The capital of France is Paris.".to_string(),
+        })]);
         let inference = RenderedSample {
             function_name: "test".to_string(),
             input: ModelInput {
@@ -270,9 +277,17 @@ mod tests {
                     })],
                 }],
             },
-            output: Some(vec![ContentBlockChatOutput::Text(Text {
-                text: "The capital of France is Paris.".to_string(),
-            })]),
+            stored_input: StoredInput {
+                system: Some(json!("You are a helpful assistant named Dr. M.M. Patel.")),
+                messages: vec![StoredInputMessage {
+                    role: Role::User,
+                    content: vec![StoredInputMessageContent::Text {
+                        value: json!("What is the capital of France?"),
+                    }],
+                }],
+            },
+            output: output.clone(),
+            stored_output: output.map(StoredOutput::Chat),
             episode_id: Some(uuid::Uuid::now_v7()),
             inference_id: Some(uuid::Uuid::now_v7()),
             tool_params: None,

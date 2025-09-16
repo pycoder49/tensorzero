@@ -51,7 +51,7 @@ RUN pnpm install --frozen-lockfile --prod
 
 # ========== tensorzero-node-build-env ==========
 
-FROM rust:latest AS tensorzero-node-build-env
+FROM rust:1.88.0 AS tensorzero-node-build-env
 
 RUN apt-get update && apt-get install -y nodejs npm && rm -rf /var/lib/apt/lists/*
 RUN npm install -g pnpm
@@ -138,4 +138,4 @@ ENV RUST_LOG=warn
 ENV TENSORZERO_UI_CONFIG_PATH=/app/config/tensorzero.toml
 
 ENTRYPOINT ["./entrypoint.sh"]
-HEALTHCHECK --start-period=10s --start-interval=1s --timeout=1s CMD wget --no-verbose --tries=1 --spider http://localhost:4000/api/tensorzero/status
+HEALTHCHECK --start-period=10s --start-interval=1s --timeout=1s CMD wget --no-verbose --tries=1 --spider http://localhost:4000/health

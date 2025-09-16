@@ -2,19 +2,20 @@ use std::collections::HashMap;
 
 use reqwest::Url;
 use tensorzero_core::{
-    clickhouse::ClickHouseConnectionInfo,
+    db::clickhouse::ClickHouseConnectionInfo,
     endpoints::datasets::{DatapointKind, CLICKHOUSE_DATETIME_FORMAT},
 };
 use uuid::Uuid;
 
 lazy_static::lazy_static! {
-    static ref GATEWAY_URL: String = std::env::var("GATEWAY_URL").unwrap_or("http://localhost:3000".to_string());
+    static ref GATEWAY_URL: String = std::env::var("TENSORZERO_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
 }
 
 pub fn get_gateway_endpoint(endpoint: &str) -> Url {
     let base_url: Url = GATEWAY_URL
         .parse()
-        .expect("Invalid gateway URL (check environment variable GATEWAY_URL)");
+        .expect("Invalid gateway URL (check environment variable TENSORZERO_GATEWAY_URL)");
 
     base_url.join(endpoint).unwrap()
 }
@@ -35,9 +36,7 @@ pub async fn delete_datapoint(
             ("id", datapoint_id.to_string().as_str())
         ])).await.unwrap();
 
-    if datapoint.response.is_empty() {
-        panic!("Datapoint not found with params {datapoint_kind:?}, {function_name}, {dataset_name}, {datapoint_id}");
-    }
+    assert!(!datapoint.response.is_empty(), "Datapoint not found with params {datapoint_kind:?}, {function_name}, {dataset_name}, {datapoint_id}");
 
     let mut datapoint_json: serde_json::Value = serde_json::from_str(&datapoint.response).unwrap();
 
@@ -48,7 +47,7 @@ pub async fn delete_datapoint(
         format!("{}", chrono::Utc::now().format(CLICKHOUSE_DATETIME_FORMAT)).into();
 
     clickhouse
-        .write(&[datapoint_json], datapoint_kind.table_name())
+        .write_batched(&[datapoint_json], datapoint_kind.table_name())
         .await
         .unwrap();
 }

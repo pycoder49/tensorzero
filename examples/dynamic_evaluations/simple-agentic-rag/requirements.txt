@@ -478,6 +478,10 @@ nest-asyncio==1.6.0 \
     --hash=sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe \
     --hash=sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c
     # via ipykernel
+nodeenv==1.9.1 \
+    --hash=sha256:6ec12890a2dab7946721edbfbcd91f3319c6ccc9aec47be7c7e6b7011ee6645f \
+    --hash=sha256:ba11c9782d29c27c70ffbdda2d7415098754709be8a7056d79a737cd901155c9
+    # via pyright
 notebook==7.4.3 \
     --hash=sha256:9cdeee954e04101cadb195d90e2ab62b7c9286c1d4f858bf3bb54e40df16c0c3 \
     --hash=sha256:a1567481cd3853f2610ee0ecf5dfa12bb508e878ee8f92152c134ef7f0568a76
@@ -560,6 +564,9 @@ pygments==2.19.2 \
     #   ipython-pygments-lexers
     #   jupyter-console
     #   nbconvert
+pyright==1.1.404 \
+    --hash=sha256:455e881a558ca6be9ecca0b30ce08aa78343ecc031d37a198ffa9a7a1abeb63e \
+    --hash=sha256:c7b7ff1fdb7219c643079e4c3e7d4125f0dafcc19d253b47e898d130ea426419
 python-dateutil==2.9.0.post0 \
     --hash=sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3 \
     --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
@@ -838,15 +845,15 @@ stack-data==0.6.3 \
     --hash=sha256:836a778de4fec4dcd1dcd89ed8abff8a221f58308462e1c4aa2a3cf30148f0b9 \
     --hash=sha256:d5558e0c25a4cb0853cddad3d77da9891a08cb85dd9f9f91b9f8cd66e511e695
     # via ipython
-tensorzero==2025.6.2 \
-    --hash=sha256:179c6371fcc7c3dc731f4f5f0fc4df25f70b0bafa109a74971b2b1905985240f \
-    --hash=sha256:26f4c099cd4ef2b4775ad86728faa58fb81b085ba2aacb51095345817b0678f8 \
-    --hash=sha256:4e1f7901cca4ee0cb68450405baf20923a42213590d623d13b040fb1fd2e3c78 \
-    --hash=sha256:4e8b90b9cd71210471ab746ff8e2ca2a292419ebb01e2d300e14bac9f44dd08b \
-    --hash=sha256:67364b6d0de2a74fbd55db2d158203bf27f15caeed7b87f2b357ee857366f39f \
-    --hash=sha256:6b31ccea665232fdd70c923fcd41cf86c008b2d9a313fff80f1977a32ae2bfcf \
-    --hash=sha256:95efe4ba31def003512a954e00a3b76b538cc23e23c9053080d3b721c2f7167b \
-    --hash=sha256:ef0f15f01f3d90e3c59aef37090f26d1407f3c5e65b90e2accb1b2e50c82d4fb
+tensorzero==2025.8.5 \
+    --hash=sha256:298511a573c608a0601af28b92995d76990b6d77bd44d2b3d290e3b59eba2635 \
+    --hash=sha256:3016d9e999899775c583a55385860e90d6020df2213fa14e244b4ef570529f26 \
+    --hash=sha256:4cbdfeaac7464c78760152442a54de937cd2cece8237dfe8f06e0a12008f5ab6 \
+    --hash=sha256:78b4247f1ab9c6880d1f506d0cb7c237cb33e884da73f9554a67489f22cd4c8d \
+    --hash=sha256:944efe60dce1f8838aa2f6cc54cbd47714d0a64ddbd9dab617c033ef7bb275b4 \
+    --hash=sha256:a022ae72f743531800063adff3d7154fe03d2ba4895352f36e088a20c8bc8c1e \
+    --hash=sha256:cbec01cb68f4be8fbb53670e7e737e1b0872a4c6d30ef3cde1a4b078931a3b9e \
+    --hash=sha256:eacac182f4a34e713056dbc3442982f38f092d3a452e1505d449000e2de90d4a
     # via tensorzero-examples-rag-retrieval-augmented-generation-simple-agentic-rag
 terminado==0.18.1 \
     --hash=sha256:a4468e1b37bb318f8a86514f65814e1afc977cf29b3992a4500d9dd305dcceb0 \
@@ -948,6 +955,7 @@ typing-extensions==4.14.0 \
     #   exceptiongroup
     #   ipython
     #   mistune
+    #   pyright
     #   referencing
     #   tensorzero
 uri-template==1.3.0 \

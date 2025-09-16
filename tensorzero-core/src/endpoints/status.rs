@@ -1,4 +1,7 @@
-use crate::gateway_util::{AppState, AppStateData};
+use crate::{
+    db::HealthCheckable,
+    gateway_util::{AppState, AppStateData},
+};
 use axum::debug_handler;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -47,7 +50,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::config_parser::Config;
+    use crate::config::Config;
     use crate::testing::get_unit_test_gateway_handle;
 
     use super::*;

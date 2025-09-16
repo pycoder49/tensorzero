@@ -18,11 +18,12 @@ use super::inference::{
     InferenceIds, InferenceModels, InferenceParams, InferenceResponse, JsonInferenceResponse,
 };
 use crate::cache::{CacheEnabledMode, CacheOptions};
-use crate::clickhouse::{ClickHouseConnectionInfo, TableName};
-use crate::config_parser::Config;
+use crate::config::Config;
+use crate::db::clickhouse::{ClickHouseConnectionInfo, TableName};
 use crate::error::{Error, ErrorDetails};
 use crate::function::{sample_variant, FunctionConfig};
 use crate::gateway_util::{AppState, AppStateData, StructuredJson};
+use crate::http::TensorzeroHttpClient;
 use crate::inference::types::batch::{
     BatchEpisodeIds, BatchEpisodeIdsWithSize, BatchInferenceDatabaseInsertMetadata,
     BatchInferenceParams, BatchInferenceParamsWithSize, BatchModelInferenceRow,
@@ -33,7 +34,8 @@ use crate::inference::types::{batch::StartBatchModelInferenceWithMetadata, Input
 use crate::inference::types::{
     current_timestamp, ChatInferenceDatabaseInsert, ContentBlockChatOutput, FetchContext,
     FinishReason, InferenceDatabaseInsert, InferenceResult, JsonInferenceDatabaseInsert,
-    JsonInferenceOutput, Latency, ModelInferenceResponseWithMetadata, Usage,
+    JsonInferenceOutput, Latency, ModelInferenceResponseWithMetadata, RequestMessagesOrBatch,
+    Usage,
 };
 use crate::inference::types::{RequestMessage, ResolvedInput};
 use crate::jsonschema_util::DynamicJSONSchema;
@@ -46,7 +48,7 @@ use crate::variant::{BatchInferenceConfig, InferenceConfig, Variant, VariantInfo
 
 /// The expected payload to the `/start_batch_inference` endpoint.
 /// It will be a JSON object with the following fields:
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartBatchInferenceParams {
     // the function name
@@ -105,14 +107,21 @@ pub type BatchOutputSchemas = Vec<Option<Value>>;
 )]
 #[debug_handler(state = AppStateData)]
 pub async fn start_batch_inference_handler(
-    State(AppStateData {
+    State(app_state): State<AppStateData>,
+    StructuredJson(params): StructuredJson<StartBatchInferenceParams>,
+) -> Result<Response<Body>, Error> {
+    Ok(Json(start_batch_inference(app_state, params).await?).into_response())
+}
+
+pub async fn start_batch_inference(
+    AppStateData {
         config,
         http_client,
         clickhouse_connection_info,
         ..
-    }): AppState,
-    StructuredJson(params): StructuredJson<StartBatchInferenceParams>,
-) -> Result<Response<Body>, Error> {
+    }: AppStateData,
+    params: StartBatchInferenceParams,
+) -> Result<PrepareBatchInferenceOutput, Error> {
     // Get the function config or return an error if it doesn't exist
     let function = config.get_function(&params.function_name)?;
     let num_inferences = params.inputs.len();
@@ -288,6 +297,7 @@ pub async fn start_batch_inference_handler(
 
         let (batch_id, inference_ids) = write_start_batch_inference(
             &clickhouse_connection_info,
+            &config,
             resolved_inputs,
             result,
             write_metadata,
@@ -295,12 +305,11 @@ pub async fn start_batch_inference_handler(
             &inference_configs,
         )
         .await?;
-        return Ok(Json(PrepareBatchInferenceOutput {
+        return Ok(PrepareBatchInferenceOutput {
             batch_id,
             inference_ids,
             episode_ids,
-        })
-        .into_response());
+        });
     }
 
     // Eventually, if we get here, it means we tried every variant and none of them worked
@@ -312,10 +321,10 @@ pub async fn start_batch_inference_handler(
 
 // Determines the return type of the `/start_batch_inference` endpoint upon success
 #[derive(Debug, Serialize)]
-struct PrepareBatchInferenceOutput {
-    batch_id: Uuid,
-    inference_ids: Vec<Uuid>,
-    episode_ids: Vec<Uuid>,
+pub struct PrepareBatchInferenceOutput {
+    pub batch_id: Uuid,
+    pub inference_ids: Vec<Uuid>,
+    pub episode_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,7 +520,7 @@ pub async fn get_batch_request(
 /// and if it's newly completed, the response.
 async fn poll_batch_inference(
     batch_request: &BatchRequestRow<'static>,
-    http_client: reqwest::Client,
+    http_client: TensorzeroHttpClient,
     models: &ModelTable,
     credentials: &InferenceCredentials,
 ) -> Result<PollBatchInferenceResponse, Error> {
@@ -555,6 +564,7 @@ struct BatchInferenceRowHelper<'a> {
 
 async fn write_start_batch_inference<'a>(
     clickhouse_connection_info: &ClickHouseConnectionInfo,
+    config: &Config,
     inputs: Vec<ResolvedInput>,
     result: StartBatchModelInferenceWithMetadata<'a>,
     metadata: BatchInferenceDatabaseInsertMetadata<'a>,
@@ -603,11 +613,14 @@ async fn write_start_batch_inference<'a>(
         },
     );
     let mut rows: Vec<BatchModelInferenceRow<'_>> = vec![];
+    let mut file_futures = Vec::new();
 
     // Process each row by serializing the stuff that needs to be serialized twice
     for row in inference_rows {
         let tool_params: Option<ToolCallConfigDatabaseInsert> =
             row.tool_config.map(|tc| tc.clone().into());
+
+        file_futures.extend(row.input.clone().write_all_files(config));
 
         rows.push(BatchModelInferenceRow {
             inference_id: *row.inference_id,
@@ -615,8 +628,12 @@ async fn write_start_batch_inference<'a>(
             function_name: metadata.function_name.into(),
             variant_name: metadata.variant_name.into(),
             episode_id: metadata.episode_ids[rows.len()],
-            input: row.input,
-            input_messages: row.input_messages,
+            input: row.input.into_stored_input(),
+            input_messages: row
+                .input_messages
+                .into_iter()
+                .map(RequestMessage::into_stored_message)
+                .collect(),
             system: row.system.map(Cow::Borrowed),
             tool_params,
             inference_params: Cow::Borrowed(row.inference_params),
@@ -628,8 +645,10 @@ async fn write_start_batch_inference<'a>(
         });
     }
 
+    futures::future::join_all(file_futures).await;
+
     clickhouse_connection_info
-        .write(rows.as_slice(), TableName::BatchModelInference)
+        .write_batched(rows.as_slice(), TableName::BatchModelInference)
         .await?;
 
     let batch_request_insert = BatchRequestRow::new(UnparsedBatchRequestRow {
@@ -660,7 +679,7 @@ pub async fn write_batch_request_row(
     batch_request: &BatchRequestRow<'_>,
 ) -> Result<(), Error> {
     clickhouse_connection_info
-        .write(&[batch_request], TableName::BatchRequest)
+        .write_batched(&[batch_request], TableName::BatchRequest)
         .await
 }
 
@@ -758,7 +777,7 @@ async fn write_batch_request_status_update(
         errors: vec![], // TODO (#503): add better error handling
     });
     clickhouse_connection_info
-        .write(&[batch_request_insert], TableName::BatchRequest)
+        .write_batched(&[batch_request_insert], TableName::BatchRequest)
         .await?;
     Ok(())
 }
@@ -836,7 +855,7 @@ pub async fn write_completed_batch_inference<'a>(
             created: current_timestamp(),
             output: output.clone(),
             system: system.map(Cow::into_owned),
-            input_messages,
+            input_messages: RequestMessagesOrBatch::BatchInput(input_messages),
             raw_request: raw_request.into_owned(),
             raw_response,
             usage,
@@ -916,18 +935,18 @@ pub async fn write_completed_batch_inference<'a>(
     match &**function {
         FunctionConfig::Chat(_chat_function) => {
             clickhouse_connection_info
-                .write(&inference_rows_to_write, TableName::ChatInference)
+                .write_batched(&inference_rows_to_write, TableName::ChatInference)
                 .await?;
         }
         FunctionConfig::Json(_json_function) => {
             clickhouse_connection_info
-                .write(&inference_rows_to_write, TableName::JsonInference)
+                .write_batched(&inference_rows_to_write, TableName::JsonInference)
                 .await?;
         }
     }
     // Write all the ModelInference rows to the database
     clickhouse_connection_info
-        .write(&model_inference_rows_to_write, TableName::ModelInference)
+        .write_batched(&model_inference_rows_to_write, TableName::ModelInference)
         .await?;
 
     Ok(inferences)
@@ -1030,8 +1049,9 @@ pub async fn get_completed_batch_inference_response(
                 let query = format!(
                     "WITH inf_lookup AS (
                         SELECT episode_id
-                        FROM InferenceById FINAL
+                        FROM InferenceById
                         WHERE id_uint = toUInt128(toUUID('{}'))
+                        LIMIT 1
                     )
                     SELECT
                         ci.id as inference_id,
@@ -1129,8 +1149,9 @@ pub async fn get_completed_batch_inference_response(
                 let query = format!(
                     "WITH inf_lookup AS (
                         SELECT episode_id
-                        FROM InferenceById FINAL
+                        FROM InferenceById
                         WHERE id_uint = toUInt128(toUUID('{}'))
+                        LIMIT 1
                     )
                     SELECT
                         ji.id as inference_id,

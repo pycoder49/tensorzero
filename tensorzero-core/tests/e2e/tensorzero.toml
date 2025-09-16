@@ -10,9 +10,9 @@
 bind_address = "0.0.0.0:3000"
 debug = true
 template_filesystem_access.enabled = true
+template_filesystem_access.base_path = "."
 export.otlp.traces.enabled = true
 unstable_error_json = true
-observability.skip_completed_migrations = true
 
 [object_storage]
 type = "disabled"
@@ -47,6 +47,13 @@ type = "fireworks"
 model_name = "accounts/fireworks/models/gpt-oss-20b"
 parse_think_blocks = false
 
+[models."gpt-oss-20b-vllm"]
+routing = ["vllm"]
+
+[models."gpt-oss-20b-vllm".providers.vllm]
+type = "vllm"
+api_base = "https://tensorzero--vllm-gpt-oss-20b-serve.modal.run/v1/"
+model_name = "openai/gpt-oss-20b"
 
 [models."gpt-4o-mini-2024-07-18-dynamic"]
 routing = ["openai"]
@@ -80,6 +87,24 @@ type = "azure"
 deployment_id = "gpt4o-mini-20240718"
 endpoint = "https://t0-azure-openai-east.openai.azure.com"
 api_key_location = "dynamic::azure_openai_api_key"
+
+[models."llama-3.3-70b-instruct-azure"]
+routing = ["azure"]
+
+[models."llama-3.3-70b-instruct-azure".providers.azure]
+type = "azure"
+deployment_id = "Llama-3.3-70B-Instruct"
+api_key_location = "env::AZURE_AI_FOUNDRY_API_KEY"
+endpoint = "https://t0-gha-resource.services.ai.azure.com"
+
+[models."llama-3.3-70b-instruct-azure-dynamic"]
+routing = ["azure"]
+
+[models."llama-3.3-70b-instruct-azure-dynamic".providers.azure]
+type = "azure"
+deployment_id = "Phi-4-mini-instruct"
+endpoint = "https://t0-gha-resource.services.ai.azure.com"
+api_key_location = "dynamic::azure_ai_foundry_api_key"
 
 ## Groq
 
@@ -711,6 +736,28 @@ routing = ["openai"]
 type = "openai"
 model_name = "text-embedding-3-small"
 
+[embedding_models.azure-text-embedding-3-small]
+routing = ["azure"]
+
+[embedding_models.azure-text-embedding-3-small.providers.azure]
+type = "azure"
+endpoint = "https://t0-azure-openai-east.openai.azure.com/"
+deployment_id = "text-embedding-3-small"
+
+[embedding_models.voyage_3_5_lite_256]
+routing = ["voyage"]
+
+[embedding_models.voyage_3_5_lite_256.providers.voyage]
+type = "openai"
+api_base = "https://api.voyageai.com/v1"
+model_name = "voyage-3.5-lite"
+api_key_location = "env::VOYAGE_API_KEY"
+extra_body = [
+    { pointer = "/dimensions", delete = true },
+    { pointer = "/encoding_format", delete = true },
+    { pointer = "/output_dimension", value = 256 },
+]
+
 [embedding_models.fallback]
 routing = ["slow", "openai"]
 
@@ -735,10 +782,17 @@ non_streaming = { total_ms = 1000 }
 type = "dummy"
 model_name = "slow"
 
+[embedding_models.dummy-embedding-model]
+routing = ["dummy"]
+
+[embedding_models.dummy-embedding-model.providers.dummy]
+type = "dummy"
+model_name = "test-embeddings"
+
 
 # ┌────────────────────────────────────────────────────────────────────────────┐
 # │                                 FUNCTIONS                                  │
-# └────────────────────────────────────────────────────────────────────────────┘
+# └────────────────────────────────────────────────────────────────────────────────┘
 
 # Timeout tests
 
@@ -828,9 +882,10 @@ type = "chat"
 [functions.basic_test_template_no_schema.variants.test]
 type = "chat_completion"
 model = "dummy::echo_request_messages"
-system_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/system_template.minijinja"
+input_wrappers.system = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/system_template.minijinja"
 assistant_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/assistant_template.minijinja"
 user_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/user_template.minijinja"
+templates.my_custom_template.path = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/my_custom_template.minijinja"
 
 [functions.basic_test_template_no_schema.variants.mixture_of_n]
 type = "experimental_mixture_of_n"
@@ -839,7 +894,7 @@ candidates = ["test", "test"]
 [functions.basic_test_template_no_schema.variants.mixture_of_n.fuser]
 model = "dummy::echo_request_messages"
 system_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/system_template_2.minijinja"
-assistant_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/assistant_template_2.minijinja"
+input_wrappers.assistant = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/assistant_template_2.minijinja"
 user_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/user_template_2.minijinja"
 
 [functions.basic_test_template_no_schema.variants.best_of_n]
@@ -850,7 +905,7 @@ candidates = ["test", "test"]
 model = "dummy::best_of_n_0"
 system_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/system_template_2.minijinja"
 assistant_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/assistant_template_2.minijinja"
-user_template = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/user_template_2.minijinja"
+input_wrappers.user = "../../fixtures/config/functions/basic_test_template_no_schema/prompt/user_template_2.minijinja"
 
 
 [functions.basic_test_no_system_schema]
@@ -1019,6 +1074,32 @@ extra_headers = [{ name = "api-key", value = "invalid_azure_openai_auth" }]
 [functions.basic_test.variants.azure-dynamic]
 type = "chat_completion"
 model = "gpt-4o-mini-azure-dynamic"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 100
+
+[functions.basic_test.variants.azure-ai-foundry]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 100
+
+[functions.basic_test.variants.azure-ai-foundry-extra-body]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 100
+extra_body = [{ pointer = "/temperature", value = 0.123 }]
+
+[functions.basic_test.variants.azure-ai-foundry-extra-headers]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 100
+extra_headers = [{ name = "api-key", value = "invalid_azure_openai_auth" }]
+
+[functions.basic_test.variants.azure-ai-foundry-dynamic]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure-dynamic"
 system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
 max_tokens = 100
 
@@ -1422,6 +1503,12 @@ model = "qwen2.5-0.5b-instruct-vllm"
 system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
 max_tokens = 100
 
+[functions.basic_test.variants.vllm-gpt-oss-20b]
+type = "chat_completion"
+model = "gpt-oss-20b-vllm"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 100
+
 [functions.basic_test.variants.vllm-extra-body]
 type = "chat_completion"
 model = "qwen2.5-0.5b-instruct-vllm"
@@ -1564,6 +1651,12 @@ model = "deepseek-r1"
 system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
 max_tokens = 800
 
+[functions.basic_test.variants.fireworks-gpt-oss-20b]
+type = "chat_completion"
+model = "gpt-oss-20b-fireworks"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+max_tokens = 800
+
 [functions.basic_test.variants.flaky]
 type = "chat_completion"
 model = "flaky_basic_test"
@@ -1645,7 +1738,7 @@ json_mode = "strict"
 
 [functions.json_success]
 type = "json"
-system_schema = "../../fixtures/config/functions/basic_test/system_schema.json"
+schemas.system.path = "../../fixtures/config/functions/basic_test/system_schema.json"
 user_schema = "../../fixtures/config/functions/json_success/user_schema.json"
 output_schema = "../../fixtures/config/functions/basic_test/output_schema.json"
 
@@ -1654,7 +1747,7 @@ type = "chat_completion"
 weight = 1
 model = "json"
 system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
-user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+templates.user.path = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
 max_tokens = 100
 json_mode = "strict"
 
@@ -1747,12 +1840,46 @@ user_template = "../../fixtures/config/functions/json_success/prompt/user_templa
 json_mode = "implicit_tool"
 max_tokens = 100
 
+[functions.json_success.variants.azure-ai-foundry]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+json_mode = "on"
+max_tokens = 100
+
+[functions.json_success.variants.azure-ai-foundry-strict]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+max_tokens = 100
+json_mode = "strict"
+
+[functions.json_success.variants.azure-ai-foundry-implicit]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+json_mode = "implicit_tool"
+max_tokens = 100
+
 [functions.json_success.variants.fireworks]
 type = "chat_completion"
 model = "fireworks::accounts/fireworks/models/mixtral-8x22b-instruct"
 system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
 user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
 json_mode = "on"
+max_tokens = 100
+
+[functions.json_success.variants.fireworks-gpt-oss-20b]
+type = "chat_completion"
+model = "gpt-oss-20b-fireworks"
+system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+# Fireworks gives us 'Failed to format non-streaming choice: Expected message start token but ran out of tokens' if
+# we try to explicitly request a 'json_object' response format for gpt-oss-20b.
+json_mode = "off"
 max_tokens = 100
 
 [functions.json_success.variants.fireworks-implicit]
@@ -2077,6 +2204,14 @@ user_template = "../../fixtures/config/functions/json_success/prompt/user_templa
 json_mode = "on"
 max_tokens = 100
 
+[functions.json_success.variants.vllm-gpt-oss-20b]
+type = "chat_completion"
+model = "gpt-oss-20b-vllm"
+system_template = "../../fixtures/config/functions/json_success/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+json_mode = "on"
+max_tokens = 100
+
 [functions.json_success.variants.vllm-strict]
 type = "chat_completion"
 model = "qwen2.5-0.5b-instruct-vllm"
@@ -2170,6 +2305,14 @@ max_tokens = 100
 [functions.json_success.variants.azure_json_mode_off]
 type = "chat_completion"
 model = "gpt-4o-mini-azure"
+system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
+json_mode = "off"
+max_tokens = 100
+
+[functions.json_success.variants.azure-ai-foundry_json_mode_off]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
 system_template = "../../fixtures/config/functions/basic_test/prompt/system_template.minijinja"
 user_template = "../../fixtures/config/functions/json_success/prompt/user_template.minijinja"
 json_mode = "off"
@@ -2392,6 +2535,30 @@ json_mode = "strict"
 [functions.dynamic_json.variants.azure-implicit]
 type = "chat_completion"
 model = "gpt-4o-mini-azure"
+system_template = "../../fixtures/config/functions/dynamic_json/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/dynamic_json/prompt/user_template.minijinja"
+json_mode = "implicit_tool"
+max_tokens = 100
+
+[functions.dynamic_json.variants.azure-ai-foundry]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/dynamic_json/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/dynamic_json/prompt/user_template.minijinja"
+json_mode = "on"
+max_tokens = 100
+
+[functions.dynamic_json.variants.azure-ai-foundry-strict]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
+system_template = "../../fixtures/config/functions/dynamic_json/prompt/system_template.minijinja"
+user_template = "../../fixtures/config/functions/dynamic_json/prompt/user_template.minijinja"
+max_tokens = 100
+json_mode = "strict"
+
+[functions.dynamic_json.variants.azure-ai-foundry-implicit]
+type = "chat_completion"
+model = "llama-3.3-70b-instruct-azure"
 system_template = "../../fixtures/config/functions/dynamic_json/prompt/system_template.minijinja"
 user_template = "../../fixtures/config/functions/dynamic_json/prompt/user_template.minijinja"
 json_mode = "implicit_tool"
@@ -3318,7 +3485,7 @@ json_mode = "strict"
 type = "chat"
 tools = ["think", "search_wikipedia", "load_wikipedia_page", "answer_question"]
 tool_choice = "required"
-parallel_tool_calls = true
+parallel_tool_calls = false
 
 [functions.multi_hop_rag_agent.variants.baseline]
 type = "chat_completion"

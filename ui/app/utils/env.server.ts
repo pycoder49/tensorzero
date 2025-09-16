@@ -1,7 +1,5 @@
 // This is the only file in which `process.env` should be accessed directly.
 
-import { logger } from "./logger";
-
 class EnvironmentVariableError extends Error {
   constructor(
     public message: string,
@@ -14,7 +12,8 @@ class EnvironmentVariableError extends Error {
 
 interface Env {
   TENSORZERO_CLICKHOUSE_URL: string;
-  TENSORZERO_UI_CONFIG_PATH: string;
+  TENSORZERO_UI_CONFIG_PATH: string | null;
+  TENSORZERO_UI_DEFAULT_CONFIG: boolean;
   TENSORZERO_GATEWAY_URL: string;
   TENSORZERO_EVALUATIONS_PATH: string;
   OPENAI_BASE_URL: string | null;
@@ -36,10 +35,13 @@ export function getEnv(): Env {
   }
 
   const TENSORZERO_CLICKHOUSE_URL = getClickhouseUrl();
-  const TENSORZERO_UI_CONFIG_PATH = process.env.TENSORZERO_UI_CONFIG_PATH;
-  if (!TENSORZERO_UI_CONFIG_PATH) {
+  const TENSORZERO_UI_CONFIG_PATH =
+    process.env.TENSORZERO_UI_CONFIG_PATH || null;
+  const TENSORZERO_UI_DEFAULT_CONFIG =
+    (process.env.TENSORZERO_UI_DEFAULT_CONFIG || null) == "1";
+  if (!TENSORZERO_UI_CONFIG_PATH && !TENSORZERO_UI_DEFAULT_CONFIG) {
     throw new EnvironmentVariableError(
-      "The environment variable `TENSORZERO_UI_CONFIG_PATH` is not set.",
+      "At least one of `TENSORZERO_UI_CONFIG_PATH` or `TENSORZERO_UI_DEFAULT_CONFIG` must be set.",
     );
   }
 
@@ -54,6 +56,7 @@ export function getEnv(): Env {
   _env = {
     TENSORZERO_CLICKHOUSE_URL,
     TENSORZERO_UI_CONFIG_PATH,
+    TENSORZERO_UI_DEFAULT_CONFIG,
     TENSORZERO_GATEWAY_URL,
     OPENAI_BASE_URL: process.env.OPENAI_BASE_URL || null,
     FIREWORKS_BASE_URL: process.env.FIREWORKS_BASE_URL || null,
@@ -69,13 +72,6 @@ function getClickhouseUrl() {
   const url = process.env.TENSORZERO_CLICKHOUSE_URL;
   if (url) {
     return url;
-  }
-
-  if (process.env.CLICKHOUSE_URL) {
-    logger.warn(
-      'Deprecation Warning: The environment variable "CLICKHOUSE_URL" has been renamed to "TENSORZERO_CLICKHOUSE_URL" and will be removed in a future version. Please update your environment to use "TENSORZERO_CLICKHOUSE_URL" instead.',
-    );
-    return process.env.CLICKHOUSE_URL;
   }
 
   throw new EnvironmentVariableError(

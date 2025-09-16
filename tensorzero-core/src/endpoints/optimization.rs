@@ -11,16 +11,17 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    clickhouse::{
+    config::Config,
+    db::clickhouse::{
         query_builder::{
             InferenceFilterTreeNode, InferenceOutputSource, ListInferencesParams, OrderBy,
         },
         ClickHouseConnectionInfo, ClickhouseFormat,
     },
-    config_parser::Config,
     endpoints::{inference::InferenceCredentials, stored_inference::render_samples},
     error::{Error, ErrorDetails},
     gateway_util::{AppState, AppStateData, StructuredJson},
+    http::TensorzeroHttpClient,
     optimization::{
         JobHandle, OptimizationJobHandle, OptimizationJobInfo, Optimizer,
         UninitializedOptimizerInfo,
@@ -71,7 +72,7 @@ pub async fn launch_optimization_workflow_handler(
 /// templating them with the template variant,
 /// and launch the optimization job specified.
 pub async fn launch_optimization_workflow(
-    http_client: &reqwest::Client,
+    http_client: &TensorzeroHttpClient,
     config: Arc<Config>,
     clickhouse_connection_info: &ClickHouseConnectionInfo,
     params: LaunchOptimizationWorkflowParams,
@@ -107,7 +108,7 @@ pub async fn launch_optimization_workflow(
         .await?;
     let variants = HashMap::from([(function_name.clone(), template_variant_name.clone())]);
     // Template the inferences and fetch any network resources needed
-    let rendered_inferences = render_samples(config, stored_inferences, variants).await?;
+    let rendered_inferences = render_samples(config.clone(), stored_inferences, variants).await?;
 
     // Drop any examples with output that is None
     let rendered_inferences = rendered_inferences
@@ -127,6 +128,8 @@ pub async fn launch_optimization_workflow(
             train_examples,
             val_examples,
             &InferenceCredentials::default(),
+            clickhouse_connection_info,
+            &config,
         )
         .await
 }
@@ -146,8 +149,10 @@ pub struct LaunchOptimizationParams {
 /// This function already takes the data as an argument so it gives the caller more control
 /// about preparing the data prior to launching the optimization job than the workflow method above.
 pub async fn launch_optimization(
-    http_client: &reqwest::Client,
+    http_client: &TensorzeroHttpClient,
     params: LaunchOptimizationParams,
+    clickhouse_connection_info: &ClickHouseConnectionInfo,
+    config: Arc<Config>,
     // For the TODO above: will need to pass config in here
 ) -> Result<OptimizationJobHandle, Error> {
     let LaunchOptimizationParams {
@@ -162,6 +167,8 @@ pub async fn launch_optimization(
             train_examples,
             val_examples,
             &InferenceCredentials::default(),
+            clickhouse_connection_info,
+            &config,
         )
         .await
 }
@@ -178,7 +185,7 @@ pub async fn poll_optimization_handler(
 /// Poll an existing optimization job.
 /// This should return the status of the job.
 pub async fn poll_optimization(
-    http_client: &reqwest::Client,
+    http_client: &TensorzeroHttpClient,
     job_handle: &OptimizationJobHandle,
 ) -> Result<OptimizationJobInfo, Error> {
     job_handle

@@ -25,8 +25,8 @@ use python_helpers::{
     python_uuid_to_uuid,
 };
 use tensorzero_core::{
-    clickhouse::{query_builder::OrderBy, ClickhouseFormat},
-    config_parser::{ConfigPyClass, FunctionsConfigPyClass},
+    config::{ConfigPyClass, FunctionsConfigPyClass},
+    db::clickhouse::{query_builder::OrderBy, ClickhouseFormat},
     function::{FunctionConfigChatPyClass, FunctionConfigJsonPyClass, VariantsConfigPyClass},
     inference::types::{
         pyo3_helpers::{
@@ -38,9 +38,10 @@ use tensorzero_core::{
         ResolvedInput, ResolvedInputMessage,
     },
     optimization::{
-        fireworks_sft::UninitializedFireworksSFTConfig,
+        dicl::UninitializedDiclOptimizationConfig, fireworks_sft::UninitializedFireworksSFTConfig,
         gcp_vertex_gemini_sft::UninitializedGCPVertexGeminiSFTConfig,
-        openai_sft::UninitializedOpenAISFTConfig, OptimizationJobInfoPyClass,
+        openai_rft::UninitializedOpenAIRFTConfig, openai_sft::UninitializedOpenAISFTConfig,
+        together_sft::UninitializedTogetherSFTConfig, OptimizationJobInfoPyClass,
         OptimizationJobStatus, UninitializedOptimizerInfo,
     },
     variant::{
@@ -67,7 +68,10 @@ use tensorzero_rust::{
 use tokio::sync::Mutex;
 use url::Url;
 
+mod gil_helpers;
 mod python_helpers;
+
+use crate::gil_helpers::DropInTokio;
 
 #[pymodule]
 fn tensorzero(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -90,9 +94,12 @@ fn tensorzero(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LocalHttpGateway>()?;
     m.add_class::<RenderedSample>()?;
     m.add_class::<StoredInference>()?;
+    m.add_class::<UninitializedOpenAIRFTConfig>()?;
     m.add_class::<UninitializedOpenAISFTConfig>()?;
     m.add_class::<UninitializedFireworksSFTConfig>()?;
+    m.add_class::<UninitializedDiclOptimizationConfig>()?;
     m.add_class::<UninitializedGCPVertexGeminiSFTConfig>()?;
+    m.add_class::<UninitializedTogetherSFTConfig>()?;
     m.add_class::<Datapoint>()?;
     m.add_class::<ResolvedInput>()?;
     m.add_class::<ResolvedInputMessage>()?;
@@ -127,22 +134,31 @@ fn tensorzero(m: &Bound<'_, PyModule>) -> PyResult<()> {
 struct LocalHttpGateway {
     #[pyo3(get)]
     base_url: String,
-    shutdown_handle: Option<ShutdownHandle>,
+    // We use a double `Option` so that we can implement `LocalHttpGateway.close`
+    // by setting it to `None`, without needing to complicate the api of `DropInTokio`
+    shutdown_handle: Option<DropInTokio<Option<ShutdownHandle>>>,
+}
+
+impl Drop for LocalHttpGateway {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 #[pymethods]
 impl LocalHttpGateway {
     fn close(&mut self) {
-        self.shutdown_handle.take();
+        self.shutdown_handle = None;
     }
 }
 
 #[pyfunction]
-#[pyo3(signature = (*, config_file, clickhouse_url, async_setup))]
+#[pyo3(signature = (*, config_file, clickhouse_url, postgres_url, async_setup))]
 fn _start_http_gateway(
     py: Python<'_>,
     config_file: Option<String>,
     clickhouse_url: Option<String>,
+    postgres_url: Option<String>,
     async_setup: bool,
 ) -> PyResult<Bound<'_, PyAny>> {
     warn_no_config(py, config_file.as_deref())?;
@@ -150,11 +166,12 @@ fn _start_http_gateway(
         let (addr, handle) = tensorzero_core::gateway_util::start_openai_compatible_gateway(
             config_file,
             clickhouse_url,
+            postgres_url,
         )
         .await?;
         Ok(LocalHttpGateway {
             base_url: format!("http://{addr}/openai/v1"),
-            shutdown_handle: Some(handle),
+            shutdown_handle: Some(DropInTokio::new(Some(handle), || None)),
         })
     };
     if async_setup {
@@ -171,14 +188,20 @@ fn _start_http_gateway(
 }
 
 // TODO - this should extend the python `ABC` class once pyo3 supports it: https://github.com/PyO3/pyo3/issues/991
-#[pyclass(subclass)]
+#[pyclass(subclass, frozen)]
 struct BaseTensorZeroGateway {
-    client: Arc<Client>,
+    client: DropInTokio<Client>,
 }
 
-#[pyclass]
+#[pyclass(frozen)]
 struct AsyncStreamWrapper {
     stream: Arc<Mutex<InferenceStream>>,
+    // A handle to the original `AsyncTensorZeroGateway` object.
+    // This ensures that Python will only garbage-collect the `AsyncTensorZeroGateway`
+    // after all `AsyncStreamWrapper` objects have been garbage collected.
+    // This allows us to safely block from within the Drop impl of `AsyncTensorZeroGateway`.
+    // knowing that there are no remaining Python objects holding on to a `ClickhouseConnectionInfo`
+    _gateway: PyObject,
 }
 
 #[pymethods]
@@ -212,9 +235,15 @@ impl AsyncStreamWrapper {
     }
 }
 
-#[pyclass]
+#[pyclass(frozen)]
 struct StreamWrapper {
     stream: Arc<Mutex<InferenceStream>>,
+    // A handle to the original `TensorZeroGateway` object.
+    // This ensures that Python will only garbage-collect the `TensorZeroGateway`
+    // after all `StreamWrapper` objects have been garbage collected.
+    // This allows us to safely block from within the Drop impl of `TensorZeroGateway`.
+    // knowing that there are no remaining Python objects holding on to a `ClickhouseConnectionInfo`
+    _gateway: PyObject,
 }
 
 #[pymethods]
@@ -234,6 +263,12 @@ impl StreamWrapper {
         let chunk = chunk.map_err(|e| convert_error(py, err_to_http(e)))?;
         parse_inference_chunk(py, chunk)
     }
+}
+
+/// Constructs a dummy embedded client. We use this so that we can move out of the real 'client'
+/// field of `BaseTensorZeroGateway` when it is dropped.
+fn make_dummy_client() -> Client {
+    ClientBuilder::build_dummy()
 }
 
 #[pymethods]
@@ -274,7 +309,7 @@ impl BaseTensorZeroGateway {
         };
 
         Ok(Self {
-            client: Arc::new(client),
+            client: DropInTokio::new(client, make_dummy_client),
         })
     }
 
@@ -558,7 +593,7 @@ impl TensorZeroGateway {
             }
         };
         let instance = PyClassInitializer::from(BaseTensorZeroGateway {
-            client: Arc::new(client),
+            client: DropInTokio::new(client, make_dummy_client),
         })
         .add_subclass(TensorZeroGateway {});
         Py::new(cls.py(), instance)
@@ -598,7 +633,7 @@ impl TensorZeroGateway {
     }
 
     #[classmethod]
-    #[pyo3(signature = (*, config_file=None, clickhouse_url=None, timeout=None))]
+    #[pyo3(signature = (*, config_file=None, clickhouse_url=None, postgres_url=None, timeout=None))]
     /// Initialize the TensorZero client, using an embedded gateway.
     /// This connects to ClickHouse (if provided) and runs DB migrations.
     ///
@@ -610,6 +645,7 @@ impl TensorZeroGateway {
         cls: &Bound<'_, PyType>,
         config_file: Option<&str>,
         clickhouse_url: Option<String>,
+        postgres_url: Option<String>,
         timeout: Option<f64>,
     ) -> PyResult<Py<TensorZeroGateway>> {
         warn_no_config(cls.py(), config_file)?;
@@ -620,8 +656,10 @@ impl TensorZeroGateway {
         let client_fut = ClientBuilder::new(ClientBuilderMode::EmbeddedGateway {
             config_file: config_file.map(PathBuf::from),
             clickhouse_url,
+            postgres_url,
             timeout,
             verify_credentials: true,
+            allow_batch_writes: false,
         })
         .build();
         let client = tokio_block_on_without_gil(cls.py(), client_fut);
@@ -636,7 +674,7 @@ impl TensorZeroGateway {
         };
         // Construct an instance of `TensorZeroGateway` (while providing the fields from the `BaseTensorZeroGateway` superclass).
         let instance = PyClassInitializer::from(BaseTensorZeroGateway {
-            client: Arc::new(client),
+            client: DropInTokio::new(client, make_dummy_client),
         })
         .add_subclass(TensorZeroGateway {});
         Py::new(cls.py(), instance)
@@ -748,32 +786,30 @@ impl TensorZeroGateway {
         extra_headers: Option<&Bound<'_, PyList>>,
         include_original_response: Option<bool>,
     ) -> PyResult<Py<PyAny>> {
-        let fut =
-            this.as_super()
-                .client
-                .inference(BaseTensorZeroGateway::prepare_inference_params(
-                    py,
-                    input,
-                    function_name,
-                    model_name,
-                    episode_id,
-                    stream,
-                    params,
-                    variant_name,
-                    dryrun,
-                    output_schema,
-                    allowed_tools,
-                    additional_tools,
-                    tool_choice,
-                    parallel_tool_calls,
-                    internal.unwrap_or(false),
-                    tags,
-                    credentials,
-                    cache_options,
-                    extra_body,
-                    extra_headers,
-                    include_original_response.unwrap_or(false),
-                )?);
+        let client = this.as_super().client.clone();
+        let fut = client.inference(BaseTensorZeroGateway::prepare_inference_params(
+            py,
+            input,
+            function_name,
+            model_name,
+            episode_id,
+            stream,
+            params,
+            variant_name,
+            dryrun,
+            output_schema,
+            allowed_tools,
+            additional_tools,
+            tool_choice,
+            parallel_tool_calls,
+            internal.unwrap_or(false),
+            tags,
+            credentials,
+            cache_options,
+            extra_body,
+            extra_headers,
+            include_original_response.unwrap_or(false),
+        )?);
 
         // We're in the synchronous `TensorZeroGateway` class, so we need to block on the Rust future,
         // and then return the result to the Python caller directly (not wrapped in a Python `Future`).
@@ -782,6 +818,7 @@ impl TensorZeroGateway {
             InferenceOutput::NonStreaming(data) => parse_inference_response(py, data),
             InferenceOutput::Streaming(stream) => Ok(StreamWrapper {
                 stream: Arc::new(Mutex::new(stream)),
+                _gateway: this.into_pyobject(py)?.into_any().unbind(),
             }
             .into_pyobject(py)?
             .into_any()
@@ -1191,7 +1228,7 @@ impl AsyncTensorZeroGateway {
 
                 // Construct an instance of `AsyncTensorZeroGateway` (while providing the fields from the `BaseTensorZeroGateway` superclass).
                 let instance = PyClassInitializer::from(BaseTensorZeroGateway {
-                    client: Arc::new(client),
+                    client: DropInTokio::new(client, make_dummy_client),
                 })
                 .add_subclass(AsyncTensorZeroGateway {});
                 Py::new(py, instance)
@@ -1243,7 +1280,7 @@ impl AsyncTensorZeroGateway {
     // as `AsyncTensorZeroGateway` would be completely async *except* for this one method
     // (which potentially takes a very long time due to running DB migrations).
     #[classmethod]
-    #[pyo3(signature = (*, config_file=None, clickhouse_url=None, timeout=None, async_setup=true))]
+    #[pyo3(signature = (*, config_file=None, clickhouse_url=None, postgres_url=None, timeout=None, async_setup=true))]
     /// Initialize the TensorZero client, using an embedded gateway.
     /// This connects to ClickHouse (if provided) and runs DB migrations.
     ///
@@ -1257,6 +1294,7 @@ impl AsyncTensorZeroGateway {
         cls: &Bound<'_, PyType>,
         config_file: Option<&str>,
         clickhouse_url: Option<String>,
+        postgres_url: Option<String>,
         timeout: Option<f64>,
         async_setup: bool,
     ) -> PyResult<Py<PyAny>> {
@@ -1268,11 +1306,12 @@ impl AsyncTensorZeroGateway {
         let client_fut = ClientBuilder::new(ClientBuilderMode::EmbeddedGateway {
             config_file: config_file.map(PathBuf::from),
             clickhouse_url,
+            postgres_url,
             timeout,
             verify_credentials: true,
+            allow_batch_writes: false,
         })
         .build();
-
         let fut = async move {
             let client = client_fut.await;
             // We need to interact with Python objects here (to build up a Python `AsyncTensorZeroGateway`),
@@ -1290,7 +1329,7 @@ impl AsyncTensorZeroGateway {
 
                 // Construct an instance of `AsyncTensorZeroGateway` (while providing the fields from the `BaseTensorZeroGateway` superclass).
                 let instance = PyClassInitializer::from(BaseTensorZeroGateway {
-                    client: Arc::new(client),
+                    client: DropInTokio::new(client, make_dummy_client),
                 })
                 .add_subclass(AsyncTensorZeroGateway {});
                 Py::new(py, instance)
@@ -1389,6 +1428,7 @@ impl AsyncTensorZeroGateway {
             include_original_response.unwrap_or(false),
         )?;
         let client = this.as_super().client.clone();
+        let gateway = this.into_pyobject(py)?.into_any().unbind();
         // See `AsyncStreamWrapper::__anext__` for more details about `future_into_py`
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let res = client.inference(params).await;
@@ -1400,6 +1440,7 @@ impl AsyncTensorZeroGateway {
                     InferenceOutput::NonStreaming(data) => parse_inference_response(py, data),
                     InferenceOutput::Streaming(stream) => Ok(AsyncStreamWrapper {
                         stream: Arc::new(Mutex::new(stream)),
+                        _gateway: gateway,
                     }
                     .into_pyobject(py)?
                     .into_any()

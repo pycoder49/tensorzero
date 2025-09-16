@@ -1,6 +1,5 @@
 use futures::future::try_join_all;
 use futures::StreamExt;
-use reqwest::Client;
 use secrecy::SecretString;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -16,10 +15,12 @@ use url::Url;
 
 use crate::cache::{
     cache_lookup, cache_lookup_streaming, start_cache_write, start_cache_write_streaming,
-    CacheData, ModelProviderRequest, NonStreamingCacheData, StreamingCacheData,
+    CacheData, CacheValidationInfo, ModelProviderRequest, NonStreamingCacheData,
+    StreamingCacheData,
 };
-use crate::config_parser::{skip_credential_validation, ProviderTypesConfig, TimeoutsConfig};
+use crate::config::{skip_credential_validation, ProviderTypesConfig, TimeoutsConfig};
 use crate::endpoints::inference::InferenceClients;
+use crate::http::TensorzeroHttpClient;
 use crate::providers::aws_sagemaker::AWSSagemakerProvider;
 #[cfg(any(test, feature = "e2e_tests"))]
 use crate::providers::dummy::DummyProvider;
@@ -426,13 +427,22 @@ impl ModelConfig {
                             let _ = start_cache_write(
                                 clients.clickhouse_connection_info,
                                 cache_key,
-                                NonStreamingCacheData {
-                                    blocks: response.output.clone(),
+                                CacheData {
+                                    output: NonStreamingCacheData {
+                                        blocks: response.output.clone(),
+                                    },
+                                    raw_request: response.raw_request.clone(),
+                                    raw_response: response.raw_response.clone(),
+                                    input_tokens: response.usage.input_tokens,
+                                    output_tokens: response.usage.output_tokens,
+                                    finish_reason: response.finish_reason,
                                 },
-                                &response.raw_request,
-                                &response.raw_response,
-                                &response.usage,
-                                response.finish_reason.as_ref(),
+                                CacheValidationInfo {
+                                    tool_config: request
+                                        .tool_config
+                                        .clone()
+                                        .map(std::borrow::Cow::into_owned),
+                                },
                             );
                         }
 
@@ -543,7 +553,7 @@ impl ModelConfig {
     pub async fn start_batch_inference<'request>(
         &self,
         requests: &'request [ModelInferenceRequest<'request>],
-        client: &'request Client,
+        client: &'request TensorzeroHttpClient,
         api_keys: &'request InferenceCredentials,
     ) -> Result<StartBatchModelInferenceResponse, Error> {
         let mut provider_errors: HashMap<String, Error> = HashMap::new();
@@ -587,6 +597,11 @@ async fn stream_with_cache_write(
 ) -> Result<PeekableProviderInferenceResponseStream, Error> {
     let cache_key = model_request.get_cache_key()?;
     let clickhouse_info = clients.clickhouse_connection_info.clone();
+    let tool_config = model_request
+        .request
+        .tool_config
+        .clone()
+        .map(std::borrow::Cow::into_owned);
     Ok((Box::pin(async_stream::stream! {
         let mut buffer = vec![];
         let mut errored = false;
@@ -612,6 +627,7 @@ async fn stream_with_cache_write(
                 buffer,
                 &raw_request,
                 &usage,
+                tool_config
             );
         }
     }) as ProviderInferenceResponseStreamInner).peekable())
@@ -642,7 +658,8 @@ pub struct UninitializedModelProvider {
     pub extra_body: Option<ExtraBodyConfig>,
     #[cfg_attr(test, ts(skip))]
     pub extra_headers: Option<ExtraHeadersConfig>,
-    pub timeouts: Option<TimeoutsConfig>,
+    #[serde(default)]
+    pub timeouts: TimeoutsConfig,
     /// If `true`, we emit a warning and discard chunks that we don't recognize
     /// (on a best-effort, per-provider basis).
     /// By default, we produce an error in the stream
@@ -662,22 +679,18 @@ pub struct ModelProvider {
     pub extra_headers: Option<ExtraHeadersConfig>,
     #[cfg_attr(test, ts(skip))]
     pub extra_body: Option<ExtraBodyConfig>,
-    pub timeouts: Option<TimeoutsConfig>,
+    pub timeouts: TimeoutsConfig,
     /// See `UninitializedModelProvider.discard_unknown_chunks`.
     pub discard_unknown_chunks: bool,
 }
 
 impl ModelProvider {
     fn non_streaming_total_timeout(&self) -> Option<Duration> {
-        Some(Duration::from_millis(
-            self.timeouts.as_ref()?.non_streaming.total_ms?,
-        ))
+        Some(Duration::from_millis(self.timeouts.non_streaming.total_ms?))
     }
 
     fn streaming_ttft_timeout(&self) -> Option<Duration> {
-        Some(Duration::from_millis(
-            self.timeouts.as_ref()?.streaming.ttft_ms?,
-        ))
+        Some(Duration::from_millis(self.timeouts.streaming.ttft_ms?))
     }
 
     /// The name to report in the OTEL `gen_ai.system` attribute
@@ -889,7 +902,7 @@ pub enum UninitializedProviderConfig {
     },
     Azure {
         deployment_id: String,
-        endpoint: Url,
+        endpoint: EndpointLocation,
         #[cfg_attr(test, ts(type = "string | null"))]
         api_key_location: Option<CredentialLocation>,
     },
@@ -1183,7 +1196,7 @@ impl ModelProvider {
     async fn infer(
         &self,
         request: ModelProviderRequest<'_>,
-        client: &Client,
+        client: &TensorzeroHttpClient,
         api_keys: &InferenceCredentials,
     ) -> Result<ProviderInferenceResponse, Error> {
         match &self.config {
@@ -1252,7 +1265,7 @@ impl ModelProvider {
     async fn infer_stream(
         &self,
         request: ModelProviderRequest<'_>,
-        client: &Client,
+        client: &TensorzeroHttpClient,
         api_keys: &InferenceCredentials,
     ) -> Result<StreamAndRawRequest, Error> {
         let (stream, raw_request) = match &self.config {
@@ -1332,7 +1345,7 @@ impl ModelProvider {
     async fn start_batch_inference<'a>(
         &self,
         requests: &'a [ModelInferenceRequest<'a>],
-        client: &'a Client,
+        client: &'a TensorzeroHttpClient,
         api_keys: &'a InferenceCredentials,
     ) -> Result<StartBatchProviderInferenceResponse, Error> {
         match &self.config {
@@ -1443,7 +1456,7 @@ impl ModelProvider {
     pub async fn poll_batch_inference<'a>(
         &self,
         batch_request: &'a BatchRequestRow<'_>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<PollBatchInferenceResponse, Error> {
         match &self.config {
@@ -1567,6 +1580,49 @@ pub enum CredentialLocation {
     None,
 }
 
+#[derive(Debug, PartialEq, Clone)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export))]
+pub enum EndpointLocation {
+    /// Environment variable containing the actual endpoint URL
+    Env(String),
+    /// For dynamic endpoint resolution
+    Dynamic(String),
+    /// Direct endpoint URL
+    Static(String),
+}
+
+impl<'de> Deserialize<'de> for EndpointLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if let Some(inner) = s.strip_prefix("env::") {
+            Ok(EndpointLocation::Env(inner.to_string()))
+        } else if let Some(inner) = s.strip_prefix("dynamic::") {
+            Ok(EndpointLocation::Dynamic(inner.to_string()))
+        } else {
+            // Default to static endpoint
+            Ok(EndpointLocation::Static(s))
+        }
+    }
+}
+
+impl Serialize for EndpointLocation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = match self {
+            EndpointLocation::Env(inner) => format!("env::{inner}"),
+            EndpointLocation::Dynamic(inner) => format!("dynamic::{inner}"),
+            EndpointLocation::Static(inner) => inner.clone(),
+        };
+        serializer.serialize_str(&s)
+    }
+}
+
 impl<'de> Deserialize<'de> for CredentialLocation {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1687,21 +1743,21 @@ impl TryFrom<(CredentialLocation, &str)> for Credential {
         (location, provider_type): (CredentialLocation, &str),
     ) -> Result<Self, Self::Error> {
         match location {
-            CredentialLocation::Env(key_name) => match env::var(key_name) {
+            CredentialLocation::Env(key_name) => match env::var(&key_name) {
                 Ok(value) => Ok(Credential::Static(SecretString::from(value))),
                 Err(_) => {
                     if skip_credential_validation() {
                         #[cfg(any(test, feature = "e2e_tests"))]
                         {
                             tracing::warn!(
-                            "You are missing the credentials required for a model provider of type {}, so the associated tests will likely fail.",
-                            provider_type
-                        );
+                                "You are missing the credentials required for a model provider of type {provider_type} (environment variable `{key_name}` is unset), so the associated tests will likely fail.",
+                            );
                         }
                         Ok(Credential::Missing)
                     } else {
                         Err(Error::new(ErrorDetails::ApiKeyMissing {
                             provider_name: provider_type.to_string(),
+                            message: format!("Environment variable `{key_name}` is missing"),
                         }))
                     }
                 }
@@ -1723,9 +1779,8 @@ impl TryFrom<(CredentialLocation, &str)> for Credential {
                             return Ok(Credential::Missing);
                         } else {
                             return Err(Error::new(ErrorDetails::ApiKeyMissing {
-                                provider_name: format!(
-                                    "{provider_type}: Environment variable {env_key} for credentials path is missing"
-                                ),
+                                provider_name: provider_type.to_string(),
+                                message: format!("Environment variable `{env_key}` for credentials path is missing"),
                             }));
                         }
                     }
@@ -1745,9 +1800,8 @@ impl TryFrom<(CredentialLocation, &str)> for Credential {
                             Ok(Credential::Missing)
                         } else {
                             Err(Error::new(ErrorDetails::ApiKeyMissing {
-                                provider_name: format!(
-                                    "{provider_type}: Failed to read credentials file - {e}"
-                                ),
+                                provider_name: provider_type.to_string(),
+                                message: format!("Failed to read credentials file - {e}"),
                             }))
                         }
                     }
@@ -1767,9 +1821,8 @@ impl TryFrom<(CredentialLocation, &str)> for Credential {
                         Ok(Credential::Missing)
                     } else {
                         Err(Error::new(ErrorDetails::ApiKeyMissing {
-                            provider_name: format!(
-                                "{provider_type}: Failed to read credentials file - {e}"
-                            ),
+                            provider_name: provider_type.to_string(),
+                            message: format!("Failed to read credentials file - {e}"),
                         }))
                     }
                 }
@@ -1914,11 +1967,11 @@ mod tests {
     use std::{borrow::Cow, cell::Cell};
 
     use crate::cache::CacheEnabledMode;
-    use crate::config_parser::SKIP_CREDENTIAL_VALIDATION;
+    use crate::config::SKIP_CREDENTIAL_VALIDATION;
     use crate::tool::{ToolCallConfig, ToolChoice};
     use crate::{
         cache::CacheOptions,
-        clickhouse::ClickHouseConnectionInfo,
+        db::clickhouse::ClickHouseConnectionInfo,
         inference::types::{
             ContentBlockChunk, FunctionType, ModelInferenceRequestJsonMode, TextChunk,
         },
@@ -1966,7 +2019,7 @@ mod tests {
             parallel_tool_calls: None,
         };
         let api_keys = InferenceCredentials::default();
-        let http_client = Client::new();
+        let http_client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &http_client,
@@ -2073,7 +2126,7 @@ mod tests {
             credentials: DummyCredentials::None,
         });
         let api_keys = InferenceCredentials::default();
-        let http_client = Client::new();
+        let http_client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &http_client,
@@ -2222,7 +2275,7 @@ mod tests {
             .infer_stream(
                 &request,
                 &InferenceClients {
-                    http_client: &Client::new(),
+                    http_client: &TensorzeroHttpClient::new().unwrap(),
                     clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
                     credentials: &api_keys,
                     cache_options: &CacheOptions {
@@ -2286,7 +2339,7 @@ mod tests {
             .infer_stream(
                 &request,
                 &InferenceClients {
-                    http_client: &Client::new(),
+                    http_client: &TensorzeroHttpClient::new().unwrap(),
                     clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
                     credentials: &api_keys,
                     cache_options: &CacheOptions {
@@ -2397,7 +2450,7 @@ mod tests {
             .infer_stream(
                 &request,
                 &InferenceClients {
-                    http_client: &Client::new(),
+                    http_client: &TensorzeroHttpClient::new().unwrap(),
                     clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
                     credentials: &api_keys,
                     cache_options: &CacheOptions {
@@ -2471,7 +2524,7 @@ mod tests {
             parallel_tool_calls: None,
         };
         let api_keys = InferenceCredentials::default();
-        let http_client = Client::new();
+        let http_client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &http_client,
@@ -2512,7 +2565,8 @@ mod tests {
                 provider_errors: HashMap::from([(
                     "model".to_string(),
                     ErrorDetails::ApiKeyMissing {
-                        provider_name: "Dummy".to_string()
+                        provider_name: "Dummy".to_string(),
+                        message: "Dynamic api key `TEST_KEY` is missing".to_string(),
                     }
                     .into()
                 )])
@@ -2580,7 +2634,7 @@ mod tests {
             parallel_tool_calls: None,
         };
         let api_keys = InferenceCredentials::default();
-        let http_client = Client::new();
+        let http_client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let clients = InferenceClients {
             http_client: &http_client,
@@ -2620,7 +2674,8 @@ mod tests {
                 provider_errors: HashMap::from([(
                     "model".to_string(),
                     ErrorDetails::ApiKeyMissing {
-                        provider_name: "Dummy".to_string()
+                        provider_name: "Dummy".to_string(),
+                        message: "Dynamic api key `TEST_KEY` is missing".to_string(),
                     }
                     .into()
                 )])

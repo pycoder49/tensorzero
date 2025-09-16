@@ -102,7 +102,9 @@ class StoredInference:
 class RenderedSample:
     function_name: str
     input: ModelInput
+    stored_input: ResolvedInput
     output: Optional[ChatInferenceOutput]
+    stored_output: Optional[Union[ChatInferenceOutput, JsonInferenceOutput]]
     episode_id: Optional[UUID]
     inference_id: Optional[UUID]
     tool_params: Optional[ToolCallConfigDatabaseInsert]
@@ -112,7 +114,9 @@ class RenderedSample:
 
 @final
 class OptimizationJobHandle:
+    Dicl: Type["OptimizationJobHandle"]
     OpenAISFT: Type["OptimizationJobHandle"]
+    OpenAIRFT: Type["OptimizationJobHandle"]
     FireworksSFT: Type["OptimizationJobHandle"]
     GCPVertexGeminiSFT: Type["OptimizationJobHandle"]
     TogetherSFT: Type["OptimizationJobHandle"]
@@ -125,7 +129,9 @@ class OptimizationJobStatus:
 
 @final
 class OptimizationJobInfo:
+    Dicl: Type["OptimizationJobInfo"]
     OpenAISFT: Type["OptimizationJobInfo"]
+    OpenAIRFT: Type["OptimizationJobInfo"]
     FireworksSFT: Type["OptimizationJobInfo"]
     GCPVertexGeminiSFT: Type["OptimizationJobInfo"]
     TogetherSFT: Type["OptimizationJobInfo"]
@@ -137,6 +143,23 @@ class OptimizationJobInfo:
     def output(self) -> Optional[Any]: ...
     @property
     def estimated_finish(self) -> Optional[int]: ...
+
+@final
+class DICLOptimizationConfig:
+    def __init__(
+        self,
+        *,
+        embedding_model: str,
+        variant_name: str,
+        function_name: str,
+        dimensions: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+        k: Optional[int] = None,
+        model: Optional[str] = None,
+        append_to_existing_variants: Optional[bool] = None,
+        credentials: Optional[str] = None,
+    ) -> None: ...
 
 @final
 class OpenAISFTConfig:
@@ -154,11 +177,47 @@ class OpenAISFTConfig:
     ) -> None: ...
 
 @final
+class OpenAIRFTConfig:
+    def __init__(
+        self,
+        *,
+        model: str,
+        grader: Dict[str, Any],
+        response_format: Optional[Dict[str, Any]] = None,
+        batch_size: Optional[int] = None,
+        compute_multiplier: Optional[float] = None,
+        eval_interval: Optional[int] = None,
+        eval_samples: Optional[int] = None,
+        learning_rate_multiplier: Optional[float] = None,
+        n_epochs: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+        credentials: Optional[str] = None,
+        api_base: Optional[str] = None,
+        seed: Optional[int] = None,
+        suffix: Optional[str] = None,
+    ) -> None: ...
+
+@final
 class FireworksSFTConfig:
     def __init__(
         self,
         *,
         model: str,
+        early_stop: Optional[bool] = None,
+        epochs: Optional[int] = None,
+        learning_rate: Optional[float] = None,
+        max_context_length: Optional[int] = None,
+        lora_rank: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        display_name: Optional[str] = None,
+        output_model: Optional[str] = None,
+        warm_start_from: Optional[str] = None,
+        is_turbo: Optional[bool] = None,
+        eval_auto_carveout: Optional[bool] = None,
+        nodes: Optional[int] = None,
+        mtp_enabled: Optional[bool] = None,
+        mtp_num_draft_tokens: Optional[int] = None,
+        mtp_freeze_base_model: Optional[bool] = None,
         credentials: Optional[str] = None,
         account_id: str,
         api_base: Optional[str] = None,
@@ -184,6 +243,42 @@ class GCPVertexGeminiSFTConfig:
         kms_key_name: Optional[str] = None,
         tuned_model_display_name: Optional[str] = None,
         bucket_path_prefix: Optional[str] = None,
+    ) -> None: ...
+
+@final
+class TogetherSFTConfig:
+    """
+    Configuration for Together supervised fine-tuning.
+
+    For detailed API documentation, see: https://docs.together.ai/reference/post-fine-tunes
+    """
+    def __init__(
+        self,
+        *,
+        model: str,
+        credentials: Optional[str] = None,
+        api_base: Optional[str] = None,
+        n_epochs: Optional[int] = None,
+        n_checkpoints: Optional[int] = None,
+        n_evals: Optional[int] = None,
+        batch_size: Optional[Union[int, str]] = None,
+        learning_rate: Optional[float] = None,
+        warmup_ratio: Optional[float] = None,
+        max_grad_norm: Optional[float] = None,
+        weight_decay: Optional[float] = None,
+        suffix: Optional[str] = None,
+        lr_scheduler: Optional[Dict[str, Any]] = None,
+        wandb_api_key: Optional[str] = None,
+        wandb_base_url: Optional[str] = None,
+        wandb_project_name: Optional[str] = None,
+        wandb_name: Optional[str] = None,
+        training_method: Optional[Dict[str, Any]] = None,
+        training_type: Optional[Dict[str, Any]] = None,
+        from_checkpoint: Optional[str] = None,
+        from_hf_model: Optional[str] = None,
+        hf_model_revision: Optional[str] = None,
+        hf_api_token: Optional[str] = None,
+        hf_output_repo_name: Optional[str] = None,
     ) -> None: ...
 
 @final
@@ -224,8 +319,8 @@ class BestOfNSamplingConfig:
     pass
 
 @final
-class DiclConfig:
-    pass
+class DICLConfig:
+    __deprecated__: str = ...
 
 @final
 class MixtureOfNConfig:
@@ -243,7 +338,7 @@ class VariantsConfig:
     ) -> Union[
         ChatCompletionConfig,
         BestOfNSamplingConfig,
-        DiclConfig,
+        DICLConfig,
         MixtureOfNConfig,
         ChainOfThoughtConfig,
     ]: ...
@@ -322,6 +417,7 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         *,
         config_file: Optional[str] = None,
         clickhouse_url: Optional[str] = None,
+        postgres_url: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> "TensorZeroGateway":
         """
@@ -329,7 +425,8 @@ class TensorZeroGateway(BaseTensorZeroGateway):
 
         :param config_file: (Optional) The path to the TensorZero configuration file.
         :param clickhouse_url: (Optional) The URL of the ClickHouse database.
-        :param timeout: The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
+        :param postgres_url: (Optional) The URL of the Postgres database.
+        :param timeout: (Optional) The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
         """
 
     def inference(
@@ -662,6 +759,7 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         *,
         config_file: Optional[str] = None,
         clickhouse_url: Optional[str] = None,
+        postgres_url: Optional[str] = None,
         timeout: Optional[float] = None,
         async_setup: bool = True,
     ) -> Union[Awaitable["AsyncTensorZeroGateway"], "AsyncTensorZeroGateway"]:
@@ -670,7 +768,8 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
 
         :param config_file: (Optional) The path to the TensorZero configuration file.
         :param clickhouse_url: (Optional) The URL of the ClickHouse database.
-        :param timeout: The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
+        :param postgres_url: (Optional) The URL of the Postgres database.
+        :param timeout: (Optional) The timeout for embedded gateway request processing, in seconds. If this timeout is hit, any in-progress LLM requests may be aborted. If not provided, no timeout will be set.
         :param async_setup (Optional): If True, this method will return a `Future` that resolves to an `AsyncTensorZeroGateway` instance. Otherwise, it will block and return an `AsyncTensorZeroGateway` directly.
         """
 
@@ -976,6 +1075,7 @@ def _start_http_gateway(
     *,
     config_file: Optional[str],
     clickhouse_url: Optional[str],
+    postgres_url: Optional[str],
     async_setup: bool,
 ) -> Union[Any, Awaitable[Any]]: ...
 @final
@@ -992,7 +1092,8 @@ __all__ = [
     "ChainOfThoughtConfig",
     "Config",
     "Datapoint",
-    "DiclConfig",
+    "DICLOptimizationConfig",
+    "DICLConfig",
     "FunctionConfigChat",
     "FunctionConfigJson",
     "FunctionsConfig",
@@ -1002,11 +1103,13 @@ __all__ = [
     "LocalHttpGateway",
     "MixtureOfNConfig",
     "_start_http_gateway",
+    "OpenAIRFTConfig",
     "OpenAISFTConfig",
     "OptimizationJobHandle",
     "OptimizationJobInfo",
     "OptimizationJobStatus",
     "RenderedSample",
+    "TogetherSFTConfig",
     "StoredInference",
     "ResolvedInput",
     "ResolvedInputMessage",

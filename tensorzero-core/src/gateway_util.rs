@@ -1,21 +1,25 @@
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 
+use crate::db::postgres::PostgresConnectionInfo;
+use crate::endpoints::openai_compatible::RouterExt;
 use axum::extract::{rejection::JsonRejection, FromRequest, Json, Request};
-use axum::routing::post;
 use axum::Router;
-use reqwest::{Client, Proxy};
 use serde::de::DeserializeOwned;
+use sqlx::postgres::PgPoolOptions;
+use tokio::runtime::Handle;
 use tokio::sync::oneshot::Sender;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
-use crate::clickhouse::migration_manager::{self, RunMigrationManagerArgs};
-use crate::clickhouse::ClickHouseConnectionInfo;
-use crate::config_parser::Config;
+use crate::config::{Config, ConfigFileGlob};
+use crate::db::clickhouse::migration_manager::{self, RunMigrationManagerArgs};
+use crate::db::clickhouse::ClickHouseConnectionInfo;
 use crate::endpoints;
 use crate::error::{Error, ErrorDetails};
+use crate::howdy::setup_howdy;
+use crate::http::TensorzeroHttpClient;
 
 /// Represents an active gateway (either standalone or embedded)
 /// The contained `app_state` can be freely cloned and dropped.
@@ -37,7 +41,42 @@ use crate::error::{Error, ErrorDetails};
 #[expect(clippy::manual_non_exhaustive)]
 pub struct GatewayHandle {
     pub app_state: AppStateData,
+    pub cancel_token: CancellationToken,
     _private: (),
+}
+
+impl Drop for GatewayHandle {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        let handle = self
+            .app_state
+            .clickhouse_connection_info
+            .batcher_join_handle();
+        // Drop our `ClickHouseConnectionInfo`, so that we stop holding on to the `Arc<BatchSender>`
+        // This allows the batch writer task to exit (once all of the remaining `ClickhouseConnectionInfo`s are dropped)
+        self.app_state.clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
+        if let Some(handle) = handle {
+            tracing::info!("Waiting for ClickHouse batch writer to finish");
+            // This could block forever if:
+            // * We spawn a long-lived `tokio::task` that holds on to a `ClickhouseConnectionInfo`,
+            //   and isn't using our `CancellationToken` to exit.
+            // * The `GatewayHandle` is dropped from a task that's running other futures
+            //   concurrently (e.g. a `try_join_all` where one of the futures somehow drops a `GatewayHandle`).
+            //   In this case, the `block_in_place` call would prevent those futures from ever making progress,
+            //   causing a `ClickhouseConnectionInfo` (and therefore the `Arc<BatchSender>`) to never be dropped.
+            //   This is very unlikely, as we only create a `GatewayHandle` in a few places (the main gateway
+            //   and embedded client), and drop it when we're exiting.
+            //
+            // We err on the side of hanging the server on shutdown, rather than potentially exiting while
+            // we still have batched writes in-flight (or about to be written via an active `ClickhouseConnectionInfo`).
+            tokio::task::block_in_place(|| {
+                if let Err(e) = Handle::current().block_on(handle) {
+                    tracing::error!("Error in batch writer: {e}");
+                }
+            });
+            tracing::info!("ClickHouse batch writer finished");
+        }
+    }
 }
 
 /// State for the API
@@ -46,8 +85,9 @@ pub struct GatewayHandle {
 #[expect(clippy::manual_non_exhaustive)]
 pub struct AppStateData {
     pub config: Arc<Config>,
-    pub http_client: Client,
+    pub http_client: TensorzeroHttpClient,
     pub clickhouse_connection_info: ClickHouseConnectionInfo,
+    pub postgres_connection_info: PostgresConnectionInfo,
     // Prevent `AppStateData` from being directly constructed outside of this module
     // This ensures that `AppStateData` is only ever constructed via explicit `new` methods,
     // which can ensure that we update global state.
@@ -57,64 +97,78 @@ pub type AppState = axum::extract::State<AppStateData>;
 
 impl GatewayHandle {
     pub async fn new(config: Arc<Config>) -> Result<Self, Error> {
-        let clickhouse_url = std::env::var("TENSORZERO_CLICKHOUSE_URL")
-            .ok()
-            .or_else(|| {
-                std::env::var("CLICKHOUSE_URL").ok().inspect(|_| {
-                    tracing::warn!("Deprecation Warning: The environment variable \"CLICKHOUSE_URL\" has been renamed to \"TENSORZERO_CLICKHOUSE_URL\" and will be removed in a future version. Please update your environment to use \"TENSORZERO_CLICKHOUSE_URL\" instead.");
-                })
-            });
-        Self::new_with_clickhouse(config, clickhouse_url).await
+        let clickhouse_url = std::env::var("TENSORZERO_CLICKHOUSE_URL").ok();
+        if clickhouse_url.is_none()
+            && std::env::var("CLICKHOUSE_URL").is_ok()
+            && config.gateway.observability.enabled.is_none()
+        {
+            return Err(ErrorDetails::ClickHouseConfiguration { message: "`CLICKHOUSE_URL` is deprecated and no longer accepted. Please set `TENSORZERO_CLICKHOUSE_URL`".to_string() }.into());
+        }
+        let postgres_url = std::env::var("TENSORZERO_POSTGRES_URL").ok();
+        Self::new_with_databases(config, clickhouse_url, postgres_url).await
     }
 
-    async fn new_with_clickhouse(
+    async fn new_with_databases(
         config: Arc<Config>,
         clickhouse_url: Option<String>,
+        postgres_url: Option<String>,
     ) -> Result<Self, Error> {
         let clickhouse_connection_info = setup_clickhouse(&config, clickhouse_url, false).await?;
-        let http_client = setup_http_client()?;
-
-        Ok(Self {
-            app_state: AppStateData {
-                config,
-                http_client,
-                clickhouse_connection_info,
-                _private: (),
-            },
-            _private: (),
-        })
+        let postgres_connection_info = setup_postgres(&config, postgres_url).await?;
+        let http_client = TensorzeroHttpClient::new()?;
+        Ok(Self::new_with_database_and_http_client(
+            config,
+            clickhouse_connection_info,
+            postgres_connection_info,
+            http_client,
+        ))
     }
 
-    pub fn new_with_clickhouse_and_http_client(
-        config: Arc<Config>,
-        clickhouse_connection_info: ClickHouseConnectionInfo,
-        http_client: Client,
-    ) -> Self {
-        Self {
-            app_state: AppStateData {
-                config,
-                http_client,
-                clickhouse_connection_info,
-                _private: (),
-            },
-            _private: (),
-        }
-    }
-
+    /// # Panics
+    /// Panics if a `TensorzeroHttpClient` cannot be constructed
     #[cfg(test)]
     pub fn new_unit_test_data(config: Arc<Config>, clickhouse_healthy: bool) -> Self {
-        let http_client = reqwest::Client::new();
+        let http_client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::new_mock(clickhouse_healthy);
+        let postgres_connection_info = PostgresConnectionInfo::Disabled;
+        Self::new_with_database_and_http_client(
+            config,
+            clickhouse_connection_info,
+            postgres_connection_info,
+            http_client,
+        )
+    }
+
+    pub fn new_with_database_and_http_client(
+        config: Arc<Config>,
+        clickhouse_connection_info: ClickHouseConnectionInfo,
+        postgres_connection_info: PostgresConnectionInfo,
+        http_client: TensorzeroHttpClient,
+    ) -> Self {
+        let cancel_token = CancellationToken::new();
+        setup_howdy(
+            &config,
+            clickhouse_connection_info.clone(),
+            cancel_token.clone(),
+        );
         Self {
             app_state: AppStateData {
                 config,
                 http_client,
                 clickhouse_connection_info,
+                postgres_connection_info,
                 _private: (),
             },
+            cancel_token,
             _private: (),
         }
     }
+}
+
+pub async fn setup_clickhouse_without_config(
+    clickhouse_url: String,
+) -> Result<ClickHouseConnectionInfo, Error> {
+    setup_clickhouse(&Config::default(), Some(clickhouse_url), true).await
 }
 
 pub async fn setup_clickhouse(
@@ -137,7 +191,11 @@ pub async fn setup_clickhouse(
         }
         // Observability enabled and ClickHouse URL provided
         (Some(true), Some(clickhouse_url)) => {
-            ClickHouseConnectionInfo::new(&clickhouse_url).await?
+            ClickHouseConnectionInfo::new(
+                &clickhouse_url,
+                config.gateway.observability.batch_writes.clone(),
+            )
+            .await?
         }
         // Observability default and no ClickHouse URL
         (None, None) => {
@@ -150,19 +208,48 @@ pub async fn setup_clickhouse(
             ClickHouseConnectionInfo::new_disabled()
         }
         // Observability default and ClickHouse URL provided
-        (None, Some(clickhouse_url)) => ClickHouseConnectionInfo::new(&clickhouse_url).await?,
+        (None, Some(clickhouse_url)) => {
+            ClickHouseConnectionInfo::new(
+                &clickhouse_url,
+                config.gateway.observability.batch_writes.clone(),
+            )
+            .await?
+        }
     };
 
     // Run ClickHouse migrations (if any) if we have a production ClickHouse connection
     if let ClickHouseConnectionInfo::Production { .. } = &clickhouse_connection_info {
         migration_manager::run(RunMigrationManagerArgs {
             clickhouse: &clickhouse_connection_info,
-            skip_completed_migrations: config.gateway.observability.skip_completed_migrations,
+            skip_completed_migrations: true,
             manual_run: false,
         })
         .await?;
     }
     Ok(clickhouse_connection_info)
+}
+
+pub async fn setup_postgres(
+    _config: &Config,
+    postgres_url: Option<String>,
+) -> Result<PostgresConnectionInfo, Error> {
+    let Some(postgres_url) = postgres_url else {
+        return Ok(PostgresConnectionInfo::Disabled);
+    };
+
+    let pool = PgPoolOptions::new()
+        // TODO: make this configurable
+        .max_connections(20)
+        .connect(&postgres_url)
+        .await
+        .map_err(|err| {
+            Error::new(ErrorDetails::PostgresConnectionInitialization {
+                message: err.to_string(),
+            })
+        })?;
+    let connection_info = PostgresConnectionInfo::new_with_pool(pool);
+    connection_info.check_migrations().await?;
+    Ok(connection_info)
 }
 
 /// Custom Axum extractor that validates the JSON body and deserializes it into a custom type
@@ -208,35 +295,6 @@ where
     }
 }
 
-// This is set high enough that it should never be hit for a normal model response.
-// In the future, we may want to allow overriding this at the model provider level.
-const DEFAULT_HTTP_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-pub fn setup_http_client() -> Result<Client, Error> {
-    let mut http_client_builder = Client::builder().timeout(DEFAULT_HTTP_CLIENT_TIMEOUT);
-
-    if cfg!(feature = "e2e_tests") {
-        if let Ok(proxy_url) = std::env::var("TENSORZERO_E2E_PROXY") {
-            tracing::info!("Using proxy URL from TENSORZERO_E2E_PROXY: {proxy_url}");
-            http_client_builder = http_client_builder
-                .proxy(Proxy::all(proxy_url).map_err(|e| {
-                    Error::new(ErrorDetails::AppState {
-                        message: format!("Invalid proxy URL: {e}"),
-                    })
-                })?)
-                // When running e2e tests, we use `provider-proxy` as an MITM proxy
-                // for caching, so we need to accept the invalid (self-signed) cert.
-                .danger_accept_invalid_certs(true);
-        }
-    }
-
-    http_client_builder.build().map_err(|e| {
-        Error::new(ErrorDetails::AppState {
-            message: format!("Failed to build HTTP client: {e}"),
-        })
-    })
-}
-
 // We hold on to these fields so that their Drop impls run when `ShutdownHandle` is dropped
 pub struct ShutdownHandle {
     #[expect(dead_code)]
@@ -254,6 +312,7 @@ pub struct ShutdownHandle {
 pub async fn start_openai_compatible_gateway(
     config_file: Option<String>,
     clickhouse_url: Option<String>,
+    postgres_url: Option<String>,
 ) -> Result<(SocketAddr, ShutdownHandle), Error> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -269,17 +328,15 @@ pub async fn start_openai_compatible_gateway(
     })?;
 
     let config = if let Some(config_file) = config_file {
-        Arc::new(Config::load_and_verify_from_path(Path::new(&config_file)).await?)
+        Arc::new(Config::load_and_verify_from_path(&ConfigFileGlob::new(config_file)?).await?)
     } else {
         Arc::new(Config::default())
     };
-    let gateway_handle = GatewayHandle::new_with_clickhouse(config, clickhouse_url).await?;
+    let gateway_handle =
+        GatewayHandle::new_with_databases(config, clickhouse_url, postgres_url).await?;
 
     let router = Router::new()
-        .route(
-            "/openai/v1/chat/completions",
-            post(endpoints::openai_compatible::inference_handler),
-        )
+        .register_openai_compatible_routes()
         .fallback(endpoints::fallback::handle_404)
         .with_state(gateway_handle.app_state.clone());
 
@@ -307,7 +364,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::config_parser::{gateway::GatewayConfig, ObservabilityConfig};
+    use crate::config::{gateway::GatewayConfig, ObservabilityConfig};
 
     #[tokio::test]
     #[traced_test]
@@ -317,7 +374,7 @@ mod tests {
             observability: ObservabilityConfig {
                 enabled: Some(false),
                 async_writes: false,
-                skip_completed_migrations: false,
+                batch_writes: Default::default(),
             },
             bind_address: None,
             debug: false,
@@ -326,6 +383,7 @@ mod tests {
             base_path: None,
             unstable_error_json: false,
             unstable_disable_feedback_target_validation: false,
+            disable_pseudonymous_usage_analytics: false,
         };
 
         let config = Box::leak(Box::new(Config {
@@ -347,7 +405,7 @@ mod tests {
             observability: ObservabilityConfig {
                 enabled: None,
                 async_writes: false,
-                skip_completed_migrations: false,
+                batch_writes: Default::default(),
             },
             unstable_error_json: false,
             ..Default::default()
@@ -374,7 +432,7 @@ mod tests {
             observability: ObservabilityConfig {
                 enabled: Some(true),
                 async_writes: false,
-                skip_completed_migrations: false,
+                batch_writes: Default::default(),
             },
             bind_address: None,
             debug: false,
@@ -383,6 +441,7 @@ mod tests {
             base_path: None,
             unstable_error_json: false,
             unstable_disable_feedback_target_validation: false,
+            disable_pseudonymous_usage_analytics: false,
         };
 
         let config = Box::leak(Box::new(Config {
@@ -400,7 +459,7 @@ mod tests {
             observability: ObservabilityConfig {
                 enabled: Some(true),
                 async_writes: false,
-                skip_completed_migrations: false,
+                batch_writes: Default::default(),
             },
             bind_address: None,
             debug: false,
@@ -409,6 +468,7 @@ mod tests {
             base_path: None,
             unstable_error_json: false,
             unstable_disable_feedback_target_validation: false,
+            disable_pseudonymous_usage_analytics: false,
         };
         let config = Box::leak(Box::new(Config {
             gateway: gateway_config,
@@ -428,7 +488,7 @@ mod tests {
             observability: ObservabilityConfig {
                 enabled: Some(true),
                 async_writes: false,
-                skip_completed_migrations: false,
+                batch_writes: Default::default(),
             },
             bind_address: None,
             debug: false,
@@ -437,6 +497,7 @@ mod tests {
             base_path: None,
             unstable_error_json: false,
             unstable_disable_feedback_target_validation: false,
+            disable_pseudonymous_usage_analytics: false,
         };
         let config = Config {
             gateway: gateway_config,

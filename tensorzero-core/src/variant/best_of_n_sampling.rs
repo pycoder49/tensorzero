@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use backon::Retryable;
 use futures::future::join_all;
@@ -8,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
 
-use crate::config_parser::{LoadableConfig, PathWithContents};
+use crate::config::{ErrorContext, PathWithContents, SchemaData};
 use crate::embeddings::EmbeddingModelTable;
 use crate::endpoints::inference::{InferenceClients, InferenceModels};
 use crate::error::ErrorDetails;
@@ -22,7 +23,6 @@ use crate::inference::types::{ContentBlockOutput, ResolvedInput};
 use crate::jsonschema_util::StaticJSONSchema;
 use crate::model::ModelTable;
 use crate::tool::{ImplicitToolConfig, ToolCallConfig, ToolChoice, ToolConfig};
-use crate::variant::chat_completion::TemplateSchemaInfo;
 use crate::variant::mixture_of_n::stream_inference_from_non_stream;
 use crate::{
     endpoints::inference::InferenceParams,
@@ -36,7 +36,7 @@ use crate::{
 use super::chat_completion::UninitializedChatCompletionConfig;
 use super::{InferenceConfig, JsonMode, ModelUsedInfo, Variant};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export))]
 pub struct BestOfNSamplingConfig {
@@ -62,7 +62,7 @@ fn default_timeout() -> f64 {
     300.0
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export))]
 pub struct BestOfNEvaluatorConfig {
@@ -78,14 +78,26 @@ pub struct UninitializedBestOfNEvaluatorConfig {
     pub inner: UninitializedChatCompletionConfig,
 }
 
-impl LoadableConfig<BestOfNSamplingConfig> for UninitializedBestOfNSamplingConfig {
-    fn load(self) -> Result<BestOfNSamplingConfig, Error> {
+impl UninitializedBestOfNSamplingConfig {
+    pub fn load(
+        self,
+        schemas: &SchemaData,
+        error_context: &ErrorContext,
+    ) -> Result<BestOfNSamplingConfig, Error> {
         Ok(BestOfNSamplingConfig {
             weight: self.weight,
             timeout_s: self.timeout_s,
             candidates: self.candidates,
             evaluator: BestOfNEvaluatorConfig {
-                inner: self.evaluator.inner.load()?,
+                inner: self.evaluator.inner.load(
+                    schemas,
+                    // Our stored evaluator is a plain `UninitializedChatCompletionConfig`, so we need
+                    // to explicitly add `evaluator` to any error messages it produces.
+                    &ErrorContext {
+                        function_name: error_context.function_name.clone(),
+                        variant_name: format!("{}.evaluator", error_context.variant_name),
+                    },
+                )?,
             },
         })
     }
@@ -94,7 +106,7 @@ impl LoadableConfig<BestOfNSamplingConfig> for UninitializedBestOfNSamplingConfi
 lazy_static! {
     static ref EVALUATOR_OUTPUT_SCHEMA: StaticJSONSchema = {
         #[expect(clippy::expect_used)]
-        StaticJSONSchema::from_value(&json!({
+        StaticJSONSchema::from_value(json!({
             "type": "object",
             "properties": {
                 "thinking": { "type": "string" },
@@ -133,7 +145,6 @@ impl Variant for BestOfNSamplingConfig {
             inference_config,
             clients,
             candidate_inference_results,
-            function,
         )
         .await
     }
@@ -157,7 +168,6 @@ impl Variant for BestOfNSamplingConfig {
                 inference_config,
                 clients,
                 candidate_inference_results,
-                function,
             )
             .await?;
 
@@ -219,6 +229,12 @@ impl Variant for BestOfNSamplingConfig {
     // We only return templates for the evaluator variant.
     fn get_all_template_paths(&self) -> Vec<&PathWithContents> {
         self.evaluator.inner.get_all_template_paths()
+    }
+
+    fn get_all_explicit_template_names(&self) -> HashSet<String> {
+        // The candidate variants will  already have 'get_all_explicit_template_names' called on them,
+        // so we don't need to look them up here
+        self.evaluator.inner.get_all_explicit_template_names()
     }
 
     async fn start_batch_inference<'a>(
@@ -328,14 +344,13 @@ impl BestOfNSamplingConfig {
     /// Gets the best candidate using the evaluator config.
     /// If at any point the evaluator fails to return a valid response,
     /// we randomly select one of the candidates.
-    async fn select_best_candidate<'a, 'request>(
-        &'a self,
+    async fn select_best_candidate<'request>(
+        &self,
         input: &ResolvedInput,
         models: &ModelTable,
         inference_config: &'request InferenceConfig<'request>,
         clients: &'request InferenceClients<'request>,
         candidates: Vec<InferenceResult>,
-        function: &'a FunctionConfig,
     ) -> Result<InferenceResult, Error> {
         if candidates.is_empty() {
             return Err(ErrorDetails::Inference {
@@ -360,7 +375,6 @@ impl BestOfNSamplingConfig {
             inference_config,
             clients,
             &candidates,
-            function,
         )
         .await
         {
@@ -424,16 +438,10 @@ async fn inner_select_best_candidate<'a, 'request>(
     inference_config: &'request InferenceConfig<'request>,
     clients: &'request InferenceClients<'request>,
     candidates: &[InferenceResult],
-    function: &'a FunctionConfig,
 ) -> Result<(Option<usize>, Option<ModelInferenceResponseWithMetadata>), Error> {
     let mut inference_params = InferenceParams::default();
-    let (inference_request, skipped_indices) = evaluator.prepare_request(
-        input,
-        inference_config,
-        candidates,
-        &mut inference_params,
-        function,
-    )?;
+    let (inference_request, skipped_indices) =
+        evaluator.prepare_request(input, inference_config, candidates, &mut inference_params)?;
     if skipped_indices.len() == candidates.len() {
         return Err(ErrorDetails::Inference {
             message: "No valid candidates available to prepare request.".to_string(),
@@ -474,7 +482,7 @@ async fn inner_select_best_candidate<'a, 'request>(
         .find_map(|block| match block {
             ContentBlockOutput::Text(text) => Some(&text.text),
             ContentBlockOutput::ToolCall(tool_call) => Some(&tool_call.arguments),
-            _ => None,
+            ContentBlockOutput::Thought(_) | ContentBlockOutput::Unknown { .. } => None,
         }) {
         Some(text) => text,
         None => {
@@ -540,11 +548,8 @@ impl BestOfNEvaluatorConfig {
         templates: &TemplateConfig,
         system: Option<&Value>,
         max_index: usize,
-        template_schema_info: TemplateSchemaInfo,
     ) -> Result<String, Error> {
-        let inner_system_message =
-            self.inner
-                .prepare_system_message(templates, system, template_schema_info)?;
+        let inner_system_message = self.inner.prepare_system_message(templates, system)?;
         let template_context = match inner_system_message {
             Some(inner_system_message) => {
                 json!({"inner_system_message": inner_system_message, "max_index": max_index})
@@ -645,7 +650,6 @@ impl BestOfNEvaluatorConfig {
         inference_config: &InferenceConfig<'_>,
         candidates: &[InferenceResult],
         inference_params: &mut InferenceParams,
-        function: &FunctionConfig,
     ) -> Result<(ModelInferenceRequest<'a>, Vec<usize>), Error> {
         // Do this before we prepare the system message so we can use the correct max index in the system message
         let (candidate_message, skipped_indices) =
@@ -664,17 +668,13 @@ impl BestOfNEvaluatorConfig {
             inference_config.templates,
             input.system.as_ref(),
             max_index,
-            function.template_schema_info(),
         )?);
         let messages = input
             .messages
             .iter()
             .map(|message| {
-                self.inner.prepare_request_message(
-                    inference_config.templates,
-                    message,
-                    function.template_schema_info(),
-                )
+                self.inner
+                    .prepare_request_message(inference_config.templates, message)
             })
             .chain(std::iter::once(Ok(candidate_message)))
             .collect::<Result<Vec<_>, _>>()?;
@@ -696,7 +696,7 @@ impl BestOfNEvaluatorConfig {
             .unwrap_or(JsonMode::Strict);
         let tool_config = match json_mode {
             JsonMode::ImplicitTool => Some(Cow::Borrowed(&*IMPLICIT_TOOL_CALL_CONFIG)),
-            _ => None,
+            JsonMode::Off | JsonMode::On | JsonMode::Strict => None,
         };
         if !inference_config.extra_body.is_empty() {
             return Err(ErrorDetails::InvalidRequest {
@@ -733,7 +733,7 @@ impl BestOfNEvaluatorConfig {
                 stream: false,
                 json_mode: json_mode.into(),
                 function_type: FunctionType::Json,
-                output_schema: Some(EVALUATOR_OUTPUT_SCHEMA.value),
+                output_schema: Some(&EVALUATOR_OUTPUT_SCHEMA.value),
                 extra_body,
                 extra_headers,
                 extra_cache_key: inference_config.extra_cache_key.clone(),
@@ -763,23 +763,25 @@ fn map_evaluator_to_actual_index(evaluator_idx: usize, skipped_indices: &[usize]
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
 
-    use reqwest::Client;
     use uuid::Uuid;
 
     use crate::{
         cache::{CacheEnabledMode, CacheOptions},
-        clickhouse::ClickHouseConnectionInfo,
+        config::UninitializedSchemas,
+        db::clickhouse::ClickHouseConnectionInfo,
         endpoints::inference::{InferenceCredentials, InferenceIds},
-        function::FunctionConfigChat,
+        http::TensorzeroHttpClient,
         inference::types::{
-            ChatInferenceResult, FinishReason, JsonInferenceResult, Latency, Usage,
+            ChatInferenceResult, FinishReason, JsonInferenceResult, Latency,
+            RequestMessagesOrBatch, Usage,
         },
-        minijinja_util::tests::get_test_template_config,
+        minijinja_util::tests::{
+            get_system_filled_template, get_system_template, get_test_template_config,
+        },
         model::{ModelConfig, ModelProvider, ProviderConfig},
         providers::dummy::DummyProvider,
-        variant::{VariantConfig, VariantInfo},
     };
 
     use super::*;
@@ -798,28 +800,32 @@ mod tests {
     #[test]
     fn test_prepare_system_message() {
         let templates = get_test_template_config();
-        let all_schemas = TemplateSchemaInfo {
-            has_system_schema: true,
-            has_user_schema: true,
-            has_assistant_schema: true,
-        };
+
+        let system_schema = StaticJSONSchema::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "assistant_name": {
+                    "type": "string"
+                }
+            },
+            "required": ["assistant_name"]
+        }))
+        .unwrap();
 
         // Test without templates, string message
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "dummy".into(),
                 weight: Some(1.0),
                 ..Default::default()
-            },
+            }
+            .load(&SchemaData::default(), &ErrorContext::new_test())
+            .unwrap(),
         };
         let input_message = Value::String("You are a helpful assistant.".to_string());
         let max_index = 2;
-        let result = evaluator_config.prepare_system_message(
-            &templates,
-            Some(&input_message),
-            max_index,
-            all_schemas,
-        );
+        let result =
+            evaluator_config.prepare_system_message(&templates, Some(&input_message), max_index);
         let prepared_message = result.unwrap();
         let expected_message = templates
             .template_message(
@@ -831,20 +837,18 @@ mod tests {
 
         // Test without templates, object message
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "dummy".into(),
                 weight: Some(1.0),
                 ..Default::default()
-            },
+            }
+            .load(&SchemaData::default(), &ErrorContext::new_test())
+            .unwrap(),
         };
         let input_message = json!({"message": "You are a helpful assistant."});
         let max_index = 3;
-        let result = evaluator_config.prepare_system_message(
-            &templates,
-            Some(&input_message),
-            max_index,
-            all_schemas,
-        );
+        let result =
+            evaluator_config.prepare_system_message(&templates, Some(&input_message), max_index);
         assert!(result.is_err());
         let prepared_message = result.unwrap_err();
         assert_eq!(
@@ -854,15 +858,16 @@ mod tests {
 
         // Test without templates, no message
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "dummy".into(),
                 weight: Some(1.0),
                 ..Default::default()
-            },
+            }
+            .load(&SchemaData::default(), &ErrorContext::new_test())
+            .unwrap(),
         };
         let max_index = 5;
-        let result =
-            evaluator_config.prepare_system_message(&templates, None, max_index, all_schemas);
+        let result = evaluator_config.prepare_system_message(&templates, None, max_index);
         let expected_message = templates
             .template_message(
                 "t0:best_of_n_evaluator_system",
@@ -873,34 +878,43 @@ mod tests {
         let prepared_message = result.unwrap();
         assert_eq!(prepared_message, expected_message);
 
-        // Test with templates that need new info
-        let system_template_name = "system";
+        let system_template = get_system_template();
 
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "dummy".into(),
                 weight: Some(1.0),
-                system_template: Some(PathWithContents {
-                    path: system_template_name.into(),
-                    contents: String::new(),
-                }),
+                system_template: Some(system_template),
+                user_template: None,
+                assistant_template: None,
+                input_wrappers: None,
                 ..Default::default()
-            },
+            }
+            .load(
+                &SchemaData::load(
+                    None,
+                    None,
+                    Some(system_schema),
+                    UninitializedSchemas::default(),
+                    "test",
+                )
+                .unwrap(),
+                &ErrorContext {
+                    function_name: "test".to_string(),
+                    variant_name: "test".to_string(),
+                },
+            )
+            .unwrap(),
         };
 
         let max_index = 6;
         let input_message = serde_json::json!({"assistant_name": "ChatGPT"});
-        let result = evaluator_config.prepare_system_message(
-            &templates,
-            Some(&input_message),
-            max_index,
-            all_schemas,
-        );
-        assert!(result.is_ok());
+        let result =
+            evaluator_config.prepare_system_message(&templates, Some(&input_message), max_index);
         let prepared_message = result.unwrap();
         let inner_system_message = templates
             .template_message(
-                system_template_name,
+                "system",
                 &json!({"assistant_name": "ChatGPT", "max_index": max_index}),
             )
             .unwrap();
@@ -914,24 +928,33 @@ mod tests {
 
         // Test with template that is complete as is (string)
         let system_template_name = "system_filled";
+        let system_template = get_system_filled_template();
 
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "dummy".into(),
                 weight: Some(1.0),
-                system_template: Some(PathWithContents {
-                    path: system_template_name.into(),
-                    contents: String::new(),
-                }),
+                system_template: Some(system_template),
+                user_template: None,
+                assistant_template: None,
+                input_wrappers: None,
                 ..Default::default()
-            },
+            }
+            .load(
+                &SchemaData::load(None, None, None, UninitializedSchemas::default(), "test")
+                    .unwrap(),
+                &ErrorContext {
+                    function_name: "test".to_string(),
+                    variant_name: "test".to_string(),
+                },
+            )
+            .unwrap(),
         };
 
         let max_index = 10;
-        let result =
-            evaluator_config.prepare_system_message(&templates, None, max_index, all_schemas);
-        assert!(result.is_ok());
-        let prepared_message = result.unwrap();
+        let prepared_message = evaluator_config
+            .prepare_system_message(&templates, None, max_index)
+            .unwrap();
         let inner_system_message = templates
             .template_message(system_template_name, &json!({}))
             .unwrap();
@@ -955,10 +978,10 @@ mod tests {
             created: 200u64,
             output: vec!["Candidate answer 1".to_string().into()],
             system: None,
-            input_messages: vec![RequestMessage {
+            input_messages: RequestMessagesOrBatch::Message(vec![RequestMessage {
                 role: Role::Assistant,
                 content: vec!["test_assistant".to_string().into()],
-            }],
+            }]),
             raw_request: "{\"prompt\": \"Example prompt\"}".to_string(),
             raw_response: "{\"response\": \"Example response\"}".to_string(),
             usage: Usage {
@@ -991,10 +1014,10 @@ mod tests {
             created: 201u64,
             output: vec!["Candidate answer 2".to_string().into()],
             system: Some("test_system".to_string()),
-            input_messages: vec![RequestMessage {
+            input_messages: RequestMessagesOrBatch::Message(vec![RequestMessage {
                 role: Role::Assistant,
                 content: vec!["test_assistant".to_string().into()],
-            }],
+            }]),
             raw_request: "{\"prompt\": \"Example prompt 2\"}".to_string(),
             raw_response: "{\"response\": \"Example response 2\"}".to_string(),
             usage: Usage {
@@ -1046,10 +1069,10 @@ mod tests {
             created: 200u64,
             output: vec!["{\"response\": \"Valid JSON response\"}".to_string().into()],
             system: Some("test_system".to_string()),
-            input_messages: vec![RequestMessage {
+            input_messages: RequestMessagesOrBatch::Message(vec![RequestMessage {
                 role: Role::Assistant,
                 content: vec!["test_assistant".to_string().into()],
-            }],
+            }]),
             raw_request: "{\"prompt\": \"Example prompt\"}".to_string(),
             raw_response: "{\"response\": \"Valid JSON response\"}".to_string(),
             usage: Usage {
@@ -1084,10 +1107,10 @@ mod tests {
                 .to_string()
                 .into()], // missing closing brace
             system: Some("test_system".to_string()),
-            input_messages: vec![RequestMessage {
+            input_messages: RequestMessagesOrBatch::Message(vec![RequestMessage {
                 role: Role::Assistant,
                 content: vec!["test_assistant".to_string().into()],
-            }],
+            }]),
             raw_request: "{\"prompt\": \"Example prompt 2\"}".to_string(),
             raw_response: "{\"response\": \"Malformed JSON response\"".to_string(), // malformed
             usage: Usage {
@@ -1136,10 +1159,12 @@ mod tests {
     async fn test_select_best_candidate() {
         // Set up evaluator with a provider that returns a valid answer_choice
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "best_of_n_1".into(),
                 ..Default::default()
-            },
+            }
+            .load(&SchemaData::default(), &ErrorContext::new_test())
+            .unwrap(),
         };
         let best_of_n_variant = BestOfNSamplingConfig {
             weight: Some(1.0),
@@ -1157,10 +1182,10 @@ mod tests {
             raw_request: "{\"prompt\": \"Example prompt\"}".to_string(),
             raw_response: "{\"response\": \"Example response\"}".to_string(),
             system: Some("test_system".to_string()),
-            input_messages: vec![RequestMessage {
+            input_messages: RequestMessagesOrBatch::Message(vec![RequestMessage {
                 role: Role::Assistant,
                 content: vec!["test_assistant".to_string().into()],
-            }],
+            }]),
             usage: Usage {
                 input_tokens: 50,
                 output_tokens: 100,
@@ -1191,10 +1216,10 @@ mod tests {
             created: 201u64,
             output: vec!["Candidate answer 1".to_string().into()],
             system: Some("test_system".to_string()),
-            input_messages: vec![RequestMessage {
+            input_messages: RequestMessagesOrBatch::Message(vec![RequestMessage {
                 role: Role::Assistant,
                 content: vec!["test_assistant".to_string().into()],
-            }],
+            }]),
             raw_request: "{\"prompt\": \"Example prompt 1\"}".to_string(),
             raw_response: "{\"response\": \"Example response 1\"}".to_string(),
             usage: Usage {
@@ -1244,24 +1269,7 @@ mod tests {
             },
         )]))
         .expect("Failed to create model table");
-        let function = FunctionConfig::Chat(FunctionConfigChat {
-            variants: HashMap::from([(
-                "best_of_n_1".into(),
-                Arc::new(VariantInfo {
-                    inner: VariantConfig::BestOfNSampling(BestOfNSamplingConfig {
-                        candidates: vec![],
-                        weight: None,
-                        timeout_s: 0.0,
-                        evaluator: BestOfNEvaluatorConfig {
-                            inner: Default::default(),
-                        },
-                    }),
-                    timeouts: Default::default(),
-                }),
-            )]),
-            ..Default::default()
-        });
-        let client = Client::new();
+        let client = TensorzeroHttpClient::new().unwrap();
         let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
         let api_keys = InferenceCredentials::default();
         let inference_clients = InferenceClients {
@@ -1299,7 +1307,6 @@ mod tests {
                 &inference_config,
                 &inference_clients,
                 candidates.clone(),
-                &function,
             )
             .await
             .expect("Failed to select best candidate");
@@ -1320,16 +1327,18 @@ mod tests {
                 assert_eq!(selected.model_inference_results.len(), 3);
                 assert_eq!(selected.finish_reason, Some(FinishReason::Stop));
             }
-            _ => {
+            InferenceResult::Json(_) => {
                 panic!("Expected a Chat inference result");
             }
         }
         // Set up evaluator with a provider that fails
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "error".into(),
                 ..Default::default()
-            },
+            }
+            .load(&SchemaData::default(), &ErrorContext::new_test())
+            .unwrap(),
         };
         let best_of_n_variant = BestOfNSamplingConfig {
             weight: Some(1.0),
@@ -1375,7 +1384,6 @@ mod tests {
                 &inference_config,
                 &inference_clients,
                 candidates.clone(),
-                &function,
             )
             .await;
 
@@ -1386,7 +1394,7 @@ mod tests {
             InferenceResult::Chat(chat_choice) => {
                 assert!(chat_choice.model_inference_results.len() == 2);
             }
-            _ => {
+            InferenceResult::Json(_) => {
                 panic!("Expected a Chat inference result");
             }
         }
@@ -1394,10 +1402,12 @@ mod tests {
 
         // Set up evaluator with a provider that returns invalid JSON
         let evaluator_config = BestOfNEvaluatorConfig {
-            inner: ChatCompletionConfig {
+            inner: UninitializedChatCompletionConfig {
                 model: "regular".into(),
                 ..Default::default()
-            },
+            }
+            .load(&SchemaData::default(), &ErrorContext::new_test())
+            .unwrap(),
         };
         let best_of_n_variant = BestOfNSamplingConfig {
             weight: Some(1.0),
@@ -1443,7 +1453,6 @@ mod tests {
                 &inference_config,
                 &inference_clients,
                 candidates.clone(),
-                &function,
             )
             .await;
 
@@ -1454,7 +1463,7 @@ mod tests {
                 // But, it's a random choice, so we can't assert on the specific index
                 assert!(chat_choice.model_inference_results.len() == 3);
             }
-            _ => {
+            InferenceResult::Json(_) => {
                 panic!("Expected a Chat inference result");
             }
         }
@@ -1467,7 +1476,6 @@ mod tests {
                 &inference_config,
                 &inference_clients,
                 empty_candidates.clone(),
-                &function,
             )
             .await;
         let err = result.unwrap_err();
@@ -1485,11 +1493,13 @@ mod tests {
             timeout_s: 10.0,
             candidates: vec![],
             evaluator: BestOfNEvaluatorConfig {
-                inner: ChatCompletionConfig {
+                inner: UninitializedChatCompletionConfig {
                     model: "best_of_n_big".into(),
                     weight: Some(1.0),
                     ..Default::default()
-                },
+                }
+                .load(&SchemaData::default(), &ErrorContext::new_test())
+                .unwrap(),
             },
         };
 
@@ -1524,7 +1534,6 @@ mod tests {
                 &inference_config,
                 &inference_clients,
                 candidates.clone(),
-                &function,
             )
             .await;
         // we gracefully handle the error and return a random candidate

@@ -2,7 +2,7 @@ use futures::StreamExt;
 use lazy_static::lazy_static;
 use mime::MediaType;
 use reqwest::StatusCode;
-use reqwest_eventsource::{Event, EventSource};
+use reqwest_eventsource::Event;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +15,7 @@ use url::Url;
 use crate::cache::ModelProviderRequest;
 use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{warn_discarded_unknown_chunk, DisplayOrDebugGateway, Error, ErrorDetails};
+use crate::http::{TensorZeroEventSource, TensorzeroHttpClient};
 use crate::inference::types::batch::BatchRequestRow;
 use crate::inference::types::batch::PollBatchInferenceResponse;
 use crate::inference::types::resolved_input::FileWithPath;
@@ -123,12 +124,14 @@ impl AnthropicCredentials {
                 dynamic_api_keys.get(key_name).ok_or_else(|| {
                     ErrorDetails::ApiKeyMissing {
                         provider_name: PROVIDER_NAME.to_string(),
+                        message: format!("Dynamic api key `{key_name}` is missing"),
                     }
                     .into()
                 })
             }
             AnthropicCredentials::None => Err(ErrorDetails::ApiKeyMissing {
                 provider_name: PROVIDER_NAME.to_string(),
+                message: "No credentials are set".to_string(),
             }
             .into()),
         }
@@ -144,7 +147,7 @@ impl InferenceProvider for AnthropicProvider {
             provider_name: _,
             model_name: tensorzero_model_name,
         }: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
@@ -221,21 +224,13 @@ impl InferenceProvider for AnthropicProvider {
             let response_code = res.status();
             let response_text = res.text().await.map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
-                    message: format!("Error parsing response: {}", DisplayOrDebugGateway::new(e)),
+                    message: format!("Error fetching response: {}", DisplayOrDebugGateway::new(e)),
                     provider_type: PROVIDER_TYPE.to_string(),
                     raw_request: Some(raw_request.clone()),
                     raw_response: None,
                 })
             })?;
-            let error_body: AnthropicError = serde_json::from_str(&response_text).map_err(|e| {
-                Error::new(ErrorDetails::InferenceServer {
-                    message: format!("Error parsing response: {}", DisplayOrDebugGateway::new(e)),
-                    provider_type: PROVIDER_TYPE.to_string(),
-                    raw_request: Some(raw_request.clone()),
-                    raw_response: Some(response_text),
-                })
-            })?;
-            handle_anthropic_error(response_code, error_body.error, raw_request)
+            handle_anthropic_error(response_code, raw_request, response_text)
         }
     }
 
@@ -247,7 +242,7 @@ impl InferenceProvider for AnthropicProvider {
             provider_name: _,
             model_name,
         }: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         api_key: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
@@ -294,7 +289,7 @@ impl InferenceProvider for AnthropicProvider {
     async fn start_batch_inference<'a>(
         &'a self,
         _requests: &'a [ModelInferenceRequest<'_>],
-        _client: &'a reqwest::Client,
+        _client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<StartBatchProviderInferenceResponse, Error> {
         Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
@@ -306,7 +301,7 @@ impl InferenceProvider for AnthropicProvider {
     async fn poll_batch_inference<'a>(
         &'a self,
         _batch_request: &'a BatchRequestRow<'a>,
-        _http_client: &'a reqwest::Client,
+        _http_client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<PollBatchInferenceResponse, Error> {
         Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
@@ -320,7 +315,7 @@ impl InferenceProvider for AnthropicProvider {
 /// Modified from the example [here](https://github.com/64bit/async-openai/blob/5c9c817b095e3bacb2b6c9804864cdf8b15c795e/async-openai/src/client.rs#L433)
 /// At a high level, this function is handling low-level EventSource details and mapping the objects returned by Anthropic into our `InferenceResultChunk` type
 fn stream_anthropic(
-    mut event_source: EventSource,
+    mut event_source: TensorZeroEventSource,
     start_time: Instant,
     model_provider: &ModelProvider,
 ) -> ProviderInferenceResponseStreamInner {
@@ -731,7 +726,11 @@ fn get_default_max_tokens(model_name: &str) -> Result<u32, Error> {
         || model_name == "claude-sonnet-4-0"
     {
         Ok(64_000)
-    } else if model_name.starts_with("claude-opus-4-202") || model_name == "claude-opus-4-0" {
+    } else if model_name.starts_with("claude-opus-4-202")
+        || model_name == "claude-opus-4-0"
+        || model_name.starts_with("claude-opus-4-1-202")
+        || model_name == "claude-opus-4-1"
+    {
         Ok(32_000)
     } else {
         Err(Error::new(ErrorDetails::InferenceClient {
@@ -748,7 +747,7 @@ fn get_default_max_tokens(model_name: &str) -> Result<u32, Error> {
 /// - Prepending a default User message with "[listening]" if the first message is not from a User
 /// - Appending a default User message with "[listening]" if the last message is from an Assistant
 fn prepare_messages(
-    mut messages: Vec<AnthropicMessage>,
+    mut messages: Vec<AnthropicMessage<'_>>,
 ) -> std::vec::Vec<providers::anthropic::AnthropicMessage<'_>> {
     // Anthropic also requires that there is at least one message and it is a User message.
     // If it's not we will prepend a default User message.
@@ -842,17 +841,6 @@ pub(crate) fn prefill_json_chunk_response(chunk: &mut ProviderInferenceResponseC
             })).unwrap_or_default()
         });
     }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct AnthropicError {
-    error: AnthropicErrorBody,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct AnthropicErrorBody {
-    r#type: String,
-    message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1034,8 +1022,8 @@ impl<'a> TryFrom<AnthropicResponseWithMetadata<'a>> for ProviderInferenceRespons
 
 fn handle_anthropic_error(
     response_code: StatusCode,
-    response_body: AnthropicErrorBody,
     raw_request: String,
+    raw_response: String,
 ) -> Result<ProviderInferenceResponse, Error> {
     match response_code {
         StatusCode::UNAUTHORIZED
@@ -1045,15 +1033,15 @@ fn handle_anthropic_error(
             status_code: Some(response_code),
             provider_type: PROVIDER_TYPE.to_string(),
             raw_request: Some(raw_request),
-            raw_response: serde_json::to_string(&response_body).ok(),
-            message: response_body.message,
+            raw_response: Some(raw_response.clone()),
+            message: raw_response,
         }
         .into()),
         // StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::INTERNAL_SERVER_ERROR | 529: Overloaded
         // These are all captured in _ since they have the same error behavior
         _ => Err(ErrorDetails::InferenceServer {
-            raw_response: serde_json::to_string(&response_body).ok(),
-            message: response_body.message,
+            raw_response: Some(raw_response.clone()),
+            message: raw_response,
             provider_type: PROVIDER_TYPE.to_string(),
             raw_request: Some(raw_request),
         }
@@ -1576,9 +1564,10 @@ mod tests {
             ..Default::default()
         };
         let anthropic_request_body = AnthropicRequestBody::new(&model, &inference_request);
-        let details = anthropic_request_body.unwrap_err().get_owned_details();
+        let error = anthropic_request_body.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InvalidRequest {
                 message: "Anthropic requires at least one message".to_string(),
             }
@@ -1810,107 +1799,93 @@ mod tests {
             ..Default::default()
         };
 
+        let model = "claude-opus-4-1-20250805".to_string();
+        let body = AnthropicRequestBody::new(&model, &request);
+        assert_eq!(body.unwrap().max_tokens, 32_000);
+        let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
+        assert_eq!(body.unwrap().max_tokens, 100);
+
         let model = "claude-opus-4-20250514".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 32_000);
-
-        let model = "claude-opus-4-20250514".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-sonnet-4-20250514".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 64_000);
-
-        let model = "claude-sonnet-4-20250514".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-7-sonnet-20250219".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 64_000);
-
-        let model = "claude-3-7-sonnet-20250219".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-5-sonnet-20241022".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 8_192);
-
-        let model = "claude-3-5-sonnet-20241022".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-5-haiku-20241022".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 8_192);
+        let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
+        assert_eq!(body.unwrap().max_tokens, 100);
 
-        let model = "claude-3-5-haiku-20241022".to_string();
+        let model = "claude-opus-4-1".to_string();
+        let body = AnthropicRequestBody::new(&model, &request);
+        assert_eq!(body.unwrap().max_tokens, 32_000);
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-opus-4-0".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 32_000);
-
-        let model = "claude-opus-4-0".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-sonnet-4-0".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 64_000);
-
-        let model = "claude-sonnet-4-0".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-7-sonnet-latest".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 64_000);
-
-        let model = "claude-3-7-sonnet-latest".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-5-sonnet-latest".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 8_192);
-
-        let model = "claude-3-5-sonnet-latest".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-5-haiku-latest".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 8_192);
-
-        let model = "claude-3-5-haiku-latest".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-haiku-20240307".to_string();
         let body = AnthropicRequestBody::new(&model, &request);
         assert_eq!(body.unwrap().max_tokens, 4_096);
-
-        let model = "claude-3-haiku-20240307".to_string();
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-3-5-ballad-latest".to_string(); // fake model
         let body = AnthropicRequestBody::new(&model, &request);
         assert!(body.is_err());
-
-        let model = "claude-3-5-ballad-latest".to_string(); // fake model
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
 
         let model = "claude-4-5-haiku-20260101".to_string(); // fake model
         let body = AnthropicRequestBody::new(&model, &request);
         assert!(body.is_err());
-
-        let model = "claude-4-5-haiku-20260101".to_string(); // fake model
         let body = AnthropicRequestBody::new(&model, &request_with_max_tokens);
         assert_eq!(body.unwrap().max_tokens, 100);
     }
@@ -2106,75 +2081,91 @@ mod tests {
 
     #[test]
     fn test_handle_anthropic_error() {
-        let error_body = AnthropicErrorBody {
-            r#type: "error".to_string(),
-            message: "test_message".to_string(),
-        };
         let response_code = StatusCode::BAD_REQUEST;
-        let result =
-            handle_anthropic_error(response_code, error_body.clone(), "raw request".to_string());
-        let details = result.unwrap_err().get_owned_details();
+        let result = handle_anthropic_error(
+            response_code,
+            "raw request".to_string(),
+            "raw response".to_string(),
+        );
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceClient {
-                message: "test_message".to_string(),
+                message: "raw response".to_string(),
                 status_code: Some(response_code),
                 provider_type: PROVIDER_TYPE.to_string(),
                 raw_request: Some("raw request".to_string()),
-                raw_response: Some("{\"type\":\"error\",\"message\":\"test_message\"}".to_string()),
+                raw_response: Some("raw response".to_string()),
             }
         );
         let response_code = StatusCode::UNAUTHORIZED;
-        let result =
-            handle_anthropic_error(response_code, error_body.clone(), "raw request".to_string());
-        let details = result.unwrap_err().get_owned_details();
+        let result = handle_anthropic_error(
+            response_code,
+            "raw request".to_string(),
+            "raw response".to_string(),
+        );
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceClient {
-                message: "test_message".to_string(),
+                message: "raw response".to_string(),
                 status_code: Some(response_code),
                 provider_type: PROVIDER_TYPE.to_string(),
                 raw_request: Some("raw request".to_string()),
-                raw_response: Some("{\"type\":\"error\",\"message\":\"test_message\"}".to_string()),
+                raw_response: Some("raw response".to_string()),
             }
         );
         let response_code = StatusCode::TOO_MANY_REQUESTS;
-        let result =
-            handle_anthropic_error(response_code, error_body.clone(), "raw request".to_string());
-        let details = result.unwrap_err().get_owned_details();
+        let result = handle_anthropic_error(
+            response_code,
+            "raw request".to_string(),
+            "raw response".to_string(),
+        );
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceClient {
-                message: "test_message".to_string(),
+                message: "raw response".to_string(),
                 status_code: Some(response_code),
                 provider_type: PROVIDER_TYPE.to_string(),
                 raw_request: Some("raw request".to_string()),
-                raw_response: Some("{\"type\":\"error\",\"message\":\"test_message\"}".to_string()),
+                raw_response: Some("raw response".to_string()),
             }
         );
         let response_code = StatusCode::NOT_FOUND;
-        let result =
-            handle_anthropic_error(response_code, error_body.clone(), "raw request".to_string());
-        let details = result.unwrap_err().get_owned_details();
+        let result = handle_anthropic_error(
+            response_code,
+            "raw request".to_string(),
+            "raw response".to_string(),
+        );
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceServer {
-                message: "test_message".to_string(),
+                message: "raw response".to_string(),
                 raw_request: Some("raw request".to_string()),
-                raw_response: Some("{\"type\":\"error\",\"message\":\"test_message\"}".to_string()),
+                raw_response: Some("raw response".to_string()),
                 provider_type: PROVIDER_TYPE.to_string(),
             }
         );
         let response_code = StatusCode::INTERNAL_SERVER_ERROR;
-        let result =
-            handle_anthropic_error(response_code, error_body.clone(), "raw request".to_string());
-        let details = result.unwrap_err().get_owned_details();
+        let result = handle_anthropic_error(
+            response_code,
+            "raw request".to_string(),
+            "raw response".to_string(),
+        );
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceServer {
-                message: "test_message".to_string(),
+                message: "raw response".to_string(),
                 raw_request: Some("raw request".to_string()),
-                raw_response: Some("{\"type\":\"error\",\"message\":\"test_message\"}".to_string()),
+                raw_response: Some("raw response".to_string()),
                 provider_type: PROVIDER_TYPE.to_string(),
             }
         );
@@ -2479,9 +2470,10 @@ mod tests {
             &mut current_tool_name,
             false,
         );
-        let details = result.unwrap_err().get_owned_details();
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceServer {
                 message: "Got InputJsonDelta chunk from Anthropic without current tool id being set by a ToolUse".to_string(),
                 raw_request: None,
@@ -2610,9 +2602,10 @@ mod tests {
             &mut current_tool_name,
             false,
         );
-        let details = result.unwrap_err().get_owned_details();
+        let error = result.unwrap_err();
+        let details = error.get_details();
         assert_eq!(
-            details,
+            *details,
             ErrorDetails::InferenceServer {
                 message: r#"{"message":"Test error"}"#.to_string(),
                 raw_request: None,
@@ -2923,7 +2916,7 @@ mod tests {
         let result = AnthropicCredentials::try_from(generic);
         assert!(result.is_err());
         assert!(matches!(
-            result.unwrap_err().get_owned_details(),
+            result.unwrap_err().get_details(),
             ErrorDetails::Config { message } if message.contains("Invalid api_key_location")
         ));
     }
