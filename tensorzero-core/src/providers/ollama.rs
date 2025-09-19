@@ -27,7 +27,6 @@ use crate::inference::types::{
 };
 use crate::inference::{InferenceProvider, TensorZeroEventError};
 use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
-use crate::providers::groq::{GroqContentBlock, GroqRequestMessage, GroqRequestToolCall};
 use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
 
 use crate::providers::helpers::{
@@ -124,7 +123,7 @@ impl InferenceProvider for OllamaProvider {
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_url = "http://localhost:11434/api/generate".to_string();
+        let request_url = "http://localhost:11434/api/chat".to_string();
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
 
@@ -161,7 +160,7 @@ impl InferenceProvider for OllamaProvider {
 
         if res.status().is_success() {
             let raw_response = res.text().await.map_err(|e| {
-                Error::new(ErrorDetails::InfereceServer {
+                Error::new(ErrorDetails::InferenceServer {
                     message: format!(
                         "Error parsing response: {}",
                         DisplayOrDebugGateway::new(e)
@@ -221,7 +220,7 @@ impl InferenceProvider for OllamaProvider {
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(GroupRequest::new(&self.model_name, request)?)
+        let request_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request)?)
             .map_err(|e| {
                 Error::new(ErrorDetails::Serialization {
                     message: format!(
@@ -230,7 +229,7 @@ impl InferenceProvider for OllamaProvider {
                     ),
                 })
             })?;
-        let request_url = "http://localhost:11434/api/generate".to_string();
+        let request_url = "http://localhost:11434/api/chat".to_string();
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
         let mut request_builder = http_client.post(request_url);
@@ -398,7 +397,7 @@ where
     }
 }
 
-#[derive(Clone, Debug, PartialEw)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum OllamaContentBlock<'a> {
     Text { text: Cow<'a, str> },
     ImageUrl { image_url: OllamaImageUrl },
@@ -441,7 +440,7 @@ pub struct OllamaRequestFunctionCall<'a> {
 #[derive(Serialize, Debug, Clone, PartialEq, Deserialize)]
 pub struct OllamaRequestToolCall<'a> {
     pub id: &'a str,
-    pub retype: OllamaToolType,
+    pub r#type: OllamaToolType,
     pub function: OllamaRequestFunctionCall<'a>,
 }
 
@@ -449,7 +448,7 @@ impl<'a> From<&'a ToolCall> for OllamaRequestToolCall<'a> {
     fn from(tool_call: &'a ToolCall) -> Self {
         OllamaRequestToolCall {
             id: &tool_call.id,
-            retype: OllamaToolType::Function,
+            r#type: OllamaToolType::Function,
             function: OllamaRequestFunctionCall {
                 name: &tool_call.name,
                 arguments: &tool_call.arguments,
@@ -482,7 +481,7 @@ pub(super) enum OllamaRequestMessage<'a> {
     System(OllamaSystemRequestMessage<'a>),
     User(OllamaUserRequestMessage<'a>),
     Assistant(OllamaAssistantRequestMessage<'a>),
-    Tool(OllameToolRequestMessage<'a>),
+    Tool(OllamaToolRequestMessage<'a>),
 }
 
 impl OllamaRequestMessage<'_> {
@@ -604,4 +603,294 @@ pub(super) fn tensorzero_to_ollama_message<'a>(
     }
 }
 
+fn tensorzero_to_ollama_user_message(
+    content_blocks: &[ContentBlock]
+) -> Result<Vec<OllamaRequestMessage<'_>>, Error> {
+    // We need to separate the tool result messages from the user content blocks
 
+    let mut messages = Vec::new();
+    let mut user_content_blocks = Vec::new();
+
+    for block in content_blocks {
+        match block {
+            ContentBlock::Text(Text { text: }) => {
+                user_content_blocks.push(OllamaContentBlock::Text {
+                    text: Cow::Borrowed(text),
+                });
+            }
+            ContentBlock::ToolCall(_) => {
+                return Err(Error::new(ErrorDetails::InvalidMessage {
+                    message: "Tool calls are not supported in user messages".to_string(),
+                }));
+            }
+            ContentBlock::ToolResult(tool_result) => {
+                messages.push(OllamaRequestMessage::Tool(OllamaToolRequestMessage {
+                    content: &tool_result.result,
+                    tool_call_id: &tool_result.id,
+                }));
+            }
+            ContentBlock::File(file) => {
+                let FileWithPath {
+                    file,
+                    storage_path: _,
+                } = &**file;
+                user_content_blocks.push(OllamaContentBlock::ImageUrl {
+                    image_url: OllamaImageUrl {
+                        // This will only produce an error if we pass in a bad
+                        // image with missing data
+                        url: format!("data: {}; base64,{}", file.mime_type, file.data()?),
+                    },
+                });
+            }
+            ContentBlock::Thought(thought) => {
+                warn_discarded_thought_block(PROVIDER_TYPE, thought);
+            }
+            ContentBlock::Unknown {
+                data,
+                model_provider_name: _,
+            } => {
+                user_content_blocks.push(OllamaContentBlock::Unknown {
+                    data: Cow::Borrowed(data),
+                });
+            }
+        };
+    }
+
+    // If there are any user content blocks, combine them into a single user message:
+    if !user_content_blocks.is_empty() {
+        messages.push(OllamaRequestMessage::User(OllamaUserRequestMessage {
+            content: user_content_blocks,
+        }));
+    }
+
+    Ok(messages)
+}
+
+fn tensorzero_to_ollama_assistant_message(
+    content_blocks: &[ContentBlock],
+) -> Result<Vec<OllamaRequestMessage<'_>>, Error> {
+    // We need to separate the tool result messages from the assistant content blocks
+
+    let mut assistant_content_blocks = Vec::new();
+    let mut assistant_tool_calls = Vec::new();
+
+    for block in content_blocks {
+        match block {
+            ContentBlock::Text(Text { text }) => {
+                assistant_content_blocks.push(OllamaContentBlock::Text {
+                    text: Cow::Borrowed(text),
+                });
+            }
+            ContentBlock::ToolCall(tool_call) => {
+                let tool_call = OllamaRequestToolCall {
+                    id: &tool_call.id,
+                    r#type: OllamaToolType::Function,
+                    function: OllamaRequestFunctionCall {
+                        name: &tool_call.name,
+                        arguments: &tool_call.arguments,
+                    },
+                };
+
+                assistant_tool_calls.push(tool_call);
+            }
+            ContentBlock::ToolResult(_) => {
+                return Err(Error::new(ErrorDetails::InvalidMessage {
+                    message: "Tool results are not supported in assistant messages".to_string(),
+                }));
+            }
+            ContentBlock::File(file) => {
+                let FileWithPath {
+                    file,
+                    storage_path: _,
+                } = &**file;
+                assistant_content_blocks.push(OllamaContentBlock::ImageUrl {
+                    image_url: OllamaImageUrl {
+                        // This will only produce an error if we pass in a bad
+                        // `Base64Image` (with missing image data)
+                        url: format!("data:{};base64,{}", file.mime_type, file.data()?),
+                    },
+                });
+            }
+            ContentBlock::Thought(thought) => {
+                warn_discarded_thought_block(PROVIDER_TYPE, thought);
+            }
+            ContentBlock::Unknown {
+                data,
+                model_provider_name: _,
+            } => {
+                assistant_content_blocks.push(OllamaContentBlock::Unknown {
+                    data: Cow::Borrowed(data),
+                });
+            }
+        }
+    }
+
+    let content = match assistant_content_blocks.len() {
+    0 => None,
+    _ => Some(assistant_content_blocks),
+    };
+
+    let tool_calls = match assistant_tool_calls.len() {
+        0 => None,
+        _ => Some(assistant_tool_calls),
+    };
+
+    let message = OllamaRequestMessage::Assistant(OllamaAssistantRequestMessage {
+        content,
+        tool_calls,
+    });
+
+    Ok(vec![message])
+}
+
+impl OllamaFormat {
+    fn ollama_format_from_json_mode(json_mode: ModelInferenceRequestJsonMode) -> Option<OllamaFormat> {
+        match json_mode {
+            ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
+                Some(OllamaFormat::Json)
+            }
+            ModelInferenceRequestJsonMode::Off => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OllamaToolType {
+    Function,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub(super) struct OllamaFunction<'a> {
+    pub(super) name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<&'a str>,
+    pub parameters: &'a Value,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub(super) struct OllamaTool<'a> {
+    pub(super) r#type: OllamaToolType,
+    pub(super) function: OllamaFunction<'a>,
+    pub(super) strict: bool,
+}
+
+impl<'a> From<&'a ToolConfig> for OllamaTool<'a> {
+    fn from(tool: &'a ToolConfig) -> Self {
+        OllamaTool {
+            r#type: OllamaToolType::Function,
+            function: OllamaFunction {
+                name: tool.name(),
+                description: Some(tool.description()),
+                parameters: tool.parameters(),
+            },
+            strict: tool.strict(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(super) enum OllamaToolChoice<'a> {
+    String(OllamaToolChoiceString),
+    Specific(SpecificToolChoice<'a>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum OllamaToolChoiceString {
+    None,
+    Auto,
+    Required,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(super) struct SpecificToolChoice<'a> {
+    pub(super) r#type: OllamaToolType,
+    pub(super) function: SpecificToolFunction<'a>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub(super) struct SpecificToolFunction<'a> {
+    pub(super) name: &'a str,
+}
+
+impl Default for OllamaToolChoice<'_> {
+    fn default() -> Self{OllamaToolChoice::String(OllamaToolChoiceString::None)}
+}
+
+impl<'a> From<&'a ToolChoice> for OllamaToolChoice<'a> {
+    fn from(tool_choice: &'a ToolChoice) -> Self {
+        match tool_choice {
+            ToolChoice::None => OllamaToolChoice::String(OllamaToolChoiceString::None),
+            ToolChoice::Auto => OllamaToolChoice::String(OllamaToolChoiceString::Auto),
+            ToolChoice::Required => OllamaToolChoice::String(OllamaToolChoiceString::Required),
+            ToolChoice::Specific(tool_name) => OllamaToolChoice::Specific(SpecificToolChoice {
+                r#type: OllamaToolType::Function,
+                function: SpecificToolFunction { name: tool_name },
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct StreamOption {
+    pub(super) include_usage: bool,
+}
+
+/// This struct defines the supported paramaeters for the Ollama API
+/// See the Ollama API documentation for more details:
+/// Se the [Ollama API documentation](https://ollama.readthedocs.io/en/api/#parameters_1)
+/// for more details
+#[derive(Debug, Serialize)]
+pub(super) struct OllamaRequest<'a> {
+    pub model: &'a str,
+    pub messages: Vec<OllamaRequestMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<OllamaTool<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<OllamaFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<OllamaOptions>,
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OllamaFormat {
+    Json,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct OllamaOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirostat: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirostat_eta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirostat_tau: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_last_n: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tfs_z: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+}
