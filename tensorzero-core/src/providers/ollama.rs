@@ -1,14 +1,14 @@
+#![allow(dead_code)] // TODO: Remove when implementation is complete
+
+use std::{borrow::Cow, sync::OnceLock, time::Duration};
+
+use crate::http::TensorzeroHttpClient;
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::StatusCode;
 use reqwest_eventsource::Event;
 use secrecy::{ExposeSecret, SecretString};
-use serde::de::IntoDeserializer;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
-use std::sync::OnceLock;
-use std::time::Duration;
-use minijinja::filters::default;
 use tokio::time::Instant;
 
 use crate::cache::ModelProviderRequest;
@@ -20,18 +20,19 @@ use crate::inference::types::{
     batch::StartBatchProviderInferenceResponse, ContentBlock, ContentBlockChunk,
     ContentBlockOutput, Latency, ModelInferenceRequest, ModelInferenceRequestJsonMode,
     PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
-    ProviderInferenceResponseChunk, RequestMessage, Role, Text, TextChunk, Usage,
+    ProviderInferenceResponseArgs, ProviderInferenceResponseChunk, RequestMessage, Role, Text,
+    TextChunk, Usage,
 };
-use crate::inference::types::{
-    FinishReason, ProviderInferenceResponseArgs, ProviderInferenceResponseStreamInner,
-};
-use crate::inference::{InferenceProvider, TensorZeroEventError};
+use crate::inference::types::{FinishReason, ProviderInferenceResponseStreamInner};
+use crate::inference::InferenceProvider;
 use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
-use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
+use crate::tool::{ToolCall, ToolChoice, ToolConfig};
 
 use crate::providers::helpers::{
     inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
+
+use crate::inference::TensorZeroEventError;
 
 fn default_api_key_location() -> CredentialLocation {
     CredentialLocation::Env("OLLAMA_API_KEY".to_string())
@@ -68,7 +69,7 @@ impl OllamaProvider {
         })
     }
 
-    pub fn model_name(&self) -> &str{
+    pub fn model_name(&self) -> &str {
         &self.model_name
     }
 }
@@ -107,8 +108,11 @@ impl OllamaCredentials {
                 Some(dynamic_api_keys.get(key_name).ok_or_else(|| {
                     ErrorDetails::ApiKeyMissing {
                         provider_name: PROVIDER_NAME.to_string(),
-                    }.into()
-                })).transpose()
+                        message: format!("Dynamic api key `{key_name}` is missing"),
+                    }
+                    .into()
+                }))
+                .transpose()
             }
             OllamaCredentials::None => Ok(None),
         }
@@ -119,7 +123,7 @@ impl InferenceProvider for OllamaProvider {
     async fn infer<'a>(
         &'a self,
         request: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
@@ -128,7 +132,7 @@ impl InferenceProvider for OllamaProvider {
         let start_time = Instant::now();
 
         let request_body =
-            serde_json::to_value(OllamaRequest::new(&self.model_name, request.request)?).map_err(
+            serde_json::to_value(OllamaRequest::new(&self.model_name, request.request)).map_err(
                 |e| {
                     Error::new(ErrorDetails::Serialization {
                         message: format!(
@@ -152,19 +156,17 @@ impl InferenceProvider for OllamaProvider {
             request.model_name,
             request_body,
             request_builder,
-        ).await?;
+        )
+        .await?;
 
-        let latency = Latency::NonStreaming{
+        let latency = Latency::NonStreaming {
             response_time: start_time.elapsed(),
         };
 
         if res.status().is_success() {
             let raw_response = res.text().await.map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
-                    message: format!(
-                        "Error parsing response: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
+                    message: format!("Error parsing response: {}", DisplayOrDebugGateway::new(e)),
                     raw_request: Some(raw_request.clone()),
                     raw_response: None,
                     provider_type: PROVIDER_TYPE.to_string(),
@@ -173,10 +175,7 @@ impl InferenceProvider for OllamaProvider {
 
             let response_body = serde_json::from_str(&raw_response).map_err(|e| {
                 Error::new(ErrorDetails::InferenceServer {
-                    message: format!(
-                        "Error parsing response: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
+                    message: format!("Error parsing response: {}", DisplayOrDebugGateway::new(e)),
                     raw_request: Some(raw_request.clone()),
                     raw_response: Some(raw_response.clone()),
                     provider_type: PROVIDER_TYPE.to_string(),
@@ -188,8 +187,9 @@ impl InferenceProvider for OllamaProvider {
                 latency,
                 raw_response,
                 raw_request: raw_request.clone(),
-                generic_request: request,
-            }.try_into()?)
+                generic_request: request.request,
+            }
+            .try_into()?)
         } else {
             Err(handle_ollama_error(
                 res.status(),
@@ -215,12 +215,13 @@ impl InferenceProvider for OllamaProvider {
             request,
             provider_name: _,
             model_name,
+            ..
         }: ModelProviderRequest<'a>,
-        http_client: &'a reqwest::Client,
+        http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request)?)
+        let request_body = serde_json::to_value(OllamaRequest::new(&self.model_name, request))
             .map_err(|e| {
                 Error::new(ErrorDetails::Serialization {
                     message: format!(
@@ -244,35 +245,39 @@ impl InferenceProvider for OllamaProvider {
             model_name,
             request_body,
             request_builder,
-        ).await?;
+        )
+        .await?;
         let stream = stream_ollama(
             PROVIDER_TYPE.to_string(),
             event_source.map_err(TensorZeroEventError::EventSource),
             start_time,
-        ).peekable();
+        )
+        .peekable();
         Ok((stream, raw_request))
     }
 
     async fn start_batch_inference<'a>(
         &'a self,
         _requests: &'a [ModelInferenceRequest<'_>],
-        _client: &'a reqwest::Client,
+        _client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<StartBatchProviderInferenceResponse, Error> {
         Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
-            provider_type: PROVIDER_TYPE.to_string();
-        }.into())
+            provider_type: PROVIDER_TYPE.to_string(),
+        }
+        .into())
     }
 
     async fn poll_batch_inference<'a>(
         &'a self,
         _batch_request: &'a BatchRequestRow<'a>,
-        _http_client: &'a reqwest::Client,
+        _http_client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
     ) -> Result<PollBatchInferenceResponse, Error> {
         Err(ErrorDetails::UnsupportedModelProviderForBatchInference {
-            provider_type: PROVIDER_TYPE.to_string();
-        }.into())
+            provider_type: PROVIDER_TYPE.to_string(),
+        }
+        .into())
     }
 }
 
@@ -287,7 +292,8 @@ pub async fn convert_stream_error(provider_type: String, e: reqwest_eventsource:
         raw_request: None,
         raw_response,
         provider_type,
-    }.into()
+    }
+    .into()
 }
 
 pub fn stream_ollama(
@@ -327,7 +333,7 @@ pub fn stream_ollama(
                             }));
 
                         let latency = start_time.elapsed();
-                        let stream_message = data.and_then(|d| {
+                        let stream_message = data.map(|d| {
                             ollama_to_tensorzero_chunk(d, latency, &mut tool_call_ids)
                         });
                         yield stream_message;
@@ -353,7 +359,15 @@ pub(super) fn handle_ollama_error(
             raw_request: None,
             raw_response: Some(response_body.to_string()),
             provider_type: provider_type.to_string(),
-        }.into(),
+        }
+        .into(),
+        _ => ErrorDetails::InferenceServer {
+            message: response_body.to_string(),
+            provider_type: provider_type.to_string(),
+            raw_request: None,
+            raw_response: None,
+        }
+        .into(),
     }
 }
 
@@ -377,7 +391,7 @@ where
 {
     // If we have a single text block, serialize it as a string
     // to stay compatible with older providers which may not support content blocks
-    if let[OllamaContentBlock::Text{ text }] = &content.as_slice() {
+    if let [OllamaContentBlock::Text { text }] = &content.as_slice() {
         text.serialize(serializer)
     } else {
         content.serialize(serializer)
@@ -486,7 +500,7 @@ pub(super) enum OllamaRequestMessage<'a> {
 
 impl OllamaRequestMessage<'_> {
     pub fn content_contains_case_insensitive(&self, value: &str) -> bool {
-        match self{
+        match self {
             OllamaRequestMessage::System(msg) => msg.content.to_lowercase().contains(value),
             OllamaRequestMessage::User(msg) => msg.content.iter().any(|c| match c {
                 OllamaContentBlock::Text { text } => text.to_lowercase().contains(value),
@@ -504,14 +518,14 @@ impl OllamaRequestMessage<'_> {
                 } else {
                     false
                 }
-            },
+            }
             OllamaRequestMessage::Tool(msg) => msg.content.to_lowercase().contains(value),
         }
     }
 }
 
 pub(super) fn prepare_ollama_messages<'a>(
-    request: &'a ModelInferenceRequest<'_>
+    request: &'a ModelInferenceRequest<'_>,
 ) -> Result<Vec<OllamaRequestMessage<'a>>, Error> {
     let mut messages = Vec::with_capacity(request.messages.len());
     for message in &request.messages {
@@ -590,11 +604,11 @@ pub(super) fn tensorzero_to_ollama_system_message<'a>(
                 }))
             }
             _ => None,
-        }
+        },
     }
 }
 
-pub(super) fn tensorzero_to_ollama_message<'a>(
+pub(super) fn tensorzero_to_ollama_message(
     message: &RequestMessage,
 ) -> Result<Vec<OllamaRequestMessage<'_>>, Error> {
     match message.role {
@@ -604,7 +618,7 @@ pub(super) fn tensorzero_to_ollama_message<'a>(
 }
 
 fn tensorzero_to_ollama_user_message(
-    content_blocks: &[ContentBlock]
+    content_blocks: &[ContentBlock],
 ) -> Result<Vec<OllamaRequestMessage<'_>>, Error> {
     // We need to separate the tool result messages from the user content blocks
 
@@ -613,7 +627,7 @@ fn tensorzero_to_ollama_user_message(
 
     for block in content_blocks {
         match block {
-            ContentBlock::Text(Text { text: }) => {
+            ContentBlock::Text(Text { text }) => {
                 user_content_blocks.push(OllamaContentBlock::Text {
                     text: Cow::Borrowed(text),
                 });
@@ -726,8 +740,8 @@ fn tensorzero_to_ollama_assistant_message(
     }
 
     let content = match assistant_content_blocks.len() {
-    0 => None,
-    _ => Some(assistant_content_blocks),
+        0 => None,
+        _ => Some(assistant_content_blocks),
     };
 
     let tool_calls = match assistant_tool_calls.len() {
@@ -744,7 +758,9 @@ fn tensorzero_to_ollama_assistant_message(
 }
 
 impl OllamaFormat {
-    fn ollama_format_from_json_mode(json_mode: ModelInferenceRequestJsonMode) -> Option<OllamaFormat> {
+    fn ollama_format_from_json_mode(
+        json_mode: ModelInferenceRequestJsonMode,
+    ) -> Option<OllamaFormat> {
         match json_mode {
             ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
                 Some(OllamaFormat::Json)
@@ -816,7 +832,9 @@ pub(super) struct SpecificToolFunction<'a> {
 }
 
 impl Default for OllamaToolChoice<'_> {
-    fn default() -> Self{OllamaToolChoice::String(OllamaToolChoiceString::None)}
+    fn default() -> Self {
+        OllamaToolChoice::String(OllamaToolChoiceString::None)
+    }
 }
 
 impl<'a> From<&'a ToolChoice> for OllamaToolChoice<'a> {
@@ -893,4 +911,172 @@ pub struct OllamaOptions {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_p: Option<f64>,
+}
+
+impl<'a> OllamaRequest<'a> {
+    pub fn new(model_name: &'a str, request: &'a ModelInferenceRequest<'a>) -> Self {
+        let messages = tensorzero_to_ollama_messages(&request.messages);
+
+        OllamaRequest {
+            model: model_name,
+            messages,
+            tools: None, // TODO: Add tool support
+            format: OllamaFormat::ollama_format_from_json_mode(request.json_mode),
+            options: None, // TODO: Add options support
+            stream: false,
+            keep_alive: None,
+        }
+    }
+}
+
+fn tensorzero_to_ollama_messages<'a>(
+    _messages: &'a [RequestMessage],
+) -> Vec<OllamaRequestMessage<'a>> {
+    // For now, return empty vector - this is a stub implementation
+    // TODO: Implement proper message conversion
+    vec![]
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaResponseMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaResponse {
+    message: OllamaResponseMessage,
+    #[serde(rename = "eval_count")]
+    completion_tokens: Option<u32>,
+    #[serde(rename = "prompt_eval_count")]
+    prompt_tokens: Option<u32>,
+    done: bool,
+}
+
+// Streaming response structures
+#[derive(Debug, Deserialize, Serialize)]
+struct OllamaChatChunkMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OllamaChatChunk {
+    model: String,
+    created_at: String,
+    message: OllamaChatChunkMessage,
+    done: bool,
+    #[serde(rename = "eval_count")]
+    completion_tokens: Option<u32>,
+    #[serde(rename = "prompt_eval_count")]
+    prompt_tokens: Option<u32>,
+    #[serde(rename = "total_duration")]
+    total_duration: Option<u64>,
+    #[serde(rename = "load_duration")]
+    load_duration: Option<u64>,
+    #[serde(rename = "prompt_eval_duration")]
+    prompt_eval_duration: Option<u64>,
+    #[serde(rename = "eval_duration")]
+    eval_duration: Option<u64>,
+}
+
+struct OllamaResponseWithMetadata<'a> {
+    response: OllamaResponse,
+    raw_response: String,
+    latency: Latency,
+    raw_request: String,
+    generic_request: &'a ModelInferenceRequest<'a>,
+}
+
+impl<'a> TryFrom<OllamaResponseWithMetadata<'a>> for ProviderInferenceResponse {
+    type Error = Error;
+
+    fn try_from(value: OllamaResponseWithMetadata<'a>) -> Result<Self, Self::Error> {
+        let OllamaResponseWithMetadata {
+            response,
+            raw_response,
+            latency,
+            raw_request,
+            generic_request,
+        } = value;
+
+        // Convert Ollama response to TensorZero format
+        let content = vec![ContentBlockOutput::Text(Text {
+            text: response.message.content,
+        })];
+
+        let usage = Usage {
+            input_tokens: response.prompt_tokens.unwrap_or(0),
+            output_tokens: response.completion_tokens.unwrap_or(0),
+        };
+
+        let system = generic_request.system.clone();
+        let input_messages = generic_request.messages.clone();
+
+        // Ollama doesn't provide explicit finish reasons, so we default to Stop
+        let finish_reason = if response.done {
+            FinishReason::Stop
+        } else {
+            FinishReason::Unknown
+        };
+
+        Ok(ProviderInferenceResponse::new(
+            ProviderInferenceResponseArgs {
+                output: content,
+                system,
+                input_messages,
+                raw_request,
+                raw_response: raw_response.clone(),
+                usage,
+                latency,
+                finish_reason: Some(finish_reason),
+            },
+        ))
+    }
+}
+
+/// Maps an Ollama chunk to a TensorZero chunk for streaming inferences
+fn ollama_to_tensorzero_chunk(
+    chunk: OllamaChatChunk,
+    latency: Duration,
+    _tool_call_ids: &mut [String], // Ollama doesn't support tool calls in streaming yet
+) -> ProviderInferenceResponseChunk {
+    // Serialize the chunk first before we move any values out of it
+    let raw_chunk = serde_json::to_string(&chunk).unwrap_or_default();
+
+    let mut content = vec![];
+    let mut finish_reason = None;
+
+    // Ollama provides content in the message.content field
+    if !chunk.message.content.is_empty() {
+        content.push(ContentBlockChunk::Text(TextChunk {
+            text: chunk.message.content,
+            id: "0".to_string(),
+        }));
+    }
+
+    // Check if the stream is done
+    if chunk.done {
+        finish_reason = Some(FinishReason::Stop);
+    }
+
+    // Convert usage if available
+    let usage =
+        if chunk.done && (chunk.completion_tokens.is_some() || chunk.prompt_tokens.is_some()) {
+            Some(Usage {
+                input_tokens: chunk.prompt_tokens.unwrap_or(0),
+                output_tokens: chunk.completion_tokens.unwrap_or(0),
+            })
+        } else {
+            None
+        };
+
+    ProviderInferenceResponseChunk::new(content, usage, raw_chunk, latency, finish_reason)
 }
