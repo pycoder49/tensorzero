@@ -31,7 +31,7 @@ use crate::inference::types::extra_body::{FullExtraBodyConfig, UnfilteredInferen
 use crate::inference::types::extra_headers::{
     FullExtraHeadersConfig, UnfilteredInferenceExtraHeaders,
 };
-use crate::inference::types::ResolvedInput;
+use crate::inference::types::resolved_input::LazyResolvedInput;
 use crate::inference::types::{
     FunctionType, InferenceResultChunk, InferenceResultStream, ModelInferenceRequest,
     ModelInferenceResponseWithMetadata, RequestMessage,
@@ -201,7 +201,7 @@ pub struct ModelUsedInfo {
 pub trait Variant {
     async fn infer<'a: 'request, 'request>(
         &self,
-        input: &ResolvedInput,
+        input: &LazyResolvedInput,
         models: &'request InferenceModels<'a>,
         function: &'a FunctionConfig,
         inference_config: &'request InferenceConfig<'request>,
@@ -211,7 +211,7 @@ pub trait Variant {
 
     async fn infer_stream<'request>(
         &self,
-        input: &ResolvedInput,
+        input: &LazyResolvedInput,
         models: &'request InferenceModels<'_>,
         function: &FunctionConfig,
         inference_config: &'request InferenceConfig<'request>,
@@ -234,7 +234,7 @@ pub trait Variant {
 
     async fn start_batch_inference<'a>(
         &'a self,
-        input: &[ResolvedInput],
+        input: &[LazyResolvedInput],
         models: &'a InferenceModels<'a>,
         function: &'a FunctionConfig,
         inference_configs: &'a [InferenceConfig<'a>],
@@ -272,7 +272,7 @@ impl Variant for VariantInfo {
     )]
     async fn infer<'a: 'request, 'request>(
         &self,
-        input: &ResolvedInput,
+        input: &LazyResolvedInput,
         models: &'request InferenceModels<'a>,
         function: &'a FunctionConfig,
         inference_config: &'request InferenceConfig<'request>,
@@ -368,7 +368,7 @@ impl Variant for VariantInfo {
     )]
     async fn infer_stream<'request>(
         &self,
-        input: &ResolvedInput,
+        input: &LazyResolvedInput,
         models: &'request InferenceModels<'_>,
         function: &FunctionConfig,
         inference_config: &'request InferenceConfig<'request>,
@@ -461,7 +461,7 @@ impl Variant for VariantInfo {
     #[instrument(skip_all, fields(variant_name = %inference_configs.first().map(|x| x.variant_name).unwrap_or("")))]
     async fn start_batch_inference<'a>(
         &'a self,
-        inputs: &[ResolvedInput],
+        inputs: &[LazyResolvedInput],
         models: &'a InferenceModels<'a>,
         function: &'a FunctionConfig,
         inference_configs: &'a [InferenceConfig<'a>],
@@ -1138,6 +1138,7 @@ mod tests {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
             },
+            otlp_config: &Default::default(),
         };
         let templates = get_test_template_config();
         let inference_params = InferenceParams::default();
@@ -1435,6 +1436,7 @@ mod tests {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
             },
+            otlp_config: &Default::default(),
         };
         let templates = get_test_template_config();
         let inference_params = InferenceParams::default();
@@ -1576,7 +1578,7 @@ mod tests {
             InferenceResult::Json(_) => panic!("Expected Chat inference result"),
         }
         assert!(logs_contain(
-            r#"ERROR test_infer_model_request_errors:infer_model_request{model_name=dummy_chat_model}:infer{model_name="dummy_chat_model" otel.name="model_inference" stream=false}:infer{provider_name="error"}:infer{provider_name="error" otel.name="model_provider_inference" gen_ai.operation.name="chat" gen_ai.system="dummy" gen_ai.request.model="error" stream=false}: tensorzero_core::error: Error from dummy client: Error sending request to Dummy provider for model 'error'."#
+            r#"ERROR test_infer_model_request_errors:infer_model_request{model_name=dummy_chat_model}:infer{model_name="dummy_chat_model" otel.name="model_inference" stream=false}:infer{provider_name="error"}:infer{provider_name="error" otel.name="model_provider_inference" stream=false}: tensorzero_core::error: Error from dummy client: Error sending request to Dummy provider for model 'error'."#
         ));
     }
 
@@ -1594,6 +1596,7 @@ mod tests {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
             },
+            otlp_config: &Default::default(),
         };
         let retry_config = RetryConfig::default();
         // Create a dummy function config (chat completion)
@@ -1739,6 +1742,7 @@ mod tests {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
             },
+            otlp_config: &Default::default(),
         };
         let inference_params = InferenceParams::default();
 
@@ -1886,7 +1890,7 @@ mod tests {
         assert_eq!(full_response, expected_response);
 
         assert!(logs_contain(
-            r#"ERROR test_infer_model_request_errors_stream:infer_model_request_stream{model_name=dummy_chat_model}:infer_stream{model_name="dummy_chat_model" otel.name="model_inference" stream=true}:infer_stream{provider_name="error" otel.name="model_provider_inference" gen_ai.operation.name="chat" gen_ai.system="dummy" gen_ai.request.model="error" stream=true}: tensorzero_core::error: Error from dummy client: Error sending request to Dummy provider for model 'error'."#
+            r#"ERROR test_infer_model_request_errors_stream:infer_model_request_stream{model_name=dummy_chat_model}:infer_stream{model_name="dummy_chat_model" otel.name="model_inference" stream=true}:infer_stream{provider_name="error" otel.name="model_provider_inference" stream=true}: tensorzero_core::error: Error from dummy client: Error sending request to Dummy provider for model 'error'."#
         ));
     }
 }
