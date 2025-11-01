@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use crate::config::OtlpConfig;
 use crate::db::clickhouse::{ClickHouseConnectionInfo, TableName};
-use crate::embeddings::{EmbeddingModelResponse, EmbeddingRequest};
+use crate::embeddings::{Embedding, EmbeddingModelResponse, EmbeddingRequest};
 use crate::error::{warn_discarded_cache_write, Error, ErrorDetails};
 use crate::inference::types::file::serialize_with_file_data;
 use crate::inference::types::{
@@ -11,7 +12,7 @@ use crate::inference::types::{
     ModelInferenceResponse, ProviderInferenceResponseChunk, Usage,
 };
 use crate::model::StreamResponse;
-use crate::serde_util::deserialize_json_string;
+use crate::serde_util::{deserialize_json_string, serialize_json_string};
 use crate::tool::{ToolCallConfig, ToolCallOutput};
 use blake3::Hash;
 use clap::ValueEnum;
@@ -69,7 +70,7 @@ impl From<(CacheParamsOptions, bool)> for CacheOptions {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CacheOptions {
     pub max_age_s: Option<u32>,
     pub enabled: CacheEnabledMode,
@@ -80,6 +81,7 @@ pub struct BaseModelProviderRequest<'request, T> {
     pub request: &'request T,
     pub model_name: &'request str,
     pub provider_name: &'request str,
+    pub otlp_config: &'request OtlpConfig,
 }
 
 // We need a manual impl to avoid adding a 'T: Copy' bound
@@ -125,6 +127,9 @@ impl EmbeddingModelProviderRequest<'_> {
             model_name,
             provider_name,
             request,
+            // The OTLP config is deliberately not included in the cache key,
+            // since it's only used to construct the OTEL span.
+            otlp_config: _,
         } = self;
         let mut hasher = blake3::Hasher::new();
         hasher.update(model_name.as_bytes());
@@ -151,6 +156,9 @@ impl ModelProviderRequest<'_> {
             model_name,
             provider_name,
             request,
+            // The OTLP config is deliberately not included in the cache key,
+            // since it's only used to construct the OTEL span.
+            otlp_config: _,
         } = self;
         let mut hasher = blake3::Hasher::new();
         hasher.update(model_name.as_bytes());
@@ -263,11 +271,21 @@ impl CacheOutput for EmbeddingCacheData {
     }
 }
 
+/// Cache data for embeddings.
+///
+/// Note: Unlike `NonStreamingCacheData` and `StreamingCacheData`, this requires both `serialize_with` and
+/// `deserialize_with` because `Embedding` is an untagged enum. Without `untagged`, OpenAI's API responses wouldn't
+/// deserialize correctly (they send bare arrays/strings). But with `untagged`, the enum serializes as bare JSON
+/// values ([1.0, 2.0] or "abc"), which breaks `deserialize_json_string` (which expects a JSON-encoded string). So we
+/// need `serialize_json_string` to ensure the data is stored in the format that `deserialize_json_string` expects.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct EmbeddingCacheData {
-    #[serde(deserialize_with = "deserialize_json_string")]
-    pub embedding: Vec<f32>,
+    #[serde(
+        serialize_with = "serialize_json_string",
+        deserialize_with = "deserialize_json_string"
+    )]
+    pub embedding: Embedding,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -289,6 +307,8 @@ fn spawn_maybe_cache_write<T: Serialize + CacheOutput + Send + Sync + 'static>(
     clickhouse_client: ClickHouseConnectionInfo,
     cache_validation_info: CacheValidationInfo,
 ) {
+    // TODO(https://github.com/tensorzero/tensorzero/issues/3983): Audit this callsite
+    #[expect(clippy::disallowed_methods)]
     tokio::spawn(async move {
         if row
             .data
@@ -547,6 +567,7 @@ mod tests {
             output_schema: None,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            fetch_and_encode_input_files_before_inference: false,
             extra_cache_key: None,
             stop_sequences: None,
         };
@@ -554,6 +575,7 @@ mod tests {
             request: &model_inference_request,
             model_name: "test_model",
             provider_name: "test_provider",
+            otlp_config: &Default::default(),
         };
         let cache_key = model_provider_request.get_cache_key().unwrap();
         let model_inference_request = ModelInferenceRequest {
@@ -571,6 +593,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
             extra_cache_key: None,
@@ -580,6 +603,7 @@ mod tests {
             request: &model_inference_request,
             model_name: "test_model",
             provider_name: "test_provider",
+            otlp_config: &Default::default(),
         };
         let new_cache_key = model_provider_request.get_cache_key().unwrap();
         // Make sure the first two get the same cache key (and that we ignore the inference_id)
@@ -599,6 +623,7 @@ mod tests {
             json_mode: ModelInferenceRequestJsonMode::Off,
             function_type: FunctionType::Chat,
             output_schema: None,
+            fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
             extra_cache_key: None,
@@ -608,6 +633,7 @@ mod tests {
             request: &streaming_model_inference_request,
             model_name: "test_model",
             provider_name: "test_provider",
+            otlp_config: &Default::default(),
         };
         let streaming_cache_key = model_provider_request.get_cache_key().unwrap();
         assert_ne!(cache_key, streaming_cache_key);

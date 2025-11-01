@@ -10,7 +10,11 @@ import {
 import { DatasetSelector } from "~/components/dataset/DatasetSelector";
 import { FunctionSelector } from "~/components/function/FunctionSelector";
 import { PageHeader, PageLayout } from "~/components/layout/PageLayout";
-import { useFunctionConfig, useAllFunctionConfigs } from "~/context/config";
+import {
+  useFunctionConfig,
+  useAllFunctionConfigs,
+  useConfig,
+} from "~/context/config";
 import { getConfig, getFunctionConfig } from "~/utils/config/index.server";
 import type { Route } from "./+types/route";
 import { listDatapoints } from "~/utils/tensorzero.server";
@@ -22,7 +26,7 @@ import { useMemo, useState } from "react";
 import { Button } from "~/components/ui/button";
 import PageButtons from "~/components/utils/PageButtons";
 import { countDatapointsForDatasetFunction } from "~/utils/clickhouse/datasets.server";
-import InputSnippet from "~/components/inference/InputSnippet";
+import Input from "~/components/inference/Input";
 import { Output } from "~/components/inference/Output";
 import { Label } from "~/components/ui/label";
 import DatapointPlaygroundOutput from "./DatapointPlaygroundOutput";
@@ -45,6 +49,7 @@ import {
   HydrationBoundary,
   QueryClient,
 } from "@tanstack/react-query";
+import { toDatapointUrl } from "~/utils/urls";
 
 const DEFAULT_LIMIT = 5;
 
@@ -205,6 +210,7 @@ export async function loader({ request }: Route.LoaderArgs) {
             functionName,
             input,
             variant,
+            toolsConfig: config.tools,
           };
           return queryClient.prefetchQuery({
             queryKey: getClientInferenceQueryKey(args),
@@ -273,6 +279,7 @@ export default function PlaygroundPage({ loaderData }: Route.ComponentProps) {
     dehydratedState,
   } = loaderData;
   const functionConfig = useFunctionConfig(functionName);
+  const config = useConfig();
   if (functionName && !functionConfig) {
     throw data(`Function config not found for function ${functionName}`, {
       status: 404,
@@ -430,7 +437,7 @@ export default function PlaygroundPage({ loaderData }: Route.ComponentProps) {
                           <div className="text-xs font-medium text-gray-500">
                             Datapoint:{" "}
                             <Link
-                              to={`/datasets/${encodeURIComponent(datasetName)}/datapoint/${datapoint.id}`}
+                              to={toDatapointUrl(datasetName, datapoint.id)}
                               className="font-mono text-xs text-blue-600 hover:text-blue-800 hover:underline"
                             >
                               {datapoint.id}
@@ -440,9 +447,10 @@ export default function PlaygroundPage({ loaderData }: Route.ComponentProps) {
                             <h3 className="mb-2 text-sm font-medium text-gray-500">
                               Input
                             </h3>
-                            <InputSnippet
+                            <Input
                               messages={inputs[index].messages}
                               system={inputs[index].system}
+                              maxHeight={150}
                             />
                           </div>
                           <div>
@@ -469,6 +477,7 @@ export default function PlaygroundPage({ loaderData }: Route.ComponentProps) {
                                   input={inputs[index]}
                                   functionName={functionName}
                                   functionConfig={functionConfig}
+                                  toolsConfig={config.tools}
                                 />
                               </div>
                             );
@@ -505,8 +514,6 @@ export default function PlaygroundPage({ loaderData }: Route.ComponentProps) {
                 return configuredVariants?.[editingVariant.name];
               case "edited":
                 return editingVariant.config;
-              default:
-                return undefined;
             }
           })();
           if (!variantInfo) {

@@ -8,7 +8,10 @@
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import OpenAI from "openai";
-import { ChatCompletionMessageParam } from "openai/resources";
+import {
+  ChatCompletionMessageParam,
+  ChatCompletionMessageFunctionToolCall,
+} from "openai/resources";
 import { v7 as uuidv7 } from "uuid";
 import fs from "fs";
 import path from "path";
@@ -135,7 +138,7 @@ describe("OpenAI Compatibility", () => {
     };
 
     await expect(
-      client.beta.chat.completions.parse({
+      client.chat.completions.parse({
         messages,
         model: "tensorzero::function_name::basic_test",
         temperature: 0.4,
@@ -423,10 +426,12 @@ describe("OpenAI Compatibility", () => {
 
     const toolCall = toolCalls[0];
     expect(toolCall.type).toBe("function");
-    expect(toolCall.function.name).toBe("get_temperature");
-    expect(toolCall.function.arguments).toBe(
-      '{"location":"Brooklyn","units":"celsius"}'
-    );
+    expect(
+      (toolCall as ChatCompletionMessageFunctionToolCall).function.name
+    ).toBe("get_temperature");
+    expect(
+      (toolCall as ChatCompletionMessageFunctionToolCall).function.arguments
+    ).toBe('{"location":"Brooklyn","units":"celsius"}');
 
     const usage = result.usage;
     expect(usage?.prompt_tokens).toBe(10);
@@ -475,10 +480,12 @@ describe("OpenAI Compatibility", () => {
 
     const toolCall = toolCalls[0];
     expect(toolCall.type).toBe("function");
-    expect(toolCall.function.name).toBe("get_temperature");
-    expect(toolCall.function.arguments).toBe(
-      '{"location":"Brooklyn","units":"Celsius"}'
-    );
+    expect(
+      (toolCall as ChatCompletionMessageFunctionToolCall).function.name
+    ).toBe("get_temperature");
+    expect(
+      (toolCall as ChatCompletionMessageFunctionToolCall).function.arguments
+    ).toBe('{"location":"Brooklyn","units":"Celsius"}');
 
     const usage = result.usage;
     expect(usage?.prompt_tokens).toBe(10);
@@ -790,7 +797,9 @@ describe("OpenAI Compatibility", () => {
         // @ts-expect-error - custom TensorZero property
         "tensorzero::episode_id": episodeId,
       })
-    ).rejects.toThrow(/System message must be a text content block/);
+    ).rejects.toThrow(
+      /System message must contain only text or template content blocks/
+    );
   });
 
   it("should handle json failure", async () => {
@@ -1069,8 +1078,14 @@ describe("OpenAI Compatibility", () => {
 
     const toolCall = result.choices[0].message.tool_calls![0];
     expect(toolCall.type).toBe("function");
-    expect(toolCall.function.name).toBe("get_temperature");
-    expect(JSON.parse(toolCall.function.arguments)).toEqual({
+    expect(
+      (toolCall as ChatCompletionMessageFunctionToolCall).function.name
+    ).toBe("get_temperature");
+    expect(
+      JSON.parse(
+        (toolCall as ChatCompletionMessageFunctionToolCall).function.arguments
+      )
+    ).toEqual({
       location: "Tokyo",
       units: "celsius",
     });
@@ -1252,7 +1267,7 @@ describe("OpenAI Compatibility", () => {
 
     expect(result.choices[0].message.content).not.toBeNull();
     const jsonContent = JSON.parse(result.choices[0].message.content!);
-    expect(jsonContent[0].storage_path).toEqual({
+    expect(jsonContent[0].Base64.storage_path).toEqual({
       kind: { type: "disabled" },
       path: "observability/files/3e127d9a726f6be0fd81d73ccea97d96ec99419f59650e01d49183cd3be999ef.pdf",
     });
@@ -1339,20 +1354,21 @@ it("should handle multi-turn parallel tool calls", async () => {
   expect(assistantMessage.tool_calls?.length).toBe(2);
 
   for (const toolCall of assistantMessage.tool_calls || []) {
-    if (toolCall.function.name === "get_temperature") {
+    const functionToolCall = toolCall as ChatCompletionMessageFunctionToolCall;
+    if (functionToolCall.function.name === "get_temperature") {
       messages.push({
         role: "tool",
         content: "70",
         tool_call_id: toolCall.id,
       });
-    } else if (toolCall.function.name === "get_humidity") {
+    } else if (functionToolCall.function.name === "get_humidity") {
       messages.push({
         role: "tool",
         content: "30",
         tool_call_id: toolCall.id,
       });
     } else {
-      throw new Error(`Unknown tool call: ${toolCall.function.name}`);
+      throw new Error(`Unknown tool call: ${functionToolCall.function.name}`);
     }
   }
 

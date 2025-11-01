@@ -38,11 +38,26 @@ test-e2e-no-creds = [
     "e2e_tests",
     "--profile",
     "clickhouse",
+    ]
+test-rate-limit-load = [
+    "run",
+    "--release",
+    "--package",
+    "rate-limit-load-test",
+    "--",
+]
+test-feedback-load = [
+    "run",
+    "--release",
+    "--package",
+    "feedback-load-test",
+    "--",
 ]
 
 
 build-e2e = "build --bin gateway --features e2e_tests"
 run-e2e = "run --bin gateway --features e2e_tests -- --config-file tensorzero-core/tests/e2e/tensorzero.toml"
+migrate-postgres = "run --bin gateway --features e2e_tests -- --run-postgres-migrations"
 watch-e2e = "watch -x run-e2e"
 
 tsbuild = [
@@ -52,4 +67,8 @@ tsbuild = [
     "tensorzero-core",
     "-p",
     "tensorzero",
+    "-p",
+    "tensorzero-node",
+    "-p",
+    "tensorzero-auth",
 ] # Export Typescript bindings for TensorZero

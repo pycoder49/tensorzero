@@ -92,6 +92,8 @@ async fn get_providers() -> E2ETestProviders {
         embeddings: vec![],
         inference_params_inference: standard_providers.clone(),
         inference_params_dynamic_credentials: vec![],
+        provider_type_default_credentials: vec![],
+        provider_type_default_credentials_shorthand: vec![],
         tool_use_inference: standard_providers.clone(),
         tool_multi_turn_inference: standard_providers.clone(),
         dynamic_tool_use_inference: standard_providers.clone(),
@@ -102,6 +104,8 @@ async fn get_providers() -> E2ETestProviders {
         pdf_inference: standard_providers.clone(),
 
         shorthand_inference: vec![],
+        // AWS bedrock only works with SDK credentials
+        credential_fallbacks: vec![],
     }
 }
 
@@ -164,7 +168,7 @@ async fn test_inference_with_explicit_region() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "Hello, world!"}]
+                "content": [{"type": "text", "text": "Hello, world!"}]
             }
         ]
     });
@@ -250,7 +254,7 @@ async fn test_inference_with_explicit_broken_region() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
     let response_json = response.json::<Value>().await.unwrap();
 
@@ -271,7 +275,7 @@ async fn test_inference_with_empty_system() {
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "arguments": {"topic": "artificial intelligence"}}]
+                    "content": [{"type": "template", "name": "user", "arguments": {"topic": "artificial intelligence"}}]
                 }
             ]},
         "stream": false,

@@ -126,10 +126,17 @@ class ToolCall(ContentBlock):
 
 
 @dataclass
+class ThoughtSummaryBlock:
+    text: str
+    type: str = "summary_text"
+
+
+@dataclass
 class Thought(ContentBlock):
     text: Optional[str] = None
     type: str = "thought"
     signature: Optional[str] = None
+    summary: Optional[List["ThoughtSummaryBlock"]] = None
     _internal_provider_type: Optional[str] = None
 
 
@@ -150,6 +157,7 @@ class UnknownContentBlock(ContentBlock):
 
 class FinishReason(str, Enum):
     STOP = "stop"
+    STOP_SEQUENCE = "stop_sequence"
     LENGTH = "length"
     TOOL_CALL = "tool_call"
     CONTENT_FILTER = "content_filter"
@@ -246,12 +254,20 @@ def parse_content_block(block: Dict[str, Any]) -> ContentBlock:
             type=block_type,
         )
     elif block_type == "thought":
+        summary_data = block.get("summary")
+        summary = None
+        if summary_data:
+            summary = [ThoughtSummaryBlock(text=s["text"]) for s in summary_data]
         return Thought(
-            text=block["text"], signature=block.get("signature"), type=block_type
+            text=block.get("text"),
+            signature=block.get("signature"),
+            summary=summary,
+            type=block_type,
         )
     elif block_type == "unknown":
         return UnknownContentBlock(
-            data=block["data"], model_provider_name=block.get("model_provider_name")
+            data=block["data"],
+            model_provider_name=block.get("model_provider_name"),
         )
     else:
         raise ValueError(f"Unknown content block type: {block}")
@@ -287,10 +303,19 @@ class ToolCallChunk(ContentBlockChunk):
 @dataclass
 class ThoughtChunk(ContentBlockChunk):
     id: str
-    text: str
+    text: Optional[str]
     type: str = "thought"
     signature: Optional[str] = None
+    summary_id: Optional[str] = None
+    summary_text: Optional[str] = None
     _internal_provider_type: Optional[str] = None
+
+
+@dataclass
+class UnknownChunk(ContentBlockChunk):
+    id: str
+    data: Any
+    type: str = "unknown"
 
 
 @dataclass
@@ -370,7 +395,19 @@ def parse_content_block_chunk(block: Dict[str, Any]) -> ContentBlockChunk:
             raw_name=block["raw_name"],
         )
     elif block_type == "thought":
-        return ThoughtChunk(id=block["id"], text=block["text"])
+        return ThoughtChunk(
+            id=block["id"],
+            text=block.get("text"),
+            signature=block.get("signature"),
+            summary_id=block.get("summary_id"),
+            summary_text=block.get("summary_text"),
+        )
+    elif block_type == "unknown":
+        return UnknownChunk(
+            id=block["id"],
+            data=block["data"],
+        )
+
     else:
         raise ValueError(f"Unknown content block type: {block}")
 
@@ -414,25 +451,47 @@ class TensorZeroError(BaseTensorZeroError):
 
 
 @dataclass
-class DynamicEvaluationRunResponse:
+class WorkflowEvaluationRunResponse:
     run_id: UUID
 
 
-def parse_dynamic_evaluation_run_response(
+def parse_workflow_evaluation_run_response(
     data: Dict[str, Any],
-) -> DynamicEvaluationRunResponse:
-    return DynamicEvaluationRunResponse(run_id=UUID(data["run_id"]))
+) -> WorkflowEvaluationRunResponse:
+    return WorkflowEvaluationRunResponse(run_id=UUID(data["run_id"]))
 
 
 @dataclass
-class DynamicEvaluationRunEpisodeResponse:
+class WorkflowEvaluationRunEpisodeResponse:
     episode_id: UUID
 
 
+def parse_workflow_evaluation_run_episode_response(
+    data: Dict[str, Any],
+) -> WorkflowEvaluationRunEpisodeResponse:
+    return WorkflowEvaluationRunEpisodeResponse(episode_id=UUID(data["episode_id"]))
+
+
+# DEPRECATED: Use WorkflowEvaluationRunResponse instead
+DynamicEvaluationRunResponse = WorkflowEvaluationRunResponse
+
+
+# DEPRECATED: Use parse_workflow_evaluation_run_response instead
+def parse_dynamic_evaluation_run_response(
+    data: Dict[str, Any],
+) -> WorkflowEvaluationRunResponse:
+    return parse_workflow_evaluation_run_response(data)
+
+
+# DEPRECATED: Use WorkflowEvaluationRunEpisodeResponse instead
+DynamicEvaluationRunEpisodeResponse = WorkflowEvaluationRunEpisodeResponse
+
+
+# DEPRECATED: Use parse_workflow_evaluation_run_episode_response instead
 def parse_dynamic_evaluation_run_episode_response(
     data: Dict[str, Any],
-) -> DynamicEvaluationRunEpisodeResponse:
-    return DynamicEvaluationRunEpisodeResponse(episode_id=UUID(data["episode_id"]))
+) -> WorkflowEvaluationRunEpisodeResponse:
+    return parse_workflow_evaluation_run_episode_response(data)
 
 
 @dataclass
@@ -445,17 +504,7 @@ class ChatDatapointInsert:
     tool_choice: Optional[str] = None
     parallel_tool_calls: Optional[bool] = None
     tags: Optional[Dict[str, str]] = None
-
-
-# CAREFUL: deprecated
-class ChatInferenceDatapointInput(ChatDatapointInsert):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `ChatDatapointInsert` instead of `ChatInferenceDatapointInput`. In a future release, `ChatInferenceDatapointInput` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
+    name: Optional[str] = None
 
 
 @dataclass
@@ -465,17 +514,7 @@ class JsonDatapointInsert:
     output: Optional[Any] = None
     output_schema: Optional[Any] = None
     tags: Optional[Dict[str, str]] = None
-
-
-# CAREFUL: deprecated
-class JsonInferenceDatapointInput(JsonDatapointInsert):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `JsonDatapointInsert` instead of `JsonInferenceDatapointInput`. In a future release, `JsonInferenceDatapointInput` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
+    name: Optional[str] = None
 
 
 @dataclass
@@ -488,6 +527,16 @@ class Tool:
 
 @dataclass
 class ToolParams:
+    """Legacy ToolParams class for backward compatibility.
+
+    Use the flattened DynamicToolParams fields directly when constructing StoredInference:
+    - allowed_tools: Optional[List[str]]
+    - additional_tools: Optional[List[Tool]]
+    - tool_choice: Optional[str]
+    - parallel_tool_calls: Optional[bool]
+    - provider_tools: Optional[List[ProviderTool]]
+    """
+
     tools_available: List[Tool]
     tool_choice: str
     parallel_tool_calls: Optional[bool] = None
@@ -515,49 +564,31 @@ ToolChoice = Union[Literal["auto", "required", "off"], Dict[Literal["specific"],
 
 
 @dataclass
-class InferenceFilterTreeNode(ABC, HasTypeField):
+class InferenceFilter(ABC, HasTypeField):
     pass
 
 
+# DEPRECATED: Use InferenceFilter instead
+InferenceFilterTreeNode = InferenceFilter
+
+
 @dataclass
-class FloatMetricFilter(InferenceFilterTreeNode):
+class FloatMetricFilter(InferenceFilter):
     metric_name: str
     value: float
     comparison_operator: Literal["<", "<=", "=", ">", ">=", "!="]
     type: str = "float_metric"
 
 
-# CAREFUL: deprecated
-class FloatMetricNode(FloatMetricFilter):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `FloatMetricFilter` instead of `FloatMetricNode`. In a future release, `FloatMetricNode` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
-
-
 @dataclass
-class BooleanMetricFilter(InferenceFilterTreeNode):
+class BooleanMetricFilter(InferenceFilter):
     metric_name: str
     value: bool
     type: str = "boolean_metric"
 
 
-# CAREFUL: deprecated
-class BooleanMetricNode(BooleanMetricFilter):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `BooleanMetricFilter` instead of `BooleanMetricNode`. In a future release, `BooleanMetricNode` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
-
-
 @dataclass
-class TagFilter(InferenceFilterTreeNode):
+class TagFilter(InferenceFilter):
     key: str
     value: str
     comparison_operator: Literal["=", "!="]
@@ -565,61 +596,28 @@ class TagFilter(InferenceFilterTreeNode):
 
 
 @dataclass
-class TimeFilter(InferenceFilterTreeNode):
+class TimeFilter(InferenceFilter):
     time: str  # RFC 3339 timestamp
     comparison_operator: Literal["<", "<=", "=", ">", ">=", "!="]
     type: str = "time"
 
 
 @dataclass
-class AndFilter(InferenceFilterTreeNode):
-    children: List[InferenceFilterTreeNode]
+class AndFilter(InferenceFilter):
+    children: List[InferenceFilter]
     type: str = "and"
 
 
-# CAREFUL: deprecated
-class AndNode(AndFilter):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `AndFilter` instead of `AndNode`. In a future release, `AndNode` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
-
-
 @dataclass
-class OrFilter(InferenceFilterTreeNode):
-    children: List[InferenceFilterTreeNode]
+class OrFilter(InferenceFilter):
+    children: List[InferenceFilter]
     type: str = "or"
 
 
-# CAREFUL: deprecated
-class OrNode(OrFilter):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `OrFilter` instead of `OrNode`. In a future release, `OrNode` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
-
-
 @dataclass
-class NotFilter(InferenceFilterTreeNode):
-    child: InferenceFilterTreeNode
+class NotFilter(InferenceFilter):
+    child: InferenceFilter
     type: str = "not"
-
-
-# CAREFUL: deprecated
-class NotNode(NotFilter):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "Please use `NotFilter` instead of `NotNode`. In a future release, `NotNode` will be removed.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)
 
 
 @dataclass

@@ -1,12 +1,12 @@
+use futures::future::try_join_all;
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::StatusCode;
 use reqwest_eventsource::Event;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::IntoDeserializer;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -15,27 +15,23 @@ use crate::endpoints::inference::InferenceCredentials;
 use crate::error::{warn_discarded_thought_block, DisplayOrDebugGateway, Error, ErrorDetails};
 use crate::http::TensorzeroHttpClient;
 use crate::inference::types::batch::{BatchRequestRow, PollBatchInferenceResponse};
-use crate::inference::types::resolved_input::FileWithPath;
 use crate::inference::types::{
     batch::StartBatchProviderInferenceResponse, ContentBlock, ContentBlockChunk,
     ContentBlockOutput, Latency, ModelInferenceRequest, ModelInferenceRequestJsonMode,
-    PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
+    ObjectStorageFile, PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
     ProviderInferenceResponseChunk, RequestMessage, Role, Text, TextChunk, Usage,
 };
 use crate::inference::types::{
     FinishReason, ProviderInferenceResponseArgs, ProviderInferenceResponseStreamInner,
 };
 use crate::inference::{InferenceProvider, TensorZeroEventError};
-use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
+use crate::model::{Credential, ModelProvider};
 use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
 
 use crate::providers::helpers::{
-    inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
+    convert_stream_error, inject_extra_request_data_and_send,
+    inject_extra_request_data_and_send_eventsource,
 };
-
-fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("GROQ_API_KEY".to_string())
-}
 
 const PROVIDER_NAME: &str = "Groq";
 pub const PROVIDER_TYPE: &str = "groq";
@@ -49,23 +45,12 @@ pub struct GroqProvider {
     credentials: GroqCredentials,
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<GroqCredentials> = OnceLock::new();
-
 impl GroqProvider {
-    pub fn new(
-        model_name: String,
-        api_key_location: Option<CredentialLocation>,
-    ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-        Ok(GroqProvider {
+    pub fn new(model_name: String, credentials: GroqCredentials) -> Self {
+        GroqProvider {
             model_name,
             credentials,
-        })
+        }
     }
 
     pub fn model_name(&self) -> &str {
@@ -78,6 +63,10 @@ pub enum GroqCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    WithFallback {
+        default: Box<GroqCredentials>,
+        fallback: Box<GroqCredentials>,
+    },
 }
 
 impl TryFrom<Credential> for GroqCredentials {
@@ -89,6 +78,10 @@ impl TryFrom<Credential> for GroqCredentials {
             Credential::Dynamic(key_name) => Ok(GroqCredentials::Dynamic(key_name)),
             Credential::None => Ok(GroqCredentials::None),
             Credential::Missing => Ok(GroqCredentials::None),
+            Credential::WithFallback { default, fallback } => Ok(GroqCredentials::WithFallback {
+                default: Box::new((*default).try_into()?),
+                fallback: Box::new((*fallback).try_into()?),
+            }),
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for Groq provider".to_string(),
             })),
@@ -113,6 +106,16 @@ impl GroqCredentials {
                 }))
                 .transpose()
             }
+            GroqCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
+            }
             GroqCredentials::None => Ok(None),
         }
     }
@@ -131,16 +134,15 @@ impl InferenceProvider for GroqProvider {
         let start_time = Instant::now();
 
         let request_body =
-            serde_json::to_value(GroqRequest::new(&self.model_name, request.request)?).map_err(
-                |e| {
+            serde_json::to_value(GroqRequest::new(&self.model_name, request.request).await?)
+                .map_err(|e| {
                     Error::new(ErrorDetails::Serialization {
                         message: format!(
                             "Error serializing Groq request: {}",
                             DisplayOrDebugGateway::new(e)
                         ),
                     })
-                },
-            )?;
+                })?;
 
         let mut request_builder = http_client.post(request_url);
 
@@ -220,12 +222,13 @@ impl InferenceProvider for GroqProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(GroqRequest::new(&self.model_name, request)?)
+        let request_body = serde_json::to_value(GroqRequest::new(&self.model_name, request).await?)
             .map_err(|e| {
                 Error::new(ErrorDetails::Serialization {
                     message: format!(
@@ -284,20 +287,6 @@ impl InferenceProvider for GroqProvider {
         }
         .into())
     }
-}
-pub async fn convert_stream_error(provider_type: String, e: reqwest_eventsource::Error) -> Error {
-    let message = e.to_string();
-    let mut raw_response = None;
-    if let reqwest_eventsource::Error::InvalidStatusCode(_, resp) = e {
-        raw_response = resp.text().await.ok();
-    }
-    ErrorDetails::InferenceServer {
-        message,
-        raw_request: None,
-        raw_response,
-        provider_type,
-    }
-    .into()
 }
 
 pub fn stream_groq(
@@ -529,13 +518,15 @@ impl GroqRequestMessage<'_> {
     }
 }
 
-pub(super) fn prepare_groq_messages<'a>(
+pub(super) async fn prepare_groq_messages<'a>(
     request: &'a ModelInferenceRequest<'_>,
 ) -> Result<Vec<GroqRequestMessage<'a>>, Error> {
-    let mut messages = Vec::with_capacity(request.messages.len());
-    for message in &request.messages {
-        messages.extend(tensorzero_to_groq_messages(message)?);
-    }
+    let mut messages: Vec<_> =
+        try_join_all(request.messages.iter().map(tensorzero_to_groq_messages))
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
     if let Some(system_msg) =
         tensorzero_to_groq_system_message(request.system.as_deref(), request.json_mode, &messages)
     {
@@ -557,10 +548,10 @@ pub(super) fn prepare_groq_tools<'a>(
     match &request.tool_config {
         None => (None, None, None),
         Some(tool_config) => {
-            if tool_config.tools_available.is_empty() {
+            if !tool_config.any_tools_available() {
                 return (None, None, None);
             }
-            let tools = Some(tool_config.tools_available.iter().map(Into::into).collect());
+            let tools = Some(tool_config.tools_available().map(Into::into).collect());
             let tool_choice = Some((&tool_config.tool_choice).into());
             let parallel_tool_calls = tool_config.parallel_tool_calls;
             (tools, tool_choice, parallel_tool_calls)
@@ -614,16 +605,16 @@ pub(super) fn tensorzero_to_groq_system_message<'a>(
     }
 }
 
-pub(super) fn tensorzero_to_groq_messages(
+pub(super) async fn tensorzero_to_groq_messages(
     message: &RequestMessage,
 ) -> Result<Vec<GroqRequestMessage<'_>>, Error> {
     match message.role {
-        Role::User => tensorzero_to_groq_user_messages(&message.content),
-        Role::Assistant => tensorzero_to_groq_assistant_messages(&message.content),
+        Role::User => tensorzero_to_groq_user_messages(&message.content).await,
+        Role::Assistant => tensorzero_to_groq_assistant_messages(&message.content).await,
     }
 }
 
-fn tensorzero_to_groq_user_messages(
+async fn tensorzero_to_groq_user_messages(
     content_blocks: &[ContentBlock],
 ) -> Result<Vec<GroqRequestMessage<'_>>, Error> {
     // We need to separate the tool result messages from the user content blocks.
@@ -650,15 +641,11 @@ fn tensorzero_to_groq_user_messages(
                 }));
             }
             ContentBlock::File(file) => {
-                let FileWithPath {
-                    file,
-                    storage_path: _,
-                } = &**file;
+                let resolved_file = file.resolve().await?;
+                let ObjectStorageFile { file, data } = &*resolved_file;
                 user_content_blocks.push(GroqContentBlock::ImageUrl {
                     image_url: GroqImageUrl {
-                        // This will only produce an error if we pass in a bad
-                        // `Base64Image` (with missing image data)
-                        url: format!("data:{};base64,{}", file.mime_type, file.data()?),
+                        url: format!("data:{};base64,{}", file.mime_type, data),
                     },
                 });
             }
@@ -686,7 +673,7 @@ fn tensorzero_to_groq_user_messages(
     Ok(messages)
 }
 
-fn tensorzero_to_groq_assistant_messages(
+async fn tensorzero_to_groq_assistant_messages(
     content_blocks: &[ContentBlock],
 ) -> Result<Vec<GroqRequestMessage<'_>>, Error> {
     // We need to separate the tool result messages from the assistant content blocks.
@@ -718,15 +705,11 @@ fn tensorzero_to_groq_assistant_messages(
                 }));
             }
             ContentBlock::File(file) => {
-                let FileWithPath {
-                    file,
-                    storage_path: _,
-                } = &**file;
+                let resolved_file = file.resolve().await?;
+                let ObjectStorageFile { file, data } = &*resolved_file;
                 assistant_content_blocks.push(GroqContentBlock::ImageUrl {
                     image_url: GroqImageUrl {
-                        // This will only produce an error if we pass in a bad
-                        // `Base64Image` (with missing image data)
-                        url: format!("data:{};base64,{}", file.mime_type, file.data()?),
+                        url: format!("data:{};base64,{}", file.mime_type, data),
                     },
                 });
             }
@@ -765,24 +748,27 @@ fn tensorzero_to_groq_assistant_messages(
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "type")]
-enum GroqResponseFormat<'a> {
+enum GroqResponseFormat {
     #[default]
     Text,
-    JsonObject {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        schema: Option<&'a Value>, // the desired JSON schema
+    JsonObject,
+    JsonSchema {
+        json_schema: Value,
     },
 }
 
-impl<'a> GroqResponseFormat<'a> {
-    fn new(json_mode: ModelInferenceRequestJsonMode, output_schema: Option<&'a Value>) -> Self {
+impl GroqResponseFormat {
+    fn new(json_mode: ModelInferenceRequestJsonMode, output_schema: Option<&Value>) -> Self {
         match json_mode {
-            ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
-                GroqResponseFormat::JsonObject {
-                    schema: output_schema,
-                }
-            }
+            ModelInferenceRequestJsonMode::On => GroqResponseFormat::JsonObject,
             ModelInferenceRequestJsonMode::Off => GroqResponseFormat::Text,
+            ModelInferenceRequestJsonMode::Strict => match output_schema {
+                Some(schema) => {
+                    let json_schema = json!({"name": "response", "strict": true, "schema": schema});
+                    GroqResponseFormat::JsonSchema { json_schema }
+                }
+                None => GroqResponseFormat::JsonObject,
+            },
         }
     }
 }
@@ -899,7 +885,7 @@ struct GroqRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<GroqResponseFormat<'a>>,
+    response_format: Option<GroqResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GroqTool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -911,7 +897,7 @@ struct GroqRequest<'a> {
 }
 
 impl<'a> GroqRequest<'a> {
-    pub fn new(
+    pub async fn new(
         model: &'a str,
         request: &'a ModelInferenceRequest<'_>,
     ) -> Result<GroqRequest<'a>, Error> {
@@ -926,7 +912,7 @@ impl<'a> GroqRequest<'a> {
         } else {
             None
         };
-        let mut messages = prepare_groq_messages(request)?;
+        let mut messages = prepare_groq_messages(request).await?;
 
         let (tools, tool_choice, mut parallel_tool_calls) = prepare_groq_tools(request);
         if model.to_lowercase().starts_with("o1") && parallel_tool_calls == Some(false) {
@@ -971,7 +957,6 @@ pub(super) struct GroqUsage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
-    pub total_tokens: u32,
 }
 
 impl From<GroqUsage> for Usage {
@@ -1373,8 +1358,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_groq_request_new() {
+    #[tokio::test]
+    async fn test_groq_request_new() {
         // Test basic request
         let basic_request = ModelInferenceRequest {
             inference_id: uuid::Uuid::now_v7(),
@@ -1405,7 +1390,9 @@ mod tests {
         };
 
         let groq_request =
-            GroqRequest::new("meta-llama/llama-4-scout-17b-16e-instruct", &basic_request).unwrap();
+            GroqRequest::new("meta-llama/llama-4-scout-17b-16e-instruct", &basic_request)
+                .await
+                .unwrap();
 
         assert_eq!(
             groq_request.model,
@@ -1451,6 +1438,7 @@ mod tests {
             "meta-llama/llama-4-scout-17b-16e-instruct",
             &request_with_tools,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1467,7 +1455,7 @@ mod tests {
         assert!(!groq_request.stream);
         assert_eq!(
             groq_request.response_format,
-            Some(GroqResponseFormat::JsonObject { schema: None })
+            Some(GroqResponseFormat::JsonObject)
         );
         assert!(groq_request.tools.is_some());
         let tools = groq_request.tools.as_ref().unwrap();
@@ -1510,6 +1498,7 @@ mod tests {
             "meta-llama/llama-4-scout-17b-16e-instruct",
             &request_with_tools,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1527,7 +1516,7 @@ mod tests {
         // Resolves to normal JSON mode since no schema is provided (this shouldn't really happen in practice)
         assert_eq!(
             groq_request.response_format,
-            Some(GroqResponseFormat::JsonObject { schema: None })
+            Some(GroqResponseFormat::JsonObject)
         );
 
         // Test request with strict JSON mode with an output schema
@@ -1558,6 +1547,7 @@ mod tests {
             "meta-llama/llama-4-scout-17b-16e-instruct",
             &request_with_tools,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1573,12 +1563,14 @@ mod tests {
         assert_eq!(groq_request.presence_penalty, None);
         assert_eq!(groq_request.frequency_penalty, None);
         let expected_schema = serde_json::json!({});
-        assert_eq!(
-            groq_request.response_format,
-            Some(GroqResponseFormat::JsonObject {
-                schema: Some(&expected_schema),
-            })
-        );
+        match groq_request.response_format {
+            Some(GroqResponseFormat::JsonSchema { json_schema }) => {
+                assert_eq!(json_schema["schema"], expected_schema);
+                assert_eq!(json_schema["name"], "response");
+                assert_eq!(json_schema["strict"], true);
+            }
+            _ => panic!("Expected JsonSchema variant"),
+        }
     }
 
     #[test]
@@ -1596,7 +1588,6 @@ mod tests {
             usage: GroqUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -1694,7 +1685,6 @@ mod tests {
             usage: GroqUsage {
                 prompt_tokens: 15,
                 completion_tokens: 25,
-                total_tokens: 40,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -1784,7 +1774,6 @@ mod tests {
             usage: GroqUsage {
                 prompt_tokens: 5,
                 completion_tokens: 0,
-                total_tokens: 5,
             },
         };
         let request_body = GroqRequest {
@@ -1841,7 +1830,6 @@ mod tests {
             usage: GroqUsage {
                 prompt_tokens: 10,
                 completion_tokens: 10,
-                total_tokens: 20,
             },
         };
 
@@ -1915,9 +1903,9 @@ mod tests {
         let parallel_tool_calls = parallel_tool_calls.unwrap();
         assert!(parallel_tool_calls);
         let tool_config = ToolCallConfig {
-            tools_available: vec![],
             tool_choice: ToolChoice::Required,
             parallel_tool_calls: Some(true),
+            ..Default::default()
         };
 
         // Test no tools but a tool choice and make sure tool choice output is None
@@ -1948,10 +1936,12 @@ mod tests {
         assert!(parallel_tool_calls.is_none());
     }
 
-    #[test]
-    fn test_tensorzero_to_groq_messages() {
+    #[tokio::test]
+    async fn test_tensorzero_to_groq_messages() {
         let content_blocks = vec!["Hello".to_string().into()];
-        let groq_messages = tensorzero_to_groq_user_messages(&content_blocks).unwrap();
+        let groq_messages = tensorzero_to_groq_user_messages(&content_blocks)
+            .await
+            .unwrap();
         assert_eq!(groq_messages.len(), 1);
         match &groq_messages[0] {
             GroqRequestMessage::User(content) => {
@@ -1970,7 +1960,9 @@ mod tests {
             "Hello".to_string().into(),
             "How are you?".to_string().into(),
         ];
-        let groq_messages = tensorzero_to_groq_user_messages(&content_blocks).unwrap();
+        let groq_messages = tensorzero_to_groq_user_messages(&content_blocks)
+            .await
+            .unwrap();
         assert_eq!(groq_messages.len(), 1);
         match &groq_messages[0] {
             GroqRequestMessage::User(content) => {
@@ -1998,7 +1990,9 @@ mod tests {
             arguments: "{}".to_string(),
         });
         let content_blocks = vec!["Hello".to_string().into(), tool_block];
-        let groq_messages = tensorzero_to_groq_assistant_messages(&content_blocks).unwrap();
+        let groq_messages = tensorzero_to_groq_assistant_messages(&content_blocks)
+            .await
+            .unwrap();
         assert_eq!(groq_messages.len(), 1);
         match &groq_messages[0] {
             GroqRequestMessage::Assistant(content) => {
@@ -2143,7 +2137,6 @@ mod tests {
             usage: Some(GroqUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             }),
         };
         let message =
@@ -2165,7 +2158,7 @@ mod tests {
         let json_mode = ModelInferenceRequestJsonMode::On;
         let output_schema = None;
         let format = GroqResponseFormat::new(json_mode, output_schema);
-        assert_eq!(format, GroqResponseFormat::JsonObject { schema: None });
+        assert_eq!(format, GroqResponseFormat::JsonObject);
 
         // Test JSON mode Off
         let json_mode = ModelInferenceRequestJsonMode::Off;
@@ -2175,24 +2168,41 @@ mod tests {
         // Test JSON mode Strict with no schema
         let json_mode = ModelInferenceRequestJsonMode::Strict;
         let format = GroqResponseFormat::new(json_mode, output_schema);
-        assert_eq!(format, GroqResponseFormat::JsonObject { schema: None });
+        assert_eq!(format, GroqResponseFormat::JsonObject);
 
         // Test JSON mode Strict with schema
         let json_mode = ModelInferenceRequestJsonMode::Strict;
-        let json_schema = serde_json::json!({
+        let schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "foo": {"type": "string"}
             }
         });
-        let output_schema = Some(&json_schema);
+        let output_schema = Some(&schema);
         let format = GroqResponseFormat::new(json_mode, output_schema);
-        assert_eq!(
-            format,
-            GroqResponseFormat::JsonObject {
-                schema: output_schema
+        match format {
+            GroqResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema["schema"], schema);
+                assert_eq!(json_schema["name"], "response");
+                assert_eq!(json_schema["strict"], true);
             }
-        );
+            _ => panic!("Expected JsonSchema variant"),
+        }
+
+        // Test serialization of JsonSchema format
+        let json_mode = ModelInferenceRequestJsonMode::Strict;
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "foo": {"type": "string"}
+            }
+        });
+        let format = GroqResponseFormat::new(json_mode, Some(&schema));
+        let serialized = serde_json::to_value(&format).unwrap();
+        assert_eq!(serialized["type"], "json_schema");
+        assert_eq!(serialized["json_schema"]["name"], "response");
+        assert_eq!(serialized["json_schema"]["strict"], true);
+        assert_eq!(serialized["json_schema"]["schema"], schema);
     }
 
     #[test]

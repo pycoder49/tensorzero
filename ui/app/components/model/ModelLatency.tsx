@@ -9,6 +9,7 @@ import {
 } from "recharts";
 import React, { useState, useMemo } from "react";
 import { Await } from "react-router";
+import { CHART_COLORS } from "~/utils/chart";
 import {
   Select,
   SelectItem,
@@ -28,6 +29,7 @@ import {
   ChartLegend,
   ChartLegendContent,
 } from "~/components/ui/chart";
+import { useTimeGranularityParam } from "~/hooks/use-time-granularity-param";
 
 type LatencyMetric = "response_time_ms" | "ttft_ms";
 
@@ -49,7 +51,7 @@ function CustomTooltipContent({ active, payload, label }: TooltipProps) {
   return (
     <div className="border-border/50 bg-background min-w-[10rem] rounded-lg border px-2.5 py-1.5 text-xs shadow-xl">
       <div className="flex items-center justify-between gap-2 pb-1">
-        <span className="text-muted-foreground">Percentile</span>
+        <span>Percentile</span>
         <span className="text-foreground font-mono font-medium tabular-nums">
           {((label || 0) * 100).toFixed(1)}%
         </span>
@@ -70,7 +72,7 @@ function CustomTooltipContent({ active, payload, label }: TooltipProps) {
                     border: `1px solid ${entry.color}`,
                   }}
                 />
-                <span className="text-muted-foreground mr-2">
+                <span className="text-muted-foreground mr-2 font-mono text-xs">
                   {entry.dataKey}
                 </span>
               </div>
@@ -84,14 +86,6 @@ function CustomTooltipContent({ active, payload, label }: TooltipProps) {
     </div>
   );
 }
-
-const CHART_COLORS = [
-  "hsl(var(--chart-1))",
-  "hsl(var(--chart-2))",
-  "hsl(var(--chart-3))",
-  "hsl(var(--chart-4))",
-  "hsl(var(--chart-5))",
-] as const;
 
 const MARGIN = { top: 12, right: 16, bottom: 28, left: 56 };
 
@@ -181,7 +175,9 @@ export function LatencyQuantileChart({
           }}
         />
 
-        <ChartLegend content={<ChartLegendContent />} />
+        <ChartLegend
+          content={<ChartLegendContent className="font-mono text-xs" />}
+        />
 
         {modelNames.map((name, index) => (
           <Line
@@ -243,14 +239,14 @@ function transformLatencyData(
 export function ModelLatency({
   modelLatencyDataPromise,
   quantiles,
-  timeGranularity,
-  onTimeGranularityChange,
 }: {
   modelLatencyDataPromise: Promise<ModelLatencyDatapoint[]>;
   quantiles: number[];
-  timeGranularity: TimeWindow;
-  onTimeGranularityChange: (granularity: TimeWindow) => void;
 }) {
+  const [timeGranularity, onTimeGranularityChange] = useTimeGranularityParam(
+    "latencyTimeGranularity",
+    "week",
+  );
   const [selectedMetric, setSelectedMetric] =
     useState<LatencyMetric>("response_time_ms");
 
@@ -260,8 +256,7 @@ export function ModelLatency({
         <div>
           <CardTitle>Model Latency Distribution</CardTitle>
           <CardDescription>
-            Empirical cumulative distribution function (eCDF) of latency metrics
-            by model
+            Quantiles of latency metrics by model
           </CardDescription>
         </div>
         <div className="flex flex-col justify-center gap-2">

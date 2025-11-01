@@ -3,8 +3,16 @@ use std::io::Cursor;
 use std::time::Duration;
 use std::{collections::HashMap, net::SocketAddr};
 
+use secrecy::SecretString;
+
 use object_store::{aws::AmazonS3Builder, ObjectStore};
 use std::sync::Arc;
+use tensorzero_core::config::provider_types::{
+    AnthropicDefaults, AzureDefaults, DeepSeekDefaults, FireworksDefaults, GCPDefaults,
+    GoogleAIStudioGeminiDefaults, GroqDefaults, HyperbolicDefaults, MistralDefaults,
+    OpenAIDefaults, OpenRouterDefaults, SGLangDefaults, TGIDefaults, TogetherDefaults,
+    VLLMDefaults, XAIDefaults,
+};
 use tensorzero_core::http::TensorzeroHttpClient;
 
 use axum::body::Body;
@@ -23,23 +31,23 @@ use serde_json::{json, Value};
 use std::future::IntoFuture;
 use tensorzero::{
     CacheParamsOptions, ClientInferenceParams, ClientInput, ClientInputMessage,
-    ClientInputMessageContent, InferenceOutput, InferenceResponse,
+    ClientInputMessageContent, ClientSecretString, InferenceOutput, InferenceResponse,
 };
 use tensorzero_core::endpoints::inference::ChatCompletionInferenceParams;
+use tensorzero_core::inference::types::extra_headers::UnfilteredInferenceExtraHeaders;
 use tracing_test::traced_test;
 
 use tensorzero_core::endpoints::object_storage::{get_object_handler, ObjectResponse, PathParams};
 
-use tensorzero_core::gateway_util::AppStateData;
-use tensorzero_core::inference::types::file::Base64FileMetadata;
+use tensorzero_core::inference::types::file::{Base64File, ObjectStoragePointer, UrlFile};
 use tensorzero_core::inference::types::stored_input::StoredFile;
-use tensorzero_core::inference::types::{FinishReason, TextKind, Thought};
+use tensorzero_core::inference::types::{Arguments, FinishReason, System, TextKind, Thought};
+use tensorzero_core::utils::gateway::AppStateData;
 use tensorzero_core::{
     cache::CacheEnabledMode,
     inference::types::{
         storage::{StorageKind, StoragePath},
-        ContentBlock, ContentBlockChatOutput, File, RequestMessage, Role, StoredContentBlock,
-        StoredRequestMessage, Text,
+        ContentBlockChatOutput, File, Role, StoredContentBlock, StoredRequestMessage, Text,
     },
     tool::{ToolCall, ToolResult},
 };
@@ -47,12 +55,14 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::common::get_gateway_endpoint;
+// use tensorzero_core::config::provider_types::*;
 use tensorzero_core::db::clickhouse::test_helpers::{
     get_clickhouse, select_chat_inference_clickhouse, select_inference_tags_clickhouse,
-    select_json_inference_clickhouse, select_model_inference_clickhouse, CLICKHOUSE_URL,
+    select_json_inference_clickhouse, select_model_inference_clickhouse,
 };
+use tensorzero_core::model::CredentialLocation;
 
-use super::helpers::get_extra_headers;
+use super::helpers::{get_extra_headers, get_test_model_extra_headers};
 
 #[derive(Clone, Debug)]
 pub struct E2ETestProvider {
@@ -63,6 +73,14 @@ pub struct E2ETestProvider {
     pub credentials: HashMap<String, String>,
 
     pub supports_batch_inference: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelTestProvider {
+    pub provider_type: String,
+    // These are keys and values that we would put into the model block for that provider
+    pub model_info: HashMap<String, String>,
+    pub use_modal_headers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +105,10 @@ pub struct E2ETestProviders {
 
     pub inference_params_dynamic_credentials: Vec<E2ETestProvider>,
 
+    pub provider_type_default_credentials: Vec<E2ETestProvider>,
+    pub provider_type_default_credentials_shorthand: Vec<E2ETestProvider>,
+    pub credential_fallbacks: Vec<ModelTestProvider>,
+
     pub inference_params_inference: Vec<E2ETestProvider>,
     pub tool_use_inference: Vec<E2ETestProvider>,
     pub tool_multi_turn_inference: Vec<E2ETestProvider>,
@@ -102,82 +124,6 @@ pub struct E2ETestProviders {
     pub embeddings: Vec<EmbeddingTestProvider>,
 }
 
-pub async fn make_http_gateway() -> tensorzero::Client {
-    tensorzero::ClientBuilder::new(tensorzero::ClientBuilderMode::HTTPGateway {
-        url: get_gateway_endpoint("/"),
-    })
-    .build()
-    .await
-    .unwrap()
-}
-
-pub async fn make_embedded_gateway() -> tensorzero::Client {
-    let mut config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    config_path.push("tests/e2e/tensorzero.toml");
-    tensorzero::ClientBuilder::new(tensorzero::ClientBuilderMode::EmbeddedGateway {
-        config_file: Some(config_path),
-        clickhouse_url: Some(CLICKHOUSE_URL.clone()),
-        postgres_url: None,
-        timeout: None,
-        verify_credentials: true,
-        allow_batch_writes: true,
-    })
-    .build()
-    .await
-    .unwrap()
-}
-
-pub async fn make_embedded_gateway_no_config() -> tensorzero::Client {
-    tensorzero::ClientBuilder::new(tensorzero::ClientBuilderMode::EmbeddedGateway {
-        config_file: None,
-        clickhouse_url: Some(CLICKHOUSE_URL.clone()),
-        postgres_url: None,
-        timeout: None,
-        verify_credentials: true,
-        allow_batch_writes: true,
-    })
-    .build()
-    .await
-    .unwrap()
-}
-
-pub async fn make_embedded_gateway_with_config(config: &str) -> tensorzero::Client {
-    let tmp_config = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp_config.path(), config).unwrap();
-    tensorzero::ClientBuilder::new(tensorzero::ClientBuilderMode::EmbeddedGateway {
-        config_file: Some(tmp_config.path().to_owned()),
-        clickhouse_url: Some(CLICKHOUSE_URL.clone()),
-        postgres_url: None,
-        timeout: None,
-        verify_credentials: true,
-        allow_batch_writes: true,
-    })
-    .build()
-    .await
-    .unwrap()
-}
-// We use a multi-threaded runtime so that the embedded gateway can use 'block_on'.
-// For consistency, we also use a multi-threaded runtime for the http gateway test.
-
-#[macro_export]
-macro_rules! make_gateway_test_functions {
-    ($prefix:ident) => {
-        paste::paste! {
-
-            #[tokio::test(flavor = "multi_thread")]
-            async fn [<$prefix _embedded_gateway>]() {
-                $prefix ($crate::providers::common::make_embedded_gateway().await).await;
-            }
-
-
-            #[tokio::test(flavor = "multi_thread")]
-            async fn [<$prefix _http_gateway>]() {
-                $prefix ($crate::providers::common::make_http_gateway().await).await;
-            }
-        }
-    };
-}
-
 #[macro_export]
 macro_rules! generate_provider_tests {
     ($func:ident) => {
@@ -185,6 +131,8 @@ macro_rules! generate_provider_tests {
         use $crate::providers::common::test_dynamic_tool_use_streaming_inference_request_with_provider;
         use $crate::providers::common::test_inference_params_inference_request_with_provider;
         use $crate::providers::common::test_inference_params_streaming_inference_request_with_provider;
+        use $crate::providers::common::test_provider_type_default_credentials_with_provider;
+        use $crate::providers::common::test_provider_type_default_credentials_shorthand_with_provider;
         use $crate::providers::common::test_json_mode_inference_request_with_provider;
         use $crate::providers::common::test_json_mode_streaming_inference_request_with_provider;
         use $crate::providers::common::test_bad_auth_extra_headers_with_provider;
@@ -229,6 +177,7 @@ macro_rules! generate_provider_tests {
         use $crate::providers::embeddings::test_basic_embedding_with_provider;
         use $crate::providers::embeddings::test_bulk_embedding_with_provider;
         use $crate::providers::embeddings::test_embedding_with_dimensions_with_provider;
+        use $crate::providers::common::test_provider_type_fallback_credentials_with_provider;
         use $crate::providers::embeddings::test_embedding_with_encoding_format_with_provider;
         use $crate::providers::embeddings::test_embedding_with_user_parameter_with_provider;
         use $crate::providers::embeddings::test_embedding_invalid_model_error_with_provider;
@@ -326,6 +275,35 @@ macro_rules! generate_provider_tests {
             let providers = $func().await.inference_params_dynamic_credentials;
             for provider in providers {
                 test_inference_params_streaming_inference_request_with_provider(provider).await;
+            }
+        }
+
+
+        #[tokio::test]
+        async fn test_provider_type_default_credentials() {
+            let providers = $func().await.provider_type_default_credentials;
+            for provider in providers {
+                test_provider_type_default_credentials_with_provider(provider).await;
+            }
+        }
+
+
+        #[tokio::test]
+        async fn test_provider_type_default_credentials_shorthand() {
+            let providers = $func().await.provider_type_default_credentials_shorthand;
+            for provider in providers {
+                test_provider_type_default_credentials_shorthand_with_provider(provider).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn test_provider_type_fallback_credentials() {
+            // We just need a longhand model
+            let all_providers = $func().await;
+            let providers = all_providers.credential_fallbacks;
+            let supports_dynamic_credentials = !all_providers.provider_type_default_credentials.is_empty();
+            for provider in providers {
+                test_provider_type_fallback_credentials_with_provider(provider, supports_dynamic_credentials).await;
             }
         }
 
@@ -461,7 +439,7 @@ macro_rules! generate_provider_tests {
                 test_dynamic_tool_use_inference_request_with_provider(provider, &client).await;
             }
         }
-        $crate::make_gateway_test_functions!(test_dynamic_tool_use_inference_request);
+        tensorzero::make_gateway_test_functions!(test_dynamic_tool_use_inference_request);
 
         async fn test_stop_sequences_inference_request(client: tensorzero::Client) {
             let providers = $func().await.simple_inference;
@@ -469,7 +447,7 @@ macro_rules! generate_provider_tests {
                 test_stop_sequences_inference_request_with_provider(provider, &client).await;
             }
         }
-        $crate::make_gateway_test_functions!(test_stop_sequences_inference_request);
+        tensorzero::make_gateway_test_functions!(test_stop_sequences_inference_request);
 
         async fn test_dynamic_tool_use_streaming_inference_request(client: tensorzero::Client) {
             let providers = $func().await.dynamic_tool_use_inference;
@@ -477,7 +455,7 @@ macro_rules! generate_provider_tests {
                 test_dynamic_tool_use_streaming_inference_request_with_provider(provider, &client).await;
             }
         }
-        $crate::make_gateway_test_functions!(test_dynamic_tool_use_streaming_inference_request);
+        tensorzero::make_gateway_test_functions!(test_dynamic_tool_use_streaming_inference_request);
 
 
         #[tokio::test]
@@ -738,17 +716,33 @@ type = "chat"
 type = "chat_completion"
 model = "openai::gpt-4o-mini-2024-07-18"
 
+[functions.pdf_test.variants.openai-responses]
+type = "chat_completion"
+model = "responses-gpt-4o-mini-2024-07-18"
+
 [functions.pdf_test.variants.gcp_vertex_gemini]
 type = "chat_completion"
 model = "gcp_vertex_gemini::projects/tensorzero-public/locations/us-central1/publishers/google/models/gemini-2.0-flash-lite"
 
+[functions.pdf_test.variants.google_ai_studio]
+type = "chat_completion"
+model = "google_ai_studio_gemini::gemini-2.0-flash-lite"
+
 [functions.pdf_test.variants.anthropic]
 type = "chat_completion"
-model = "anthropic::claude-3-5-sonnet-20241022"
+model = "anthropic::claude-sonnet-4-5-20250929"
 
 [functions.pdf_test.variants.aws-bedrock]
 type = "chat_completion"
 model = "claude-3-haiku-20240307-aws-bedrock"
+
+[models."responses-gpt-4o-mini-2024-07-18"]
+routing = ["openai"]
+
+[models."responses-gpt-4o-mini-2024-07-18".providers.openai]
+type = "openai"
+model_name = "gpt-4o-mini-2024-07-18"
+api_type = "responses"
 
 [models.claude-3-haiku-20240307-aws-bedrock]
 routing = ["aws_bedrock"]
@@ -770,6 +764,10 @@ type = "chat"
 type = "chat_completion"
 model = "openai::gpt-4o-mini-2024-07-18"
 
+[functions.image_test.variants.openai-responses]
+type = "chat_completion"
+model = "responses-gpt-4o-mini-2024-07-18"
+
 [functions.image_test.variants.anthropic]
 type = "chat_completion"
 model = "anthropic::claude-3-haiku-20240307"
@@ -790,6 +788,14 @@ type = "gcp_vertex_gemini"
 model_id = "gemini-2.5-pro"
 location = "global"
 project_id = "tensorzero-public"
+
+[models."responses-gpt-4o-mini-2024-07-18"]
+routing = ["openai"]
+
+[models."responses-gpt-4o-mini-2024-07-18".providers.openai]
+type = "openai"
+model_name = "gpt-4o-mini-2024-07-18"
+api_type = "responses"
 
 [functions.image_test.variants.gcp-vertex-haiku]
 type = "chat_completion"
@@ -817,6 +823,470 @@ model_id = "us.anthropic.claude-3-haiku-20240307-v1:0"
 region = "us-east-1"
 "#;
 
+/// Helper function to get the default credential location for a provider type.
+/// This calls the Default implementation directly, ensuring we test the actual defaults.
+fn get_default_credential_location(provider_type: &str) -> CredentialLocation {
+    match provider_type {
+        "anthropic" => AnthropicDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "openai" => OpenAIDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "azure" => AzureDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "deepseek" => DeepSeekDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "fireworks" => FireworksDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "gcp_vertex_anthropic" => GCPDefaults::default()
+            .credential_location
+            .default_location()
+            .clone(),
+        "gcp_vertex_gemini" => GCPDefaults::default()
+            .credential_location
+            .default_location()
+            .clone(),
+        "google_ai_studio_gemini" => GoogleAIStudioGeminiDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "groq" => GroqDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "hyperbolic" => HyperbolicDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "mistral" => MistralDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "openrouter" => OpenRouterDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "sglang" => SGLangDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "tgi" => TGIDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "together" => TogetherDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "vllm" => VLLMDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        "xai" => XAIDefaults::default()
+            .api_key_location
+            .default_location()
+            .clone(),
+        _ => panic!("Unknown provider type: {provider_type}"),
+    }
+}
+
+fn uses_credential_location(provider_type: &str) -> bool {
+    matches!(provider_type, "gcp_vertex_gemini" | "gcp_vertex_anthropic")
+}
+
+/// Test that provider type default credentials work correctly.
+/// This test:
+/// 1. Gets the default credential location from the provider's Default impl
+/// 2. Removes the credential from its default location
+/// 3. Sets it at a custom location
+/// 4. Configures the gateway to use the custom location via provider_types config
+/// 5. Verifies inference works
+pub async fn test_provider_type_default_credentials_with_provider(provider: E2ETestProvider) {
+    // Get the default credential location for this provider
+    let default_location = get_default_credential_location(&provider.model_provider_name);
+
+    // Extract the env var name from the credential location
+    let (original_env_var, is_path_env) = match &default_location {
+        CredentialLocation::Env(var_name) => (var_name.clone(), false),
+        CredentialLocation::PathFromEnv(var_name) => (var_name.clone(), true),
+        _ => {
+            println!(
+                "Skipping test for {} - unsupported credential location type",
+                provider.model_provider_name
+            );
+            return;
+        }
+    };
+
+    // Save the original credential value if it exists
+    let original_value = std::env::var(&original_env_var).unwrap();
+
+    // Get the credential value from the provider (it should be set for the test to run)
+    let credential_value = original_value.clone();
+
+    // Remove the default env var
+    std::env::remove_var(&original_env_var);
+
+    // Set up a custom env var with a test-specific name
+    let custom_env_var = format!(
+        "TENSORZERO_TEST_{}_KEY",
+        provider.model_provider_name.to_uppercase()
+    );
+    std::env::set_var(&custom_env_var, &credential_value);
+
+    // Create the credential location config based on the type
+    let default_credential_location_key = if uses_credential_location(&provider.model_provider_name)
+    {
+        "credential_location"
+    } else {
+        "api_key_location"
+    };
+    let credential_location_config = if is_path_env {
+        format!(r#"{default_credential_location_key}= "path_from_env::{custom_env_var}""#)
+    } else {
+        format!(r#"{default_credential_location_key}= "env::{custom_env_var}""#)
+    };
+
+    // Create a config with the custom credential location
+    let config = format!(
+        r#"
+[provider_types.{}]
+defaults.{}
+
+[models."test-model"]
+routing = ["test-provider"]
+
+[models."test-model".providers.test-provider]
+type = "{}"
+model_name = "{}"
+
+[functions.basic_test]
+type = "chat"
+
+[functions.basic_test.variants.default]
+type = "chat_completion"
+model = "test-model"
+"#,
+        provider.model_provider_name,
+        credential_location_config,
+        provider.model_provider_name,
+        provider.model_name
+    );
+
+    println!(
+        "Testing provider type default credentials for {}",
+        provider.model_provider_name
+    );
+    println!("Config:\n{config}");
+
+    // Create an embedded gateway with this config
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(&config).await;
+
+    // Make a simple inference request to verify it works
+    let episode_id = Uuid::now_v7();
+    let result = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![ClientInputMessage {
+                    role: Role::User,
+                    content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                        text: "Say hello".to_string(),
+                    })],
+                }],
+            },
+            stream: Some(false),
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the inference succeeded
+    assert!(
+        result.is_ok(),
+        "Inference failed for {}: {:?}",
+        provider.model_provider_name,
+        result.err()
+    );
+}
+
+/// Test that provider type default credentials work correctly with shorthand model syntax.
+/// This test is similar to test_provider_type_default_credentials_with_provider but uses
+/// shorthand model syntax (e.g., "openai::gpt-4o-mini") instead of explicit provider configs.
+pub async fn test_provider_type_default_credentials_shorthand_with_provider(
+    provider: E2ETestProvider,
+) {
+    // Get the default credential location for this provider
+    let default_location = get_default_credential_location(&provider.model_provider_name);
+
+    // Extract the env var name from the credential location
+    let (original_env_var, is_path_env) = match &default_location {
+        CredentialLocation::Env(var_name) => (var_name.clone(), false),
+        CredentialLocation::PathFromEnv(var_name) => (var_name.clone(), true),
+        _ => {
+            println!(
+                "Skipping test for {} - unsupported credential location type",
+                provider.model_provider_name
+            );
+            return;
+        }
+    };
+
+    // Save the original credential value if it exists
+    let original_value = std::env::var(&original_env_var).unwrap();
+
+    // Get the credential value from the provider (it should be set for the test to run)
+    let credential_value = original_value.clone();
+
+    // Remove the default env var
+    std::env::remove_var(&original_env_var);
+
+    // Set up a custom env var with a test-specific name
+    let custom_env_var = format!(
+        "TENSORZERO_TEST_{}_KEY",
+        provider.model_provider_name.to_uppercase()
+    );
+    std::env::set_var(&custom_env_var, &credential_value);
+
+    // Create the credential location config based on the type
+    let default_credential_location_key = if uses_credential_location(&provider.model_provider_name)
+    {
+        "credential_location"
+    } else {
+        "api_key_location"
+    };
+    let credential_location_config = if is_path_env {
+        format!(r#"{default_credential_location_key}= "path_from_env::{custom_env_var}""#)
+    } else {
+        format!(r#"{default_credential_location_key}= "env::{custom_env_var}""#)
+    };
+
+    // Create a config with the custom credential location and shorthand model syntax
+    let config = format!(
+        r"
+[provider_types.{}]
+defaults.{}
+
+",
+        provider.model_provider_name, credential_location_config
+    );
+
+    println!(
+        "Testing provider type default credentials (shorthand) for {}",
+        provider.model_provider_name
+    );
+    println!("Config:\n{config}");
+
+    // Create an embedded gateway with this config
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(&config).await;
+
+    // Make a simple inference request to verify it works
+    let episode_id = Uuid::now_v7();
+    let result = client
+        .inference(ClientInferenceParams {
+            function_name: None,
+            model_name: Some(provider.model_name),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![ClientInputMessage {
+                    role: Role::User,
+                    content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                        text: "Say hello".to_string(),
+                    })],
+                }],
+            },
+            stream: Some(false),
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the inference succeeded
+    assert!(
+        result.is_ok(),
+        "Inference failed for {} (shorthand): {:?}",
+        provider.model_provider_name,
+        result.err()
+    );
+}
+
+/// Test that fallback credentials work correctly.
+/// This test:
+/// 1. Gets the default credential location from the provider's Default impl
+/// 2. Gets the credential value from the env var or path
+/// 3. Sets up a provider with a dynamic credential location that falls back to the default location
+/// 4. Infers with the dynamic credential
+/// 5. Infers with the default credential
+/// 6. Asserts that the logs contain exactly one message about falling back
+#[traced_test]
+pub async fn test_provider_type_fallback_credentials_with_provider(
+    provider: ModelTestProvider,
+    supports_dynamic_credentials_test: bool,
+) {
+    // Get the default credential location for this provider
+    let default_location = get_default_credential_location(&provider.provider_type);
+
+    // Create the credential location config based on the type
+    let credential_location_key = if uses_credential_location(&provider.provider_type) {
+        "credential_location"
+    } else {
+        "api_key_location"
+    };
+    let default_credential_location_str = serde_json::to_string(&default_location).unwrap();
+    let credential_location_config = format!(
+        r#"{credential_location_key}= {{default = "dynamic::test_credential", fallback = {default_credential_location_str}}}"#
+    );
+
+    // Extract the env var name from the credential location
+    let original_env_var = match &default_location {
+        CredentialLocation::Env(var_name) => var_name.clone(),
+        CredentialLocation::PathFromEnv(var_name) => var_name.clone(),
+        _ => {
+            println!(
+                "Skipping test for {} - unsupported credential location type",
+                provider.provider_type
+            );
+            return;
+        }
+    };
+
+    // Create a config with the custom credential location
+    // Build the model_info config lines
+    let model_info_config = provider
+        .model_info
+        .iter()
+        .map(|(key, value)| format!("{key} = \"{value}\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let config = format!(
+        r#"
+[models."test-model"]
+routing = ["test-provider"]
+
+[models."test-model".providers.test-provider]
+{}
+type = "{}"
+{}
+
+[functions.basic_test]
+type = "chat"
+
+[functions.basic_test.variants.default]
+type = "chat_completion"
+model = "test-model"
+"#,
+        credential_location_config, provider.provider_type, model_info_config
+    );
+
+    println!(
+        "Testing provider type fallback credentials for {}",
+        provider.provider_type
+    );
+    println!("Config:\n{config}");
+
+    // Create an embedded gateway with this config
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(&config).await;
+
+    // Save the original credential value if it exists
+    let original_value = std::env::var(&original_env_var).unwrap();
+    let extra_headers = if provider.use_modal_headers {
+        get_test_model_extra_headers()
+    } else {
+        UnfilteredInferenceExtraHeaders {
+            extra_headers: vec![],
+        }
+    };
+
+    if supports_dynamic_credentials_test {
+        // Make a simple inference request with primary credentials to verify it works
+        let episode_id = Uuid::now_v7();
+        let result = client
+            .inference(ClientInferenceParams {
+                function_name: Some("basic_test".to_string()),
+                variant_name: Some("default".to_string()),
+                episode_id: Some(episode_id),
+                input: ClientInput {
+                    system: None,
+                    messages: vec![ClientInputMessage {
+                        role: Role::User,
+                        content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                            text: "Say hello".to_string(),
+                        })],
+                    }],
+                },
+                stream: Some(false),
+                credentials: HashMap::from([(
+                    "test_credential".to_string(),
+                    ClientSecretString(SecretString::new(original_value.clone().into())),
+                )]),
+                extra_headers: extra_headers.clone(),
+                // pass dynamic credentials here
+                ..Default::default()
+            })
+            .await;
+
+        // Assert the inference succeeded
+        assert!(
+            result.is_ok(),
+            "Inference failed for {}: {:?}",
+            provider.provider_type,
+            result.err()
+        );
+
+        assert!(!logs_contain("attempting fallback"));
+    }
+
+    // Make a simple inference request without primary credentials to verify it works
+    // with a fallback
+    let episode_id = Uuid::now_v7();
+    let result = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![ClientInputMessage {
+                    role: Role::User,
+                    content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                        text: "Say hello".to_string(),
+                    })],
+                }],
+            },
+            stream: Some(false),
+            credentials: HashMap::from([(
+                "test_credentials".to_string(),
+                ClientSecretString(SecretString::new(original_value.into())),
+            )]),
+            extra_headers,
+            // pass dynamic credentials here
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the inference succeeded
+    assert!(
+        result.is_ok(),
+        "Inference failed for {}: {:?}",
+        provider.provider_type,
+        result.err()
+    );
+
+    assert!(logs_contain("attempting fallback"));
+}
+
 pub async fn test_image_url_inference_with_provider_filesystem(provider: E2ETestProvider) {
     let temp_dir = tempfile::tempdir().unwrap();
     println!("Temporary image dir: {}", temp_dir.path().to_string_lossy());
@@ -827,6 +1297,7 @@ pub async fn test_image_url_inference_with_provider_filesystem(provider: E2ETest
         },
         &format!(
             r#"
+        gateway.fetch_and_encode_input_files_before_inference = true
         [object_storage]
         type = "filesystem"
         path = "{}"
@@ -1081,7 +1552,10 @@ pub async fn test_image_inference_with_provider_s3_compatible(
         Err(object_store::Error::NotFound { .. }) => {
             // Expected - object should not exist
         }
-        _ => {
+        Err(e) => {
+            panic!("Unexpected error: {e}");
+        }
+        Ok(_) => {
             panic!("Object should not exist after deletion");
         }
     }
@@ -1123,6 +1597,8 @@ async fn make_temp_image_server() -> (SocketAddr, tokio::sync::oneshot::Sender<(
         let _ = recv.await;
     };
 
+    // TODO(https://github.com/tensorzero/tensorzero/issues/3983): Audit this callsite
+    #[expect(clippy::disallowed_methods)]
     tokio::spawn(
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_fut)
@@ -1143,7 +1619,7 @@ pub async fn test_url_image_inference_with_provider_and_store(
     let (server_addr, _shutdown_sender) = make_temp_image_server().await;
     let image_url = Url::parse(&format!("http://{server_addr}/ferris.png")).unwrap();
 
-    let client = make_embedded_gateway_with_config(config_toml).await;
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(config_toml).await;
 
     for should_be_cached in [false, true] {
         let response = client
@@ -1158,10 +1634,10 @@ pub async fn test_url_image_inference_with_provider_and_store(
                             ClientInputMessageContent::Text(TextKind::Text {
                                 text: "Describe the contents of the image".to_string(),
                             }),
-                            ClientInputMessageContent::File(File::Url {
+                            ClientInputMessageContent::File(File::Url(UrlFile {
                                 url: image_url.clone(),
                                 mime_type: None,
-                            }),
+                            })),
                         ],
                     }],
                 },
@@ -1202,7 +1678,7 @@ pub async fn test_base64_pdf_inference_with_provider_and_store(
 
     let pdf_data = BASE64_STANDARD.encode(DEEPSEEK_PAPER_PDF);
 
-    let client = make_embedded_gateway_with_config(config_toml).await;
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(config_toml).await;
     let mut storage_path = None;
 
     for should_be_cached in [false, true] {
@@ -1219,10 +1695,11 @@ pub async fn test_base64_pdf_inference_with_provider_and_store(
                             ClientInputMessageContent::Text(TextKind::Text {
                                 text: "Describe the contents of the PDF".to_string(),
                             }),
-                            ClientInputMessageContent::File(File::Base64 {
+                            ClientInputMessageContent::File(File::Base64(Base64File {
+                                source_url: None,
                                 mime_type: mime::APPLICATION_PDF,
                                 data: pdf_data.clone(),
-                            }),
+                            })),
                         ],
                     }],
                 },
@@ -1264,7 +1741,7 @@ pub async fn test_base64_image_inference_with_provider_and_store(
 
     let image_data = BASE64_STANDARD.encode(FERRIS_PNG);
 
-    let client = make_embedded_gateway_with_config(config_toml).await;
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(config_toml).await;
     let mut storage_path = None;
 
     let mut params = ClientInferenceParams {
@@ -1279,10 +1756,11 @@ pub async fn test_base64_image_inference_with_provider_and_store(
                     ClientInputMessageContent::Text(TextKind::Text {
                         text: "Describe the contents of the image".to_string(),
                     }),
-                    ClientInputMessageContent::File(File::Base64 {
+                    ClientInputMessageContent::File(File::Base64(Base64File {
+                        source_url: None,
                         mime_type: mime::IMAGE_PNG,
                         data: image_data.clone(),
-                    }),
+                    })),
                 ],
             }],
         },
@@ -1338,10 +1816,12 @@ pub async fn test_base64_image_inference_with_provider_and_store(
 
     let updated_base64 = BASE64_STANDARD.encode(updated_image.into_inner());
 
-    params.input.messages[0].content[1] = ClientInputMessageContent::File(File::Base64 {
-        mime_type: mime::IMAGE_PNG,
-        data: updated_base64,
-    });
+    params.input.messages[0].content[1] =
+        ClientInputMessageContent::File(File::Base64(Base64File {
+            source_url: None,
+            mime_type: mime::IMAGE_PNG,
+            data: updated_base64,
+        }));
 
     let response = client.inference(params.clone()).await.unwrap();
 
@@ -1754,7 +2234,7 @@ pub async fn test_bad_auth_extra_headers_with_provider_and_stream(
             res["error"]
                 .as_str()
                 .unwrap()
-                .contains(format!("Error from {} server", provider.model_provider_name).as_str()),
+                .contains(format!("from {} server", provider.model_provider_name).as_str()),
             "Missing provider type in error: {res}"
         );
     }
@@ -1852,7 +2332,12 @@ pub async fn test_bad_auth_extra_headers_with_provider_and_stream(
                     || res["error"]
                         .as_str()
                         .unwrap()
-                        .contains("No auth credentials found"),
+                        .contains("No auth credentials found")
+                    || res["error"]
+                        .as_str()
+                        .unwrap()
+                        .to_lowercase()
+                        .contains("no cookie auth"),
                 "Unexpected error: {res}"
             );
         }
@@ -1891,7 +2376,7 @@ pub async fn test_bad_auth_extra_headers_with_provider_and_stream(
         }
     }
 
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[traced_test]
@@ -1903,19 +2388,23 @@ pub async fn test_warn_ignored_thought_block_with_provider(provider: E2ETestProv
         return;
     }
 
-    let client = make_embedded_gateway().await;
-    client
+    let client = tensorzero::test_helpers::make_embedded_gateway().await;
+    let res = client
         .inference(ClientInferenceParams {
             function_name: Some("basic_test".to_string()),
-            variant_name: Some(provider.variant_name),
+            variant_name: Some(provider.variant_name.clone()),
             input: ClientInput {
-                system: Some(serde_json::json!({"assistant_name": "Dr. Mehta"})),
+                system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                    "assistant_name".to_string(),
+                    "Dr. Mehta".into(),
+                )])))),
                 messages: vec![
                     ClientInputMessage {
                         role: Role::Assistant,
                         content: vec![ClientInputMessageContent::Thought(Thought {
                             text: Some("My TensorZero thought".to_string()),
-                            signature: Some("My TensorZero signature".to_string()),
+                            signature: Some("My new TensorZero signature".to_string()),
+                            summary: None,
                             provider_type: None,
                         })],
                     },
@@ -1930,8 +2419,19 @@ pub async fn test_warn_ignored_thought_block_with_provider(provider: E2ETestProv
             extra_headers: get_extra_headers(),
             ..Default::default()
         })
-        .await
-        .unwrap();
+        .await;
+
+    if "anthropic" == provider.model_provider_name.as_str() {
+        // Anthropic rejects requests with invalid thought signatures
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("signature"));
+    } else if "openai-responses" == provider.variant_name.as_str() {
+        // OpenAI Responses rejects requests with invalid thought signatures
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("signature"));
+    } else {
+        let _ = res.unwrap();
+    }
 
     if ["anthropic", "aws-bedrock"].contains(&provider.model_provider_name.as_str()) {
         assert!(
@@ -2096,13 +2596,11 @@ pub async fn check_base64_pdf_response(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "value": "Describe the contents of the PDF"},
+                    {"type": "text", "text": "Describe the contents of the PDF"},
                     {
                         "type": "file",
-                        "file": {
-                            "url": null,
-                            "mime_type": "application/pdf",
-                        },
+                        "source_url": null,
+                        "mime_type": "application/pdf",
                         "storage_path": {
                             "kind": kind_json,
                             "path": format!("{prefix}observability/files/3e127d9a726f6be0fd81d73ccea97d96ec99419f59650e01d49183cd3be999ef.pdf"),
@@ -2139,13 +2637,11 @@ pub async fn check_base64_pdf_response(
                 StoredContentBlock::Text(Text {
                     text: "Describe the contents of the PDF".to_string(),
                 }),
-                StoredContentBlock::File(Box::new(StoredFile {
-                    file: Base64FileMetadata {
-                        url: None,
-                        mime_type: mime::APPLICATION_PDF,
-                    },
+                StoredContentBlock::File(Box::new(StoredFile(ObjectStoragePointer {
+                    source_url: None,
+                    mime_type: mime::APPLICATION_PDF,
                     storage_path: expected_storage_path.clone(),
-                }))
+                },)))
             ]
         },]
     );
@@ -2251,13 +2747,11 @@ pub async fn check_base64_image_response(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "value": "Describe the contents of the image"},
+                    {"type": "text", "text": "Describe the contents of the image"},
                     {
                         "type": "file",
-                        "file": {
-                            "url": null,
-                            "mime_type": "image/png",
-                        },
+                        "source_url": null,
+                        "mime_type": "image/png",
                         "storage_path": {
                             "kind": kind_json,
                             "path": format!("{prefix}observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"),
@@ -2294,13 +2788,11 @@ pub async fn check_base64_image_response(
                 StoredContentBlock::Text(Text {
                     text: "Describe the contents of the image".to_string(),
                 }),
-                StoredContentBlock::File(Box::new(StoredFile {
-                    file: Base64FileMetadata {
-                        url: None,
-                        mime_type: mime::IMAGE_PNG,
-                    },
+                StoredContentBlock::File(Box::new(StoredFile(ObjectStoragePointer {
+                    source_url: None,
+                    mime_type: mime::IMAGE_PNG,
                     storage_path: expected_storage_path.clone(),
-                }))
+                },)))
             ]
         },]
     );
@@ -2406,13 +2898,11 @@ pub async fn check_url_image_response(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "value": "Describe the contents of the image"},
+                    {"type": "text", "text": "Describe the contents of the image"},
                     {
                         "type": "file",
-                        "file": {
-                            "url": image_url.to_string(),
-                            "mime_type": "image/png",
-                        },
+                        "source_url": image_url.to_string(),
+                        "mime_type": "image/png",
                         "storage_path": {
                             "kind": kind_json,
                             "path": "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"
@@ -2443,16 +2933,16 @@ pub async fn check_url_image_response(
                 role: Role::User,
                 content: vec![StoredContentBlock::Text(Text {
                     text: "Describe the contents of the image".to_string(),
-                }), StoredContentBlock::File(Box::new(StoredFile {
-                    file: Base64FileMetadata {
-                        url: Some(image_url.clone()),
+                }), StoredContentBlock::File(Box::new(StoredFile(
+                    ObjectStoragePointer {
+                        source_url: Some(image_url.clone()),
                         mime_type: mime::IMAGE_PNG,
+                        storage_path: StoragePath {
+                            kind: kind.clone(),
+                            path: Path::parse("observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png").unwrap(),
+                        },
                     },
-                    storage_path: StoragePath {
-                        kind: kind.clone(),
-                        path: Path::parse("observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png").unwrap(),
-                    }
-                }))]
+                )))]
             },
         ]
     );
@@ -2526,13 +3016,15 @@ pub async fn check_simple_inference_response(
         assert!(input_tokens > 0);
         assert!(output_tokens > 0);
     }
-    let finish_reason = response_json
-        .get("finish_reason")
-        .unwrap()
-        .as_str()
-        .unwrap();
-    // Some providers return "stop" and others return "length"
-    assert!(finish_reason == "stop" || finish_reason == "length");
+    if provider.variant_name != "openai-responses" {
+        let finish_reason = response_json
+            .get("finish_reason")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        // Some providers return "stop" and others return "length"
+        assert!(finish_reason == "stop" || finish_reason == "length");
+    }
 
     // Sleep to allow time for data to be inserted into ClickHouse (trailing writes from API)
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2568,7 +3060,7 @@ pub async fn check_simple_inference_response(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the name of the capital city of Japan?"}]
+                "content": [{"type": "text", "text": "What is the name of the capital city of Japan?"}]
             }
         ]
     });
@@ -2657,18 +3149,18 @@ pub async fn check_simple_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let mut output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let mut output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     // Some providers always produce thought blocks - we don't care about them in this test
-    output.retain(|c| !matches!(c, ContentBlock::Thought(_)));
+    output.retain(|c| !matches!(c, StoredContentBlock::Thought(_)));
     assert_eq!(output.len(), 1);
 
     if !is_batch {
@@ -2773,13 +3265,11 @@ pub async fn check_simple_image_inference_response(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "value": "What kind of animal is in this image?"},
+                    {"type": "text", "text": "What kind of animal is in this image?"},
                     {
                         "type": "file",
-                        "file": {
-                            "url": "https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png",
-                            "mime_type": "image/png",
-                        },
+                        "source_url": "https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png",
+                        "mime_type": "image/png",
                         "storage_path": {
                             "kind": {"type": "disabled"},
                             "path": "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"
@@ -2863,7 +3353,7 @@ pub async fn check_simple_image_inference_response(
         output.to_lowercase().contains("crab"),
         "Unexpected output: {output}",
     );
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
 
     if !is_batch {
@@ -2933,7 +3423,7 @@ pub async fn test_streaming_invalid_request_with_provider(provider: E2ETestProvi
         let reqwest_eventsource::Error::InvalidStatusCode(code, resp) = err else {
             panic!("Unexpected error: {err:?}")
         };
-        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
         let resp: Value = resp.json().await.unwrap();
         let err_msg = resp.get("error").unwrap().as_str().unwrap();
         assert!(
@@ -3154,7 +3644,7 @@ pub async fn test_simple_streaming_inference_request_with_provider_cache(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the name of the capital city of Japan?"}]
+                "content": [{"type": "text", "text": "What is the name of the capital city of Japan?"}]
             }
         ]
     });
@@ -3252,18 +3742,18 @@ pub async fn test_simple_streaming_inference_request_with_provider_cache(
         format!("You are a helpful and friendly assistant named Dr. Mehta #{seed}")
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let mut output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let mut output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     // Some providers always produce thought blocks - we don't care about them in this test
-    output.retain(|c| !matches!(c, ContentBlock::Thought(_)));
+    output.retain(|c| !matches!(c, StoredContentBlock::Thought(_)));
     assert_eq!(output.len(), 1);
 
     // Check the InferenceTag Table
@@ -3505,16 +3995,16 @@ pub async fn check_inference_params_response(
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
 }
 
@@ -3661,7 +4151,7 @@ pub async fn test_inference_params_streaming_inference_request_with_provider(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the name of the capital city of Japan?"}]
+                "content": [{"type": "text", "text": "What is the name of the capital city of Japan?"}]
             }
         ]
     });
@@ -3774,16 +4264,16 @@ pub async fn test_inference_params_streaming_inference_request_with_provider(
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
 }
 
@@ -3929,7 +4419,7 @@ pub async fn check_tool_use_tool_choice_auto_used_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
                 }
             ]
         }
@@ -4033,8 +4523,8 @@ pub async fn check_tool_use_tool_choice_auto_used_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -4044,10 +4534,10 @@ pub async fn check_tool_use_tool_choice_auto_used_inference_response(
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert exactly one tool call
@@ -4055,7 +4545,7 @@ pub async fn check_tool_use_tool_choice_auto_used_inference_response(
 
     let tool_call_block = tool_call_blocks[0];
     match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
+        StoredContentBlock::ToolCall(tool_call) => {
             assert_eq!(tool_call.name, "get_temperature");
             let arguments =
                 serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
@@ -4246,7 +4736,7 @@ pub async fn test_tool_use_tool_choice_auto_used_streaming_inference_request_wit
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
                 }
             ]
         }
@@ -4394,8 +4884,8 @@ pub async fn test_tool_use_tool_choice_auto_used_streaming_inference_request_wit
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -4405,10 +4895,10 @@ pub async fn test_tool_use_tool_choice_auto_used_streaming_inference_request_wit
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert exactly one tool call
@@ -4416,7 +4906,7 @@ pub async fn test_tool_use_tool_choice_auto_used_streaming_inference_request_wit
 
     let tool_call_block = tool_call_blocks[0];
     match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
+        StoredContentBlock::ToolCall(tool_call) => {
             assert_eq!(tool_call.name, "get_temperature");
             let arguments =
                 serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
@@ -4483,6 +4973,7 @@ pub async fn check_tool_use_tool_choice_auto_unused_inference_response(
 ) {
     let inference_id = response_json.get("inference_id").unwrap().as_str().unwrap();
     let inference_id = Uuid::parse_str(inference_id).unwrap();
+    let content = response_json.get("content").unwrap().as_array().unwrap();
 
     if let Some(episode_id) = episode_id {
         let episode_id_response = response_json.get("episode_id").unwrap().as_str().unwrap();
@@ -4492,15 +4983,6 @@ pub async fn check_tool_use_tool_choice_auto_unused_inference_response(
 
     let variant_name = response_json.get("variant_name").unwrap().as_str().unwrap();
     assert_eq!(variant_name, provider.variant_name);
-
-    let content = response_json.get("content").unwrap().as_array().unwrap();
-    assert!(!content.iter().any(|block| block["type"] == "tool_call"));
-    let content_block = content
-        .iter()
-        .find(|block| block["type"] == "text")
-        .unwrap();
-    let content_block_text = content_block.get("text").unwrap().as_str().unwrap();
-    assert!(content_block_text.to_lowercase().contains("mehta"));
 
     let usage = response_json.get("usage").unwrap();
     let usage = usage.as_object().unwrap();
@@ -4546,7 +5028,7 @@ pub async fn check_tool_use_tool_choice_auto_unused_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is your name?"}]
+                    "content": [{"type": "text", "text": "What is your name?"}]
                 }
             ]
         }
@@ -4665,24 +5147,34 @@ pub async fn check_tool_use_tool_choice_auto_unused_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is your name?".to_string().into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is your name?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let mut output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let mut output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     // We don't care about thoughts in this test
-    output.retain(|block| !matches!(block, ContentBlock::Thought(_)));
+    output.retain(|block| !matches!(block, StoredContentBlock::Thought(_)));
 
     let first = output.first().unwrap();
     match first {
-        ContentBlock::Text(_text) => {}
+        StoredContentBlock::Text(_text) => {}
         _ => {
             panic!("Expected a text block, got {first:?}");
         }
     }
+
+    assert!(!content.iter().any(|block| block["type"] == "tool_call"));
+    let content_block = content
+        .iter()
+        .find(|block| block["type"] == "text")
+        .unwrap();
+    let content_block_text = content_block.get("text").unwrap().as_str().unwrap();
+    assert!(content_block_text.to_lowercase().contains("mehta"));
 }
 
 /// This test is similar to `test_tool_use_tool_choice_auto_used_streaming_inference_request_with_provider`, but it steers the model to not use the tool.
@@ -4832,7 +5324,7 @@ pub async fn test_tool_use_tool_choice_auto_unused_streaming_inference_request_w
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is your name?"}]
+                    "content": [{"type": "text", "text": "What is your name?"}]
                 }
             ]
         }
@@ -4965,20 +5457,22 @@ pub async fn test_tool_use_tool_choice_auto_unused_streaming_inference_request_w
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is your name?".to_string().into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is your name?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let mut output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let mut output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     // We don't care about thoughts in this test
-    output.retain(|block| !matches!(block, ContentBlock::Thought(_)));
+    output.retain(|block| !matches!(block, StoredContentBlock::Thought(_)));
 
     let first = output.first().unwrap();
     match first {
-        ContentBlock::Text(_text) => {}
+        StoredContentBlock::Text(_text) => {}
         _ => {
             panic!("Expected a text block, got {first:?}");
         }
@@ -5145,7 +5639,7 @@ pub async fn check_tool_use_tool_choice_required_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is your name?"}]
+                    "content": [{"type": "text", "text": "What is your name?"}]
                 }
             ]
         }
@@ -5250,29 +5744,35 @@ pub async fn check_tool_use_tool_choice_required_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is your name?".to_string().into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is your name?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
-    // Assert exactly one tool call
-    assert_eq!(tool_call_blocks.len(), 1, "Expected exactly one tool call");
+    // Assert at least one tool call
+    assert!(
+        !tool_call_blocks.is_empty(),
+        "Expected at least one tool call"
+    );
 
-    let tool_call_block = tool_call_blocks[0];
-    match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
-            assert_eq!(tool_call.name, "get_temperature");
-            serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
+    for tool_call_block in tool_call_blocks {
+        match tool_call_block {
+            StoredContentBlock::ToolCall(tool_call) => {
+                assert_eq!(tool_call.name, "get_temperature");
+                serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
+            }
+            _ => panic!("Unreachable"),
         }
-        _ => panic!("Unreachable"),
     }
 }
 
@@ -5281,10 +5781,12 @@ pub async fn test_tool_use_tool_choice_required_streaming_inference_request_with
 ) {
     // Azure, Together, and SGLang don't support `tool_choice: "required"`
     // Groq says they support it, but it doesn't return the required tool as expected
+    // Fireworks returns trash.
     if provider.model_provider_name == "azure"
         || provider.model_provider_name == "together"
         || provider.model_provider_name == "sglang"
         || provider.model_provider_name == "groq"
+        || provider.model_provider_name == "fireworks"
     {
         return;
     }
@@ -5455,7 +5957,7 @@ pub async fn test_tool_use_tool_choice_required_streaming_inference_request_with
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is your name?"}]
+                    "content": [{"type": "text", "text": "What is your name?"}]
                 }
             ]
         }
@@ -5600,17 +6102,19 @@ pub async fn test_tool_use_tool_choice_required_streaming_inference_request_with
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is your name?".to_string().into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is your name?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert at least one tool call
@@ -5621,7 +6125,7 @@ pub async fn test_tool_use_tool_choice_required_streaming_inference_request_with
 
     for tool_call_block in tool_call_blocks {
         match tool_call_block {
-            ContentBlock::ToolCall(tool_call) => {
+            StoredContentBlock::ToolCall(tool_call) => {
                 assert_eq!(tool_call.name, "get_temperature");
                 serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
             }
@@ -5765,7 +6269,7 @@ pub async fn check_tool_use_tool_choice_none_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
                 }
             ]
         }
@@ -5867,8 +6371,8 @@ pub async fn check_tool_use_tool_choice_none_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -5878,10 +6382,10 @@ pub async fn check_tool_use_tool_choice_none_inference_response(
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let first = output.first().unwrap();
     match first {
-        ContentBlock::Text(_) | ContentBlock::Unknown { .. } => {}
+        StoredContentBlock::Text(_) | StoredContentBlock::Unknown { .. } => {}
         _ => {
             panic!("Expected a text or unknown block, got {first:?}");
         }
@@ -6042,7 +6546,7 @@ pub async fn test_tool_use_tool_choice_none_streaming_inference_request_with_pro
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
                 }
             ]
         }
@@ -6171,8 +6675,8 @@ pub async fn test_tool_use_tool_choice_none_streaming_inference_request_with_pro
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -6182,10 +6686,10 @@ pub async fn test_tool_use_tool_choice_none_streaming_inference_request_with_pro
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let first = output.first().unwrap();
     match first {
-        ContentBlock::Text(_text) => {}
+        StoredContentBlock::Text(_text) => {}
         _ => {
             panic!("Expected a text block, got {first:?}");
         }
@@ -6358,7 +6862,7 @@ pub async fn check_tool_use_tool_choice_specific_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the temperature like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                    "content": [{"type": "text", "text": "What is the temperature like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
                 }
             ]
         }
@@ -6492,8 +6996,8 @@ pub async fn check_tool_use_tool_choice_specific_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What is the temperature like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -6503,22 +7007,25 @@ pub async fn check_tool_use_tool_choice_specific_inference_response(
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert at most one tool call (a model could decide to call no tools if to reads the `self_destruct` description).
-    assert!(
-        tool_call_blocks.len() <= 1,
-        "Expected at most one tool call, found {}",
-        tool_call_blocks.len()
-    );
+    // Sglang likes to emit lots of tool calls
+    if provider.model_provider_name != "sglang" {
+        assert!(
+            tool_call_blocks.len() <= 1,
+            "Expected at most one tool call, found {}",
+            tool_call_blocks.len()
+        );
+    }
 
     let tool_call_block = tool_call_blocks.first();
     match tool_call_block {
-        Some(ContentBlock::ToolCall(tool_call)) => {
+        Some(StoredContentBlock::ToolCall(tool_call)) => {
             // Don't check which tool was called, as xAI can sometimes call a tool other than `self_destruct`.
             serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
         }
@@ -6643,10 +7150,19 @@ pub async fn test_tool_use_tool_choice_specific_streaming_inference_request_with
                     let block_tool_id = block.get("id").unwrap().as_str().unwrap();
                     match &tool_id {
                         None => tool_id = Some(block_tool_id.to_string()),
-                        Some(tool_id) => assert_eq!(
-                            tool_id, block_tool_id,
-                            "Provider returned multiple tool calls"
-                        ),
+                        Some(tool_id) => {
+                            if provider.model_provider_name == "sglang" {
+                                // Sglang likes to emit lots of duplicate tool calls
+                                if tool_id != block_tool_id {
+                                    continue;
+                                }
+                            } else {
+                                assert_eq!(
+                                    tool_id, block_tool_id,
+                                    "Provider returned multiple tool calls"
+                                );
+                            }
+                        }
                     }
 
                     let chunk_arguments = block.get("raw_arguments").unwrap().as_str().unwrap();
@@ -6724,7 +7240,7 @@ pub async fn test_tool_use_tool_choice_specific_streaming_inference_request_with
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": prompt}]
+                    "content": [{"type": "text", "text": prompt}]
                 }
             ]
         }
@@ -6737,7 +7253,7 @@ pub async fn test_tool_use_tool_choice_specific_streaming_inference_request_with
     assert!(!output_clickhouse.is_empty()); // could be > 1 if the model returns text as well
     let content_block = output_clickhouse
         .iter()
-        .find(|block| (block.get("type").and_then(Value::as_str) == Some("tool_call")))
+        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_call"))
         .expect("No tool_call content block found in ClickHouse output");
     // The type check is implicitly handled by the find operation above.
     assert_eq!(content_block.get("id").unwrap().as_str().unwrap(), tool_id);
@@ -6903,29 +7419,32 @@ pub async fn test_tool_use_tool_choice_specific_streaming_inference_request_with
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![prompt.into()],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert at most one tool call (a model could decide to call no tools if to reads the `self_destruct` description).
-    assert!(
-        tool_call_blocks.len() <= 1,
-        "Expected at most one tool call, found {}",
-        tool_call_blocks.len()
-    );
+    // Sglang likes to emit lots of tool calls
+    if provider.model_provider_name != "sglang" {
+        assert!(
+            tool_call_blocks.len() <= 1,
+            "Expected at most one tool call, found {}",
+            tool_call_blocks.len()
+        );
+    }
 
     let tool_call_block = tool_call_blocks.first();
     match tool_call_block {
-        Some(ContentBlock::ToolCall(tool_call)) => {
+        Some(StoredContentBlock::ToolCall(tool_call)) => {
             // Don't check which tool was called, as xAI can sometimes call a tool other than `self_destruct`.
             serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
         }
@@ -7077,7 +7596,7 @@ pub async fn check_tool_use_tool_choice_allowed_tools_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What can you tell me about the weather in Tokyo (e.g. temperature, humidity, wind)? Use the provided tools and return what you can (not necessarily everything)."}]
+                    "content": [{"type": "text", "text": "What can you tell me about the weather in Tokyo (e.g. temperature, humidity, wind)? Use the provided tools and return what you can (not necessarily everything)."}]
                 }
             ]
         }
@@ -7166,8 +7685,8 @@ pub async fn check_tool_use_tool_choice_allowed_tools_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What can you tell me about the weather in Tokyo (e.g. temperature, humidity, wind)? Use the provided tools and return what you can (not necessarily everything)."
@@ -7177,22 +7696,31 @@ pub async fn check_tool_use_tool_choice_allowed_tools_inference_response(
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
-    // Assert exactly one tool call
-    assert_eq!(tool_call_blocks.len(), 1, "Expected exactly one tool call");
+    if provider.model_provider_name == "sglang" {
+        // Sglang likes to emit lots of duplicate tool calls
+        assert!(
+            !tool_call_blocks.is_empty(),
+            "Expected at least one tool call"
+        );
+    } else {
+        // Assert exactly one tool call
+        assert_eq!(tool_call_blocks.len(), 1, "Expected exactly one tool call");
+    }
 
-    let tool_call_block = tool_call_blocks[0];
-    match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
-            assert_eq!(tool_call.name, "get_humidity");
-            serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
+    for tool_call_block in tool_call_blocks {
+        match tool_call_block {
+            StoredContentBlock::ToolCall(tool_call) => {
+                assert_eq!(tool_call.name, "get_humidity");
+                serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
+            }
+            _ => panic!("Unreachable"),
         }
-        _ => panic!("Unreachable"),
     }
 }
 
@@ -7289,10 +7817,13 @@ pub async fn test_tool_use_allowed_tools_streaming_inference_request_with_provid
                     if let Some(block_raw_name) = block.get("raw_name") {
                         match tool_name {
                             Some(_) => {
-                                assert!(
-                                    block_raw_name.as_str().unwrap().is_empty(),
-                                    "Raw name already seen, got {block:#?}"
-                                );
+                                // Sglang likes to emit lots of duplicate tool calls
+                                if provider.model_provider_name != "sglang" {
+                                    assert!(
+                                        block_raw_name.as_str().unwrap().is_empty(),
+                                        "Raw name already seen, got {block:#?}"
+                                    );
+                                }
                             }
                             None => {
                                 tool_name = Some(block_raw_name.as_str().unwrap().to_string());
@@ -7303,7 +7834,16 @@ pub async fn test_tool_use_allowed_tools_streaming_inference_request_with_provid
                     let block_tool_id = block.get("id").unwrap().as_str().unwrap();
                     match &tool_id {
                         None => tool_id = Some(block_tool_id.to_string()),
-                        Some(tool_id) => assert_eq!(tool_id, block_tool_id),
+                        Some(tool_id) => {
+                            if provider.model_provider_name == "sglang" {
+                                // Sglang likes to emit lots of duplicate tool calls
+                                if tool_id != block_tool_id {
+                                    continue;
+                                }
+                            } else {
+                                assert_eq!(tool_id, block_tool_id);
+                            }
+                        }
                     }
 
                     let chunk_arguments = block.get("raw_arguments").unwrap().as_str().unwrap();
@@ -7381,7 +7921,7 @@ pub async fn test_tool_use_allowed_tools_streaming_inference_request_with_provid
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What can you tell me about the weather in Tokyo (e.g. temperature, humidity, wind)? Use the provided tools and return what you can (not necessarily everything)."}]
+                    "content": [{"type": "text", "text": "What can you tell me about the weather in Tokyo (e.g. temperature, humidity, wind)? Use the provided tools and return what you can (not necessarily everything)."}]
                 }
             ]
         }
@@ -7518,8 +8058,8 @@ pub async fn test_tool_use_allowed_tools_streaming_inference_request_with_provid
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
         content: vec![
             "What can you tell me about the weather in Tokyo (e.g. temperature, humidity, wind)? Use the provided tools and return what you can (not necessarily everything)."
@@ -7529,22 +8069,31 @@ pub async fn test_tool_use_allowed_tools_streaming_inference_request_with_provid
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
-    // Assert exactly one tool call
-    assert_eq!(tool_call_blocks.len(), 1, "Expected exactly one tool call");
+    // Sglang likes to emit lots of tool calls
+    if provider.model_provider_name == "sglang" {
+        assert!(
+            !tool_call_blocks.is_empty(),
+            "Expected at least one tool call"
+        );
+    } else {
+        // Assert exactly one tool call
+        assert_eq!(tool_call_blocks.len(), 1, "Expected exactly one tool call");
+    }
 
-    let tool_call_block = tool_call_blocks[0];
-    match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
-            assert_eq!(tool_call.name, "get_humidity");
-            serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
+    for tool_call_block in tool_call_blocks {
+        match tool_call_block {
+            StoredContentBlock::ToolCall(tool_call) => {
+                assert_eq!(tool_call.name, "get_humidity");
+                serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
+            }
+            _ => panic!("Unreachable"),
         }
-        _ => panic!("Unreachable"),
     }
 }
 
@@ -7679,7 +8228,7 @@ pub async fn check_tool_use_multi_turn_inference_response(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
             },
             {
                 "role": "assistant",
@@ -7773,9 +8322,9 @@ pub async fn check_tool_use_multi_turn_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
     let expected_input_messages = vec![
-        RequestMessage {
+        StoredRequestMessage {
             role: Role::User,
             content: vec![
                 "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -7783,17 +8332,17 @@ pub async fn check_tool_use_multi_turn_inference_response(
                     .into(),
             ],
         },
-        RequestMessage {
+        StoredRequestMessage {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![StoredContentBlock::ToolCall(ToolCall {
                 id: "123456789".to_string(),
                 name: "get_temperature".to_string(),
                 arguments: "{\"location\":\"Tokyo\",\"units\":\"celsius\"}".to_string(),
             })],
         },
-        RequestMessage {
+        StoredRequestMessage {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![StoredContentBlock::ToolResult(ToolResult {
                 id: "123456789".to_string(),
                 name: "get_temperature".to_string(),
                 result: "70".to_string(),
@@ -7802,11 +8351,11 @@ pub async fn check_tool_use_multi_turn_inference_response(
     ];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
     let first = output.first().unwrap();
     match first {
-        ContentBlock::Text(text) => {
+        StoredContentBlock::Text(text) => {
             assert!(text.text.to_lowercase().contains("tokyo"));
         }
         _ => {
@@ -7977,7 +8526,7 @@ pub async fn test_tool_multi_turn_streaming_inference_request_with_provider(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
+                "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."}]
             },
             {
                 "role": "assistant",
@@ -8089,9 +8638,9 @@ pub async fn test_tool_multi_turn_streaming_inference_request_with_provider(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with the tool call. Use the \"get_temperature\" tool.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
     let expected_input_messages = vec![
-        RequestMessage {
+        StoredRequestMessage {
             role: Role::User,
             content: vec![
                 "What is the weather like in Tokyo (in Celsius)? Use the `get_temperature` tool."
@@ -8099,17 +8648,17 @@ pub async fn test_tool_multi_turn_streaming_inference_request_with_provider(
                     .into(),
             ],
         },
-        RequestMessage {
+        StoredRequestMessage {
             role: Role::Assistant,
-            content: vec![ContentBlock::ToolCall(ToolCall {
+            content: vec![StoredContentBlock::ToolCall(ToolCall {
                 id: "123456789".to_string(),
                 name: "get_temperature".to_string(),
                 arguments: "{\"location\":\"Tokyo\",\"units\":\"celsius\"}".to_string(),
             })],
         },
-        RequestMessage {
+        StoredRequestMessage {
             role: Role::User,
-            content: vec![ContentBlock::ToolResult(ToolResult {
+            content: vec![StoredContentBlock::ToolResult(ToolResult {
                 id: "123456789".to_string(),
                 name: "get_temperature".to_string(),
                 result: "30".to_string(),
@@ -8118,11 +8667,11 @@ pub async fn test_tool_multi_turn_streaming_inference_request_with_provider(
     ];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
     let first = output.first().unwrap();
     match first {
-        ContentBlock::Text(text) => {
+        StoredContentBlock::Text(text) => {
             assert!(text.text.to_lowercase().contains("tokyo"));
         }
         _ => {
@@ -8135,6 +8684,10 @@ pub async fn test_stop_sequences_inference_request_with_provider(
     provider: E2ETestProvider,
     client: &tensorzero::Client,
 ) {
+    // OpenAI Responses doesn't support stop sequences
+    if provider.variant_name == "openai-responses" {
+        return;
+    }
     let episode_id = Uuid::now_v7();
     let extra_headers = get_extra_headers();
 
@@ -8145,7 +8698,10 @@ pub async fn test_stop_sequences_inference_request_with_provider(
             variant_name: Some(provider.variant_name.clone()),
             episode_id: Some(episode_id),
             input: tensorzero::ClientInput {
-                system: Some(json!({"assistant_name": "Dr. Mehta"})),
+                system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                    "assistant_name".to_string(),
+                    "Dr. Mehta".into(),
+                )])))),
                 messages: vec![tensorzero::ClientInputMessage {
                     role: Role::User,
                     content: vec![tensorzero::ClientInputMessageContent::Text(
@@ -8266,7 +8822,10 @@ pub async fn test_dynamic_tool_use_inference_request_with_provider(
         episode_id: Some(episode_id),
         extra_headers: get_extra_headers(),
         input: tensorzero::ClientInput {
-            system: Some(json!({"assistant_name": "Dr. Mehta"})),
+            system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                "assistant_name".to_string(),
+                "Dr. Mehta".into(),
+            )])))),
             messages: vec![tensorzero::ClientInputMessage {
                 role: Role::User,
                 content: vec![
@@ -8427,7 +8986,7 @@ pub async fn check_dynamic_tool_use_inference_response(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."}]
                 }
             ]
         }
@@ -8530,19 +9089,18 @@ pub async fn check_dynamic_tool_use_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text { text: "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."
+            .to_string() })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert exactly one tool call
@@ -8550,7 +9108,7 @@ pub async fn check_dynamic_tool_use_inference_response(
 
     let tool_call_block = tool_call_blocks[0];
     match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
+        StoredContentBlock::ToolCall(tool_call) => {
             assert_eq!(tool_call.name, "get_temperature");
             serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
         }
@@ -8572,7 +9130,10 @@ pub async fn test_dynamic_tool_use_streaming_inference_request_with_provider(
         variant_name: Some(provider.variant_name.clone()),
         episode_id: Some(episode_id),
         input: tensorzero::ClientInput {
-            system: Some(json!({"assistant_name": "Dr. Mehta"})),
+            system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                "assistant_name".to_string(),
+                "Dr. Mehta".into(),
+            )])))),
             messages: vec![tensorzero::ClientInputMessage {
                 role: Role::User,
                 content: vec![tensorzero::ClientInputMessageContent::Text(TextKind::Text { text: "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function.".to_string() })],
@@ -8744,7 +9305,7 @@ pub async fn test_dynamic_tool_use_streaming_inference_request_with_provider(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."}]
                 }
             ]
         }
@@ -8892,19 +9453,18 @@ pub async fn test_dynamic_tool_use_streaming_inference_request_with_provider(
         "You are a helpful and friendly assistant named Dr. Mehta"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text { text: "What is the weather like in Tokyo (in Celsius)? Use the provided `get_temperature` tool. Do not say anything else, just call the function."
+            .to_string() })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     let tool_call_blocks: Vec<_> = output
         .iter()
-        .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+        .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
         .collect();
 
     // Assert exactly one tool call
@@ -8912,7 +9472,7 @@ pub async fn test_dynamic_tool_use_streaming_inference_request_with_provider(
 
     let tool_call_block = tool_call_blocks[0];
     match tool_call_block {
-        ContentBlock::ToolCall(tool_call) => {
+        StoredContentBlock::ToolCall(tool_call) => {
             assert_eq!(tool_call.name, "get_temperature");
             serde_json::from_str::<Value>(&tool_call.arguments.to_lowercase()).unwrap();
         }
@@ -9096,7 +9656,7 @@ pub async fn check_parallel_tool_use_inference_response(
                     "role": "user",
                     "content": [{
                         "type": "text",
-                        "value": "What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."
+                        "text": "What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."
                     }]
                 }
             ]
@@ -9233,24 +9793,24 @@ pub async fn check_parallel_tool_use_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with two tool calls. Use BOTH the \"get_temperature\" and \"get_humidity\" tools.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit with 50% humidity.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text { text: "What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."
+            .to_string() })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
 
     let is_openrouter = provider.model_provider_name == "openrouter";
-    if is_openrouter {
-        // For OpenRouter, check that there are at least 2 tool calls
-        // (OpenRouter may include an empty text block)
+    let is_groq = provider.model_provider_name == "groq";
+    if is_openrouter || is_groq {
+        // For Groq and OpenRouter, check that there are at least 2 tool calls
+        // (these providers may include an empty text block)
         let tool_calls = output
             .iter()
-            .filter(|block| matches!(block, ContentBlock::ToolCall(_)))
+            .filter(|block| matches!(block, StoredContentBlock::ToolCall(_)))
             .count();
         assert_eq!(
             tool_calls, 2,
@@ -9269,16 +9829,20 @@ pub async fn check_parallel_tool_use_inference_response(
     let mut tool_call_names = vec![];
     for block in output {
         match block {
-            ContentBlock::ToolCall(tool_call) => {
+            StoredContentBlock::ToolCall(tool_call) => {
                 tool_call_names.push(tool_call.name);
                 serde_json::from_str::<Value>(&tool_call.arguments).unwrap();
             }
-            ContentBlock::Text(text) if text.text.is_empty() && is_openrouter => {
+            StoredContentBlock::Text(text) if text.text.is_empty() && is_openrouter => {
                 // Skip empty text blocks for OpenRouter
                 continue;
             }
+            StoredContentBlock::Text(text) if text.text.trim().is_empty() && is_groq => {
+                // Skip empty text blocks for Groq
+                continue;
+            }
             _ => {
-                panic!("Expected a tool call or empty text (for OpenRouter), got {block:?}");
+                panic!("Expected a tool call or empty text (for OpenRouter/Groq), got {block:?}");
             }
         }
     }
@@ -9477,7 +10041,7 @@ pub async fn test_parallel_tool_use_streaming_inference_request_with_provider(
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."}]
+                    "content": [{"type": "text", "text": "What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."}]
                 }
             ]
         }
@@ -9688,26 +10252,25 @@ pub async fn test_parallel_tool_use_streaming_inference_request_with_provider(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with two tool calls. Use BOTH the \"get_temperature\" and \"get_humidity\" tools.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit with 50% humidity.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text { text: "What is the weather like in Tokyo (in Celsius)? Use both the provided `get_temperature` and `get_humidity` tools. Do not say anything else, just call the two functions."
+            .to_string() })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert!(output.len() >= 2);
     let mut tool_call_names = vec![];
     for block in output {
         match block {
-            ContentBlock::ToolCall(tool_call) => {
+            StoredContentBlock::ToolCall(tool_call) => {
                 tool_call_names.push(tool_call.name);
                 serde_json::from_str::<Value>(&tool_call.arguments).unwrap();
             }
             // Sometimes vLLM returns a text block alongside the tool calls
-            ContentBlock::Text(_) => {
+            StoredContentBlock::Text(_) => {
                 // Do nothing
             }
             _ => {
@@ -9732,7 +10295,7 @@ pub async fn test_json_mode_inference_request_with_provider(provider: E2ETestPro
                "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "arguments": {"country": "Japan"}}]
+                    "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
                 }
             ]},
         "stream": false,
@@ -9908,18 +10471,18 @@ pub async fn check_json_mode_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPlease answer the questions in a JSON with key \"answer\".\n\nDo not include any other text than the JSON object. Do not include \"```json\" or \"```\" or anything else.\n\nExample Response:\n\n{\n    \"answer\": \"42\"\n}"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let mut output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let mut output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     // We don't care about thoughts in this test
-    output.retain(|block| !matches!(block, ContentBlock::Thought(_)));
+    output.retain(|block| !matches!(block, StoredContentBlock::Thought(_)));
 
     let is_openrouter = provider.model_provider_name == "openrouter";
     // Some providers may return both an empty text block and a tool_call block
@@ -9933,16 +10496,16 @@ pub async fn check_json_mode_inference_response(
     let mut found_valid_content = false;
     for output_block in &output {
         match output_block {
-            ContentBlock::Text(text) if text.text.trim().is_empty() => {
+            StoredContentBlock::Text(text) if text.text.trim().is_empty() => {
                 // Skip empty text blocks
                 continue;
             }
-            ContentBlock::Text(text) => {
+            StoredContentBlock::Text(text) => {
                 let _: Value = serde_json::from_str(&text.text).unwrap();
                 assert!(text.text.to_lowercase().contains("tokyo"));
                 found_valid_content = true;
             }
-            ContentBlock::ToolCall(tool_call) => {
+            StoredContentBlock::ToolCall(tool_call) => {
                 // OpenRouter may use tool_call format
                 assert_eq!(tool_call.name, "respond");
                 let arguments: Value = serde_json::from_str(&tool_call.arguments).unwrap();
@@ -9990,7 +10553,7 @@ pub async fn test_dynamic_json_mode_inference_request_with_provider(provider: E2
                "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "arguments": {"country": "Japan"}}]
+                    "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
                 }
             ]},
         "stream": false,
@@ -10168,18 +10731,18 @@ pub async fn check_dynamic_json_mode_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nDo not include any other text than the JSON object.  Do not include \"```json\" or \"```\" or anything else.\n\nPlease answer the questions in a JSON with the following schema:\n\n{\"type\":\"object\",\"properties\":{\"response\":{\"type\":\"string\"}},\"required\":[\"response\"],\"additionalProperties\":false}"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let mut output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let mut output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     // We don't care about thoughts in this test
-    output.retain(|block| !matches!(block, ContentBlock::Thought(_)));
+    output.retain(|block| !matches!(block, StoredContentBlock::Thought(_)));
 
     let is_openrouter = provider.model_provider_name == "openrouter";
     // Some providers return both an empty text block and a tool_call block
@@ -10193,16 +10756,16 @@ pub async fn check_dynamic_json_mode_inference_response(
     let mut found_valid_content = false;
     for output_block in &output {
         match output_block {
-            ContentBlock::Text(text) if text.text.trim().is_empty() => {
+            StoredContentBlock::Text(text) if text.text.trim().is_empty() => {
                 // Skip empty text blocks
                 continue;
             }
-            ContentBlock::Text(text) => {
+            StoredContentBlock::Text(text) => {
                 let _: Value = serde_json::from_str(&text.text).unwrap();
                 assert!(&text.text.to_lowercase().contains("tokyo"));
                 found_valid_content = true;
             }
-            ContentBlock::ToolCall(tool_call) => {
+            StoredContentBlock::ToolCall(tool_call) => {
                 // OpenRouter may use tool_call format
                 assert_eq!(tool_call.name, "respond");
                 let arguments: Value = serde_json::from_str(&tool_call.arguments).unwrap();
@@ -10248,7 +10811,7 @@ pub async fn test_json_mode_streaming_inference_request_with_provider(provider: 
                "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "arguments": {"country": "Japan"}}]
+                    "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
                 }
             ]},
         "stream": true,
@@ -10475,24 +11038,24 @@ pub async fn test_json_mode_streaming_inference_request_with_provider(provider: 
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPlease answer the questions in a JSON with key \"answer\".\n\nDo not include any other text than the JSON object. Do not include \"```json\" or \"```\" or anything else.\n\nExample Response:\n\n{\n    \"answer\": \"42\"\n}"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan?".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
     match &output[0] {
-        ContentBlock::Text(text) => {
+        StoredContentBlock::Text(text) => {
             let parsed: Value = serde_json::from_str(&text.text).unwrap();
             let answer = parsed.get("answer").unwrap().as_str().unwrap();
             assert!(answer.to_lowercase().contains("tokyo"));
         }
-        ContentBlock::ToolCall(tool_call) => {
+        StoredContentBlock::ToolCall(tool_call) => {
             // Handles implicit tool calls
             assert_eq!(tool_call.name, "respond");
             let arguments: Value = serde_json::from_str(&tool_call.arguments).unwrap();
@@ -10525,6 +11088,13 @@ pub async fn test_short_inference_request_with_provider(provider: E2ETestProvide
         return;
     }
 
+    // The OpenAI Responses API has a minimum value of 16
+    let max_tokens = if provider.model_name.starts_with("responses-") {
+        16
+    } else {
+        1
+    };
+
     let episode_id = Uuid::now_v7();
     let extra_headers = get_extra_headers();
 
@@ -10541,7 +11111,7 @@ pub async fn test_short_inference_request_with_provider(provider: E2ETestProvide
                "messages": [
                 {
                     "role": "user",
-                    "content": "What is the name of the capital city of Japan?"
+                    "content": "What is the name of the capital city of Japan? Explain your answer."
                 }
             ]},
         "stream": false,
@@ -10549,13 +11119,18 @@ pub async fn test_short_inference_request_with_provider(provider: E2ETestProvide
         "cache_options": {"enabled": "on", "lookback_s": 10},
         "params": {
             "chat_completion": {
-                "max_tokens": 1
+                "max_tokens": max_tokens
             }
         },
         "extra_headers": extra_headers.extra_headers,
     });
     if provider.variant_name.contains("openai") && provider.variant_name.contains("o1") {
         // Can't pin a single token for o1
+        return;
+    }
+
+    if provider.variant_name.contains("openrouter") {
+        // OpenRouter claims gpt4.1-mini needs a minimum of 16 output tokens
         return;
     }
 
@@ -10577,6 +11152,7 @@ pub async fn test_short_inference_request_with_provider(provider: E2ETestProvide
         response_json,
         Some(episode_id),
         &provider,
+        max_tokens,
         false,
     )
     .await;
@@ -10595,8 +11171,15 @@ pub async fn test_short_inference_request_with_provider(provider: E2ETestProvide
 
     println!("API response: {response_json:#?}");
 
-    check_short_inference_response(randomness, response_json, Some(episode_id), &provider, true)
-        .await;
+    check_short_inference_response(
+        randomness,
+        response_json,
+        Some(episode_id),
+        &provider,
+        max_tokens,
+        true,
+    )
+    .await;
 }
 
 async fn check_short_inference_response(
@@ -10604,6 +11187,7 @@ async fn check_short_inference_response(
     response_json: Value,
     episode_id: Option<Uuid>,
     provider: &E2ETestProvider,
+    max_tokens: u32,
     should_be_cached: bool,
 ) {
     let hardcoded_function_name = "basic_test";
@@ -10635,7 +11219,7 @@ async fn check_short_inference_response(
         assert_eq!(output_tokens, 0);
     } else {
         assert!(input_tokens > 0);
-        assert_eq!(output_tokens, 1);
+        assert_eq!(output_tokens, max_tokens as u64);
     }
     let finish_reason = response_json
         .get("finish_reason")
@@ -10678,7 +11262,7 @@ async fn check_short_inference_response(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the name of the capital city of Japan?"}]
+                "content": [{"type": "text", "text": "What is the name of the capital city of Japan? Explain your answer."}]
             }
         ]
     });
@@ -10710,7 +11294,7 @@ async fn check_short_inference_response(
             .unwrap()
             .as_u64()
             .unwrap(),
-        1
+        max_tokens as u64
     );
 
     let processing_time_ms = result.get("processing_time_ms").unwrap().as_u64().unwrap();
@@ -10760,16 +11344,16 @@ async fn check_short_inference_response(
         format!("You are a helpful and friendly assistant named Dr. Mehta: {randomness}")
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
-    let expected_input_messages = vec![RequestMessage {
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let expected_input_messages = vec![StoredRequestMessage {
         role: Role::User,
-        content: vec!["What is the name of the capital city of Japan?"
-            .to_string()
-            .into()],
+        content: vec![StoredContentBlock::Text(Text {
+            text: "What is the name of the capital city of Japan? Explain your answer.".to_string(),
+        })],
     }];
     assert_eq!(input_messages, expected_input_messages);
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
     let finish_reason = result.get("finish_reason").unwrap().as_str().unwrap();
     assert_eq!(finish_reason, "length");
@@ -10872,6 +11456,17 @@ pub async fn test_multi_turn_parallel_tool_use_inference_request_with_provider(
             // For OpenRouter, skip empty text blocks
             let text = content_block.get("text").unwrap().as_str().unwrap();
             if text.is_empty() {
+                continue;
+            } else {
+                panic!("Unexpected text block with non-empty content: {text}");
+            }
+        }
+
+        // Special handling for groq text blocks
+        if content_block_type == "text" && provider.model_provider_name == "groq" {
+            let text = content_block.get("text").unwrap().as_str().unwrap();
+            // Groq produces a text block containing '\n'
+            if text.trim().is_empty() {
                 continue;
             } else {
                 panic!("Unexpected text block with non-empty content: {text}");
@@ -11079,14 +11674,14 @@ pub async fn check_multi_turn_parallel_tool_use_inference_response(
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with two tool calls. Use BOTH the \"get_temperature\" and \"get_humidity\" tools.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit with 50% humidity.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
     let last_input_message = input_messages.last().unwrap();
     assert_eq!(last_input_message.role, Role::User);
     let last_input_message_content = &last_input_message.content;
     assert_eq!(last_input_message_content.len(), 2);
     for tool_result in last_input_message_content {
         match tool_result {
-            ContentBlock::ToolResult(tool_result) => {
+            StoredContentBlock::ToolResult(tool_result) => {
                 assert!(
                     tool_result.name == "get_temperature" || tool_result.name == "get_humidity"
                 );
@@ -11097,11 +11692,11 @@ pub async fn check_multi_turn_parallel_tool_use_inference_response(
         }
     }
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
     let output_content = output.first().unwrap();
     match output_content {
-        ContentBlock::Text(text) => {
+        StoredContentBlock::Text(text) => {
             assert!(text.text.to_lowercase().contains("70"));
             assert!(text.text.to_lowercase().contains("30"));
         }
@@ -11164,6 +11759,17 @@ pub async fn test_multi_turn_parallel_tool_use_streaming_inference_request_with_
             // For OpenRouter, skip empty text blocks
             let text = content_block.get("text").unwrap().as_str().unwrap();
             if text.is_empty() {
+                continue;
+            } else {
+                panic!("Unexpected text block with non-empty content: {text}");
+            }
+        }
+
+        // Special handling for groq text blocks
+        if content_block_type == "text" && provider.model_provider_name == "groq" {
+            let text = content_block.get("text").unwrap().as_str().unwrap();
+            // Groq produces a text block containing '\n'
+            if text.trim().is_empty() {
                 continue;
             } else {
                 panic!("Unexpected text block with non-empty content: {text}");
@@ -11420,14 +12026,14 @@ pub async fn test_multi_turn_parallel_tool_use_streaming_inference_request_with_
         "You are a helpful and friendly assistant named Dr. Mehta.\n\nPeople will ask you questions about the weather.\n\nIf asked about the weather, just respond with two tool calls. Use BOTH the \"get_temperature\" and \"get_humidity\" tools.\n\nIf provided with a tool result, use it to respond to the user (e.g. \"The weather in New York is 55 degrees Fahrenheit with 50% humidity.\")."
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
     let last_input_message = input_messages.last().unwrap();
     assert_eq!(last_input_message.role, Role::User);
     let last_input_message_content = &last_input_message.content;
     assert_eq!(last_input_message_content.len(), 2);
     for tool_result in last_input_message_content {
         match tool_result {
-            ContentBlock::ToolResult(tool_result) => {
+            StoredContentBlock::ToolResult(tool_result) => {
                 assert!(
                     tool_result.name == "get_temperature" || tool_result.name == "get_humidity"
                 );
@@ -11438,11 +12044,11 @@ pub async fn test_multi_turn_parallel_tool_use_streaming_inference_request_with_
         }
     }
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(output.len(), 1);
     let output_content = output.first().unwrap();
     match output_content {
-        ContentBlock::Text(text) => {
+        StoredContentBlock::Text(text) => {
             assert!(text.text.to_lowercase().contains("70"));
             assert!(text.text.to_lowercase().contains("30"));
         }
@@ -11466,7 +12072,7 @@ pub async fn test_json_mode_off_inference_request_with_provider(provider: E2ETes
                "messages": [
                    {
                        "role": "user",
-                       "content": [{"type": "text", "arguments": {"country": "Japan"}}]
+                       "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]
                    }
                ]
             },
@@ -11490,6 +12096,8 @@ pub async fn test_json_mode_off_inference_request_with_provider(provider: E2ETes
     assert_eq!(response.status(), StatusCode::OK);
     let response_json = response.json::<Value>().await.unwrap();
 
+    println!("API response: {response_json}");
+
     // Assert the output isn't JSON
     let output = response_json.get("output").unwrap().as_object().unwrap();
     let parsed = output.get("parsed").unwrap().as_object();
@@ -11498,7 +12106,10 @@ pub async fn test_json_mode_off_inference_request_with_provider(provider: E2ETes
     assert!(serde_json::from_str::<Value>(raw).is_err());
 
     // Assert that the answer is correct
-    assert!(raw.to_lowercase().contains("tokyo"));
+    assert!(
+        raw.to_lowercase().contains("tokyo"),
+        "Unexpected raw output: {raw}"
+    );
 
     // Check that inference_id is here
     let inference_id = response_json.get("inference_id").unwrap().as_str().unwrap();

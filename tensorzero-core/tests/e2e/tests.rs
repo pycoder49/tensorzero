@@ -1,4 +1,10 @@
-#![expect(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stdout,
+    clippy::unwrap_used
+)]
+#![recursion_limit = "256"]
 mod batch;
 mod best_of_n;
 mod cache;
@@ -8,27 +14,33 @@ mod config;
 mod datasets;
 mod db;
 mod dicl;
-mod dynamic_evaluations;
 mod dynamic_variants;
+mod endpoints;
+mod experimentation;
 mod fallback;
 mod feedback;
 mod health;
 mod howdy;
 mod human_feedback;
-mod human_static_evaluation_feedback;
+mod image_url;
 mod inference;
+mod inference_evaluation_human_feedback;
 mod list_inferences;
 mod mixture_of_n;
 mod object_storage;
 mod openai_compatible;
 mod optimization;
 mod otel;
+mod otel_config_headers;
 mod otel_export;
 mod prometheus;
 mod providers;
 mod proxy;
+mod rate_limiting;
+mod rate_limiting_startup;
 mod render_inferences;
 mod retries;
 mod streaming_errors;
 mod template;
 mod timeouts;
+mod workflow_evaluations;

@@ -2,6 +2,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { FunctionSelector } from "./FunctionSelector";
 import type { FunctionConfig } from "tensorzero-node";
 import { useState } from "react";
+import { DEFAULT_FUNCTION } from "~/utils/constants";
 
 const meta = {
   title: "UI/FunctionSelector",
@@ -19,7 +20,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 const mockFunctions: Record<string, FunctionConfig> = {
-  "tensorzero::default": {
+  [DEFAULT_FUNCTION]: {
     type: "chat",
     variants: {},
     schemas: {},
@@ -27,6 +28,7 @@ const mockFunctions: Record<string, FunctionConfig> = {
     tool_choice: "auto",
     parallel_tool_calls: null,
     description: "Default chat function",
+    experimentation: { type: "uniform" },
   },
   "chat-function": {
     type: "chat",
@@ -36,6 +38,7 @@ const mockFunctions: Record<string, FunctionConfig> = {
     tool_choice: "auto",
     parallel_tool_calls: true,
     description: "Chat function with tools",
+    experimentation: { type: "uniform" },
   },
   "json-extractor": {
     type: "json",
@@ -45,11 +48,15 @@ const mockFunctions: Record<string, FunctionConfig> = {
       value: null,
     },
     implicit_tool_call_config: {
-      tools_available: [],
+      static_tools_available: [],
+      dynamic_tools_available: [],
+      provider_tools: [],
       tool_choice: "auto",
       parallel_tool_calls: false,
+      allowed_tools: { tools: [], choice: "function_default" },
     },
     description: "Extract structured data from text",
+    experimentation: { type: "uniform" },
   },
   "sentiment-analyzer": {
     type: "json",
@@ -59,11 +66,15 @@ const mockFunctions: Record<string, FunctionConfig> = {
       value: null,
     },
     implicit_tool_call_config: {
-      tools_available: [],
+      static_tools_available: [],
+      dynamic_tools_available: [],
+      provider_tools: [],
       tool_choice: "auto",
       parallel_tool_calls: false,
+      allowed_tools: { tools: [], choice: "function_default" },
     },
     description: "Analyze sentiment of text",
+    experimentation: { type: "uniform" },
   },
 };
 

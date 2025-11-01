@@ -1,5 +1,3 @@
-#![allow(clippy::print_stdout)]
-
 use http::StatusCode;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -9,7 +7,7 @@ use tensorzero_core::{
         get_clickhouse, select_chat_inference_clickhouse, select_model_inferences_clickhouse,
         CLICKHOUSE_URL,
     },
-    inference::types::{ContentBlockChatOutput, Text},
+    inference::types::{Arguments, ContentBlockChatOutput, System, Text},
 };
 use uuid::Uuid;
 
@@ -115,11 +113,11 @@ async fn e2e_test_template_no_schema() {
         "system":"My system message",
         "messages":[
           {"role":"user","content":[
-            {"type":"text","value":"First user message"},
-            {"type":"text","value":"Second user message"},
+            {"type":"text","text":"First user message"},
+            {"type":"text","text":"Second user message"},
             {"type":"template","name":"my_custom_template","arguments":{"first_variable":"my_content","second_variable":"my_other_content"}}
           ]},
-          {"role":"assistant","content":[{"type":"text","value":"First assistant message"},{"type":"text","value":"Second assistant message"}]}]
+          {"role":"assistant","content":[{"type":"text","text":"First assistant message"},{"type":"text","text":"Second assistant message"}]}]
         })
     );
 }
@@ -390,6 +388,41 @@ async fn e2e_test_invalid_system_input_template_no_schema() {
 }
 
 #[tokio::test]
+async fn e2e_test_invalid_json_user_input_template_no_schema() {
+    let payload = json!({
+        "function_name": "null_json",
+        "input":{
+            "system": "My system message",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "First user message"},
+                        {"type": "template", "name": "user", "arguments": {"my_invalid": "user message"}},
+                    ]
+                },
+
+            ]},
+        "stream": false,
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_json = response.json::<Value>().await.unwrap();
+    let error = response_json["error"].as_str().unwrap();
+    assert_eq!(
+        error,
+        "Message at index 0 has non-string content but there is no template `user` in any variant"
+    );
+}
+
+#[tokio::test]
 async fn e2e_test_invalid_user_input_template_no_schema() {
     let payload = json!({
         "function_name": "basic_test_template_no_schema",
@@ -400,7 +433,7 @@ async fn e2e_test_invalid_user_input_template_no_schema() {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "First user message"},
-                        {"type": "text", "arguments": {"my_invalid": "user message"}},
+                        {"type": "template", "name": "user", "arguments": {"my_invalid": "user message"}},
                     ]
                 },
 
@@ -435,7 +468,41 @@ async fn e2e_test_invalid_assistant_input_template_no_schema() {
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "text", "arguments": {"my_invalid": "assistant message"}},
+                        {"type": "template", "name": "assistant", "arguments": {"my_invalid": "assistant message"}},
+                    ]
+                }
+            ]},
+        "stream": false,
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let response_json = response.json::<Value>().await.unwrap();
+    let error = response_json["error"].as_str().unwrap();
+    assert_eq!(
+        error,
+        "Message at index 0 has non-string content but there is no template `assistant` in any variant"
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn e2e_test_invalid_json_assistant_input_template_no_schema() {
+    let payload = json!({
+        "function_name": "null_json",
+        "input":{
+            "system": "My system message",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "template", "name": "assistant", "arguments": {"my_invalid": "assistant message"}},
                     ]
                 }
             ]},
@@ -496,7 +563,10 @@ async fn e2e_test_named_system_template_no_schema() {
             function_name: Some("test_system_template".to_string()),
             variant_name: Some("test".to_string()),
             input: tensorzero::ClientInput {
-                system: Some(serde_json::json!({"assistant_name": "AskJeeves"})),
+                system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                    "assistant_name".to_string(),
+                    "AskJeeves".into(),
+                )])))),
                 messages: vec![],
             },
             ..Default::default()
@@ -558,7 +628,10 @@ async fn e2e_test_named_system_template_with_schema() {
             function_name: Some("test_system_template".to_string()),
             variant_name: Some("test".to_string()),
             input: tensorzero::ClientInput {
-                system: Some(serde_json::json!({"assistant_name": "AskJeeves"})),
+                system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                    "assistant_name".to_string(),
+                    "AskJeeves".into(),
+                )])))),
                 messages: vec![],
             },
             ..Default::default()
@@ -595,7 +668,10 @@ async fn e2e_test_named_system_template_with_schema() {
             function_name: Some("test_system_template".to_string()),
             variant_name: Some("test".to_string()),
             input: tensorzero::ClientInput {
-                system: Some(serde_json::json!({"assistant_name": 123})),
+                system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                    "assistant_name".to_string(),
+                    123.into(),
+                )])))),
                 messages: vec![],
             },
             ..Default::default()

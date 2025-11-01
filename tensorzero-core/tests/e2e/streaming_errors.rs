@@ -4,22 +4,19 @@ use tensorzero::{
     Client, ClientInferenceParams, ClientInput, ClientInputMessage, ClientInputMessageContent,
     InferenceOutput, InferenceResponseChunk, Role,
 };
-use tensorzero_core::inference::types::TextKind;
+use tensorzero_core::inference::types::{Arguments, System, TextKind};
 
-use crate::{
-    common::get_gateway_endpoint,
-    providers::common::{make_embedded_gateway, make_http_gateway},
-};
+use crate::common::get_gateway_endpoint;
 use reqwest_eventsource::{Event, RequestBuilderExt};
 
 #[tokio::test]
 async fn test_client_stream_with_error_http_gateway() {
-    test_client_stream_with_error(make_http_gateway().await).await;
+    test_client_stream_with_error(tensorzero::test_helpers::make_http_gateway().await).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_client_stream_with_error_embedded_gateway() {
-    test_client_stream_with_error(make_embedded_gateway().await).await;
+    test_client_stream_with_error(tensorzero::test_helpers::make_embedded_gateway().await).await;
 }
 
 async fn test_client_stream_with_error(client: Client) {
@@ -28,9 +25,10 @@ async fn test_client_stream_with_error(client: Client) {
             function_name: Some("basic_test".to_string()),
             variant_name: Some("err_in_stream".to_string()),
             input: ClientInput {
-                system: Some(json!({
-                    "assistant_name": "AskJeeves",
-                })),
+                system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+                    "assistant_name".to_string(),
+                    "AskJeeves".into(),
+                )])))),
                 messages: vec![ClientInputMessage {
                     role: Role::User,
                     content: vec![ClientInputMessageContent::Text(TextKind::Text {

@@ -15,17 +15,17 @@ import { getConfig, getFunctionConfig } from "~/utils/config/index.server";
 import FunctionInferenceTable from "./FunctionInferenceTable";
 import BasicInfo from "./FunctionBasicInfo";
 import FunctionSchema from "./FunctionSchema";
+import { FunctionExperimentation } from "./FunctionExperimentation";
 import { useFunctionConfig } from "~/context/config";
 import {
   getVariantCounts,
   getVariantPerformances,
   getFunctionThroughputByVariant,
-  type TimeWindowUnit,
 } from "~/utils/clickhouse/function";
 import { queryMetricsWithFeedback } from "~/utils/clickhouse/feedback";
 import { getInferenceTableName } from "~/utils/clickhouse/common";
 import { MetricSelector } from "~/components/function/variant/MetricSelector";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { VariantPerformance } from "~/components/function/variant/VariantPerformance";
 import { VariantThroughput } from "~/components/function/variant/VariantThroughput";
 import FunctionVariantTable from "./FunctionVariantTable";
@@ -38,18 +38,30 @@ import {
 } from "~/components/layout/PageLayout";
 import { getFunctionTypeIcon } from "~/utils/icon";
 import { logger } from "~/utils/logger";
+import { DEFAULT_FUNCTION } from "~/utils/constants";
+import {
+  getNativeDatabaseClient,
+  getNativeTensorZeroClient,
+} from "~/utils/tensorzero/native_client.server";
+import type { TimeWindow } from "tensorzero-node";
 
 export async function loader({ request, params }: Route.LoaderArgs) {
   const { function_name } = params;
   const url = new URL(request.url);
   const config = await getConfig();
+  const dbClient = await getNativeDatabaseClient();
   const beforeInference = url.searchParams.get("beforeInference");
   const afterInference = url.searchParams.get("afterInference");
   const pageSize = Number(url.searchParams.get("pageSize")) || 10;
   const metric_name = url.searchParams.get("metric_name") || undefined;
-  const time_granularity = url.searchParams.get("time_granularity") || "week";
-  const throughput_time_granularity =
-    url.searchParams.get("throughput_time_granularity") || "week";
+  const time_granularity = (url.searchParams.get("time_granularity") ||
+    "week") as TimeWindow;
+  const throughput_time_granularity = (url.searchParams.get(
+    "throughput_time_granularity",
+  ) || "week") as TimeWindow;
+  const feedback_time_granularity = (url.searchParams.get(
+    "cumulative_feedback_time_granularity",
+  ) || "week") as TimeWindow;
   if (pageSize > 100) {
     throw data("Page size cannot exceed 100", { status: 400 });
   }
@@ -87,14 +99,48 @@ export async function loader({ request, params }: Route.LoaderArgs) {
           function_config,
           metric_name,
           metric_config: config.metrics[metric_name],
-          time_window_unit: time_granularity as TimeWindowUnit,
+          time_window_unit: time_granularity,
         })
       : undefined;
   const variantThroughputPromise = getFunctionThroughputByVariant(
     function_name,
-    throughput_time_granularity as TimeWindowUnit,
+    throughput_time_granularity,
     10,
   );
+
+  // Get feedback timeseries
+  // For now, we only fetch this for track_and_stop experimentation
+  // but the underlying query is general and could be used for other experimentation types
+  const feedbackParams =
+    function_config.experimentation.type === "track_and_stop"
+      ? {
+          metric_name: function_config.experimentation.metric,
+          variant_names: function_config.experimentation.candidate_variants,
+        }
+      : null;
+  const feedbackTimeseriesPromise = feedbackParams
+    ? (async () => {
+        return dbClient.getCumulativeFeedbackTimeseries({
+          function_name,
+          ...feedbackParams,
+          time_window: feedback_time_granularity as TimeWindow,
+          max_periods: 10,
+        });
+      })()
+    : Promise.resolve(undefined);
+
+  // Get variant sampling probabilities from the gateway
+  const variantSamplingProbabilitiesPromise = (async () => {
+    try {
+      const tensorZeroClient = await getNativeTensorZeroClient();
+      return await tensorZeroClient.getVariantSamplingProbabilities(
+        function_name,
+      );
+    } catch (error) {
+      logger.error("Failed to get variant sampling probabilities:", error);
+      return {};
+    }
+  })();
 
   const [
     inferences,
@@ -104,6 +150,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     variant_performances,
     variant_counts,
     variant_throughput,
+    feedback_timeseries,
+    variant_sampling_probabilities,
   ] = await Promise.all([
     inferencePromise,
     tableBoundsPromise,
@@ -112,9 +160,12 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     variantPerformancesPromise,
     variantCountsPromise,
     variantThroughputPromise,
+    feedbackTimeseriesPromise,
+    variantSamplingProbabilitiesPromise,
   ]);
+
   const variant_counts_with_metadata = variant_counts.map((variant_count) => {
-    const variant_config = function_config.variants[
+    let variant_config = function_config.variants[
       variant_count.variant_name
     ] || {
       inner: {
@@ -123,12 +174,39 @@ export async function loader({ request, params }: Route.LoaderArgs) {
         weight: 0,
       },
     };
+
+    if (function_name === DEFAULT_FUNCTION) {
+      variant_config = {
+        inner: {
+          type: "chat_completion",
+          model: variant_count.variant_name,
+          weight: null,
+          templates: {},
+          temperature: null,
+          top_p: null,
+          max_tokens: null,
+          presence_penalty: null,
+          frequency_penalty: null,
+          seed: null,
+          stop_sequences: null,
+          json_mode: null,
+          retries: { num_retries: 0, max_delay_s: 0 },
+        },
+        timeouts: {
+          non_streaming: { total_ms: null },
+          streaming: { ttft_ms: null },
+        },
+      };
+      function_config.variants[variant_count.variant_name] = variant_config;
+    }
+
     return {
       ...variant_count,
       type: variant_config.inner.type,
       weight: variant_config.inner.weight,
     };
   });
+
   return {
     function_name,
     inferences,
@@ -138,6 +216,8 @@ export async function loader({ request, params }: Route.LoaderArgs) {
     variant_performances,
     variant_throughput,
     variant_counts: variant_counts_with_metadata,
+    feedback_timeseries,
+    variant_sampling_probabilities,
   };
 }
 
@@ -151,7 +231,10 @@ export default function InferencesPage({ loaderData }: Route.ComponentProps) {
     variant_performances,
     variant_throughput,
     variant_counts,
+    feedback_timeseries,
+    variant_sampling_probabilities,
   } = loaderData;
+
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const function_config = useFunctionConfig(function_name);
@@ -186,15 +269,12 @@ export default function InferencesPage({ loaderData }: Route.ComponentProps) {
   const disableNextInferencePage =
     !bottomInference || inference_bounds.first_id === bottomInference.id;
 
-  const [metric_name, setMetricName] = useState(
-    () => searchParams.get("metric_name") || "",
-  );
+  const metric_name = searchParams.get("metric_name") || "";
 
   const handleMetricChange = (metric: string) => {
-    setMetricName(metric);
-    const searchParams = new URLSearchParams(window.location.search);
-    searchParams.set("metric_name", metric);
-    navigate(`?${searchParams.toString()}`, { preventScrollReset: true });
+    const newSearchParams = new URLSearchParams(window.location.search);
+    newSearchParams.set("metric_name", metric);
+    navigate(`?${newSearchParams.toString()}`, { preventScrollReset: true });
   };
 
   const metricsExcludingDemonstrations = useMemo(
@@ -205,31 +285,6 @@ export default function InferencesPage({ loaderData }: Route.ComponentProps) {
     }),
     [metricsWithFeedback],
   );
-
-  const [time_granularity, setTimeGranularity] =
-    useState<TimeWindowUnit>("week");
-  const handleTimeGranularityChange = (granularity: TimeWindowUnit) => {
-    setTimeGranularity(granularity);
-    const searchParams = new URLSearchParams(window.location.search);
-    searchParams.set("time_granularity", granularity);
-    navigate(`?${searchParams.toString()}`, { preventScrollReset: true });
-  };
-
-  const [throughput_time_granularity, setThroughputTimeGranularity] =
-    useState<TimeWindowUnit>(() => {
-      const param = searchParams.get(
-        "throughput_time_granularity",
-      ) as TimeWindowUnit;
-      return param || "week";
-    });
-  const handleThroughputTimeGranularityChange = (
-    granularity: TimeWindowUnit,
-  ) => {
-    setThroughputTimeGranularity(granularity);
-    const searchParams = new URLSearchParams(window.location.search);
-    searchParams.set("throughput_time_granularity", granularity);
-    navigate(`?${searchParams.toString()}`, { preventScrollReset: true });
-  };
 
   return (
     <PageLayout>
@@ -251,13 +306,21 @@ export default function InferencesPage({ loaderData }: Route.ComponentProps) {
           />
         </SectionLayout>
 
+        {function_name !== DEFAULT_FUNCTION && (
+          <SectionLayout>
+            <SectionHeader heading="Experimentation" />
+            <FunctionExperimentation
+              functionConfig={function_config}
+              functionName={function_name}
+              feedbackTimeseries={feedback_timeseries}
+              variantSamplingProbabilities={variant_sampling_probabilities}
+            />
+          </SectionLayout>
+        )}
+
         <SectionLayout>
           <SectionHeader heading="Throughput" />
-          <VariantThroughput
-            variant_throughput={variant_throughput}
-            time_granularity={throughput_time_granularity}
-            onTimeGranularityChange={handleThroughputTimeGranularityChange}
-          />
+          <VariantThroughput variant_throughput={variant_throughput} />
         </SectionLayout>
 
         <SectionLayout>
@@ -271,8 +334,6 @@ export default function InferencesPage({ loaderData }: Route.ComponentProps) {
             <VariantPerformance
               variant_performances={variant_performances}
               metric_name={metric_name}
-              time_granularity={time_granularity}
-              onTimeGranularityChange={handleTimeGranularityChange}
             />
           )}
         </SectionLayout>

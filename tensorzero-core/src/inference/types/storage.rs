@@ -10,12 +10,13 @@ use pyo3::prelude::*;
 /// Configuration for the object storage backend
 /// Currently, we only support S3-compatible object storage and local filesystem storage
 /// We test against Amazon S3, GCS, Cloudflare R2, and Minio
-#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, ts(export))]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(ts_rs::TS)]
+#[ts(export)]
 pub enum StorageKind {
     S3Compatible {
+        // TODO(shuyangli): mark all of these as ts(optional)
         bucket_name: Option<String>,
         region: Option<String>,
         endpoint: Option<String>,
@@ -23,6 +24,7 @@ pub enum StorageKind {
         /// An extra prefix to prepend to the object key.
         /// This is only enabled in e2e tests, to prevent clashes between concurrent test runs.
         #[cfg(feature = "e2e_tests")]
+        #[cfg_attr(test, ts(skip))]
         #[serde(default)]
         prefix: String,
     },
@@ -73,9 +75,12 @@ impl StorageKind {
     }
 }
 
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(test, ts(export))]
+/// Path to a file in an object storage backend.
+/// This is part of the public API for `File`s. In particular, this is useful for roundtripping
+/// unresolved inputs from stored inferences or datapoints, without requiring clients to fetch
+/// file data first.
+#[derive(ts_rs::TS, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[ts(export)]
 #[cfg_attr(feature = "pyo3", pyclass(str))]
 pub struct StoragePath {
     pub kind: StorageKind,
@@ -83,7 +88,7 @@ pub struct StoragePath {
         serialize_with = "serialize_storage_path",
         deserialize_with = "deserialize_storage_path"
     )]
-    #[cfg_attr(test, ts(type = "string"))]
+    #[ts(type = "string")]
     pub path: object_store::path::Path,
 }
 

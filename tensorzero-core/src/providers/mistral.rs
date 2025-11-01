@@ -1,7 +1,10 @@
-use std::{borrow::Cow, sync::OnceLock, time::Duration};
+use std::{borrow::Cow, time::Duration};
 
-use crate::http::{TensorZeroEventSource, TensorzeroHttpClient};
-use futures::StreamExt;
+use crate::{
+    http::{TensorZeroEventSource, TensorzeroHttpClient},
+    providers::openai::OpenAIMessagesConfig,
+};
+use futures::{future::try_join_all, StreamExt};
 use lazy_static::lazy_static;
 use reqwest::StatusCode;
 use reqwest_eventsource::Event;
@@ -26,17 +29,17 @@ use crate::{
         },
         InferenceProvider,
     },
-    model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider},
+    model::{Credential, ModelProvider},
     providers::helpers::{
-        check_new_tool_call_name, inject_extra_request_data_and_send,
+        check_new_tool_call_name, convert_stream_error, inject_extra_request_data_and_send,
         inject_extra_request_data_and_send_eventsource,
     },
     tool::{ToolCall, ToolCallChunk, ToolChoice},
 };
 
 use super::openai::{
-    convert_stream_error, get_chat_url, tensorzero_to_openai_messages, OpenAIFunction,
-    OpenAIRequestMessage, OpenAISystemRequestMessage, OpenAITool, OpenAIToolType,
+    get_chat_url, tensorzero_to_openai_messages, OpenAIFunction, OpenAIRequestMessage,
+    OpenAISystemRequestMessage, OpenAITool, OpenAIToolType,
 };
 
 lazy_static! {
@@ -44,10 +47,6 @@ lazy_static! {
         #[expect(clippy::expect_used)]
         Url::parse("https://api.mistral.ai/v1/").expect("Failed to parse MISTRAL_API_BASE")
     };
-}
-
-fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("MISTRAL_API_KEY".to_string())
 }
 
 const PROVIDER_NAME: &str = "Mistral";
@@ -62,23 +61,12 @@ pub struct MistralProvider {
     credentials: MistralCredentials,
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<MistralCredentials> = OnceLock::new();
-
 impl MistralProvider {
-    pub fn new(
-        model_name: String,
-        api_key_location: Option<CredentialLocation>,
-    ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-        Ok(MistralProvider {
+    pub fn new(model_name: String, credentials: MistralCredentials) -> Self {
+        MistralProvider {
             model_name,
             credentials,
-        })
+        }
     }
 
     pub fn model_name(&self) -> &str {
@@ -91,6 +79,10 @@ pub enum MistralCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    WithFallback {
+        default: Box<MistralCredentials>,
+        fallback: Box<MistralCredentials>,
+    },
 }
 
 impl TryFrom<Credential> for MistralCredentials {
@@ -101,6 +93,12 @@ impl TryFrom<Credential> for MistralCredentials {
             Credential::Static(key) => Ok(MistralCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(MistralCredentials::Dynamic(key_name)),
             Credential::Missing => Ok(MistralCredentials::None),
+            Credential::WithFallback { default, fallback } => {
+                Ok(MistralCredentials::WithFallback {
+                    default: Box::new((*default).try_into()?),
+                    fallback: Box::new((*fallback).try_into()?),
+                })
+            }
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for Mistral provider".to_string(),
             })),
@@ -124,6 +122,16 @@ impl MistralCredentials {
                     .into()
                 })
             }
+            MistralCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
+            }
             MistralCredentials::None => Err(ErrorDetails::ApiKeyMissing {
                 provider_name: PROVIDER_NAME.to_string(),
                 message: "No credentials are set".to_string(),
@@ -140,20 +148,23 @@ impl InferenceProvider for MistralProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(MistralRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing Mistral request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
+        let request_body = serde_json::to_value(
+            MistralRequest::new(&self.model_name, request).await?,
+        )
+        .map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!(
+                    "Error serializing Mistral request: {}",
+                    DisplayOrDebugGateway::new(e)
+                ),
+            })
+        })?;
         let request_url = get_chat_url(&MISTRAL_API_BASE)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
@@ -231,20 +242,23 @@ impl InferenceProvider for MistralProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(MistralRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing Mistral request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
+        let request_body = serde_json::to_value(
+            MistralRequest::new(&self.model_name, request).await?,
+        )
+        .map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!(
+                    "Error serializing Mistral request: {}",
+                    DisplayOrDebugGateway::new(e)
+                ),
+            })
+        })?;
         let request_url = get_chat_url(&MISTRAL_API_BASE)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
@@ -358,13 +372,20 @@ pub fn stream_mistral(
     })
 }
 
-pub(super) fn prepare_mistral_messages<'a>(
+pub(super) async fn prepare_mistral_messages<'a>(
     request: &'a ModelInferenceRequest<'_>,
+    config: OpenAIMessagesConfig<'a>,
 ) -> Result<Vec<OpenAIRequestMessage<'a>>, Error> {
-    let mut messages = Vec::with_capacity(request.messages.len());
-    for message in &request.messages {
-        messages.extend(tensorzero_to_openai_messages(message, PROVIDER_TYPE)?);
-    }
+    let mut messages: Vec<_> = try_join_all(
+        request
+            .messages
+            .iter()
+            .map(|msg| tensorzero_to_openai_messages(msg, config)),
+    )
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
     if let Some(system_msg) = tensorzero_to_mistral_system_message(request.system.as_deref()) {
         messages.insert(0, system_msg);
     }
@@ -419,8 +440,7 @@ fn prepare_mistral_tools<'a>(
         Some(tool_config) => match &tool_config.tool_choice {
             ToolChoice::Specific(tool_name) => {
                 let tool = tool_config
-                    .tools_available
-                    .iter()
+                    .tools_available()
                     .find(|t| t.name() == tool_name)
                     .ok_or_else(|| {
                         Error::new(ErrorDetails::ToolNotFound {
@@ -432,8 +452,7 @@ fn prepare_mistral_tools<'a>(
             }
             ToolChoice::Auto | ToolChoice::Required => {
                 let tools = tool_config
-                    .tools_available
-                    .iter()
+                    .tools_available()
                     .map(|t| MistralTool::from(OpenAITool::from(t)))
                     .collect();
                 let tool_choice = match tool_config.tool_choice {
@@ -489,7 +508,7 @@ struct MistralRequest<'a> {
 }
 
 impl<'a> MistralRequest<'a> {
-    pub fn new(
+    pub async fn new(
         model: &'a str,
         request: &'a ModelInferenceRequest<'_>,
     ) -> Result<MistralRequest<'a>, Error> {
@@ -499,7 +518,16 @@ impl<'a> MistralRequest<'a> {
             }
             ModelInferenceRequestJsonMode::Off => None,
         };
-        let messages = prepare_mistral_messages(request)?;
+        let messages = prepare_mistral_messages(
+            request,
+            OpenAIMessagesConfig {
+                json_mode: Some(&request.json_mode),
+                provider_type: PROVIDER_TYPE,
+                fetch_and_encode_input_files_before_inference: request
+                    .fetch_and_encode_input_files_before_inference,
+            },
+        )
+        .await?;
         let (tools, tool_choice) = prepare_mistral_tools(request)?;
 
         Ok(MistralRequest {
@@ -524,7 +552,6 @@ impl<'a> MistralRequest<'a> {
 struct MistralUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
-    total_tokens: u32,
 }
 
 impl From<MistralUsage> for Usage {
@@ -779,8 +806,8 @@ mod tests {
     use crate::inference::types::{FunctionType, RequestMessage, Role};
     use crate::providers::test_helpers::{WEATHER_TOOL, WEATHER_TOOL_CONFIG};
 
-    #[test]
-    fn test_mistral_request_new() {
+    #[tokio::test]
+    async fn test_mistral_request_new() {
         let request_with_tools = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
             messages: vec![RequestMessage {
@@ -803,8 +830,9 @@ mod tests {
             ..Default::default()
         };
 
-        let mistral_request =
-            MistralRequest::new("mistral-small-latest", &request_with_tools).unwrap();
+        let mistral_request = MistralRequest::new("mistral-small-latest", &request_with_tools)
+            .await
+            .unwrap();
 
         assert_eq!(mistral_request.model, "mistral-small-latest");
         assert_eq!(mistral_request.messages.len(), 1);
@@ -838,7 +866,6 @@ mod tests {
             usage: MistralUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             },
         };
 
@@ -935,7 +962,6 @@ mod tests {
             usage: MistralUsage {
                 prompt_tokens: 15,
                 completion_tokens: 25,
-                total_tokens: 40,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -1018,7 +1044,6 @@ mod tests {
             usage: MistralUsage {
                 prompt_tokens: 5,
                 completion_tokens: 0,
-                total_tokens: 5,
             },
         };
         let request_body = MistralRequest {
@@ -1071,7 +1096,6 @@ mod tests {
             usage: MistralUsage {
                 prompt_tokens: 10,
                 completion_tokens: 10,
-                total_tokens: 20,
             },
         };
         let request_body = MistralRequest {

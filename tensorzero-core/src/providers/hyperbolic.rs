@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::sync::OnceLock;
 
 use crate::cache::ModelProviderRequest;
 use crate::endpoints::inference::InferenceCredentials;
@@ -11,10 +10,11 @@ use crate::inference::types::{
     PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
 };
 use crate::inference::types::{ContentBlockOutput, ProviderInferenceResponseArgs};
-use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
+use crate::model::{Credential, ModelProvider};
 use crate::providers::helpers::{
     inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
+use crate::providers::openai::OpenAIMessagesConfig;
 use futures::{StreamExt, TryStreamExt};
 use lazy_static::lazy_static;
 use secrecy::{ExposeSecret, SecretString};
@@ -36,10 +36,6 @@ lazy_static! {
     };
 }
 
-pub fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("HYPERBOLIC_API_KEY".to_string())
-}
-
 const PROVIDER_NAME: &str = "Hyperbolic";
 pub const PROVIDER_TYPE: &str = "hyperbolic";
 
@@ -52,23 +48,12 @@ pub struct HyperbolicProvider {
     credentials: HyperbolicCredentials,
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<HyperbolicCredentials> = OnceLock::new();
-
 impl HyperbolicProvider {
-    pub fn new(
-        model_name: String,
-        api_key_location: Option<CredentialLocation>,
-    ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-        Ok(HyperbolicProvider {
+    pub fn new(model_name: String, credentials: HyperbolicCredentials) -> Self {
+        HyperbolicProvider {
             model_name,
             credentials,
-        })
+        }
     }
 
     pub fn model_name(&self) -> &str {
@@ -81,6 +66,10 @@ pub enum HyperbolicCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    WithFallback {
+        default: Box<HyperbolicCredentials>,
+        fallback: Box<HyperbolicCredentials>,
+    },
 }
 
 impl TryFrom<Credential> for HyperbolicCredentials {
@@ -91,6 +80,12 @@ impl TryFrom<Credential> for HyperbolicCredentials {
             Credential::Static(key) => Ok(HyperbolicCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(HyperbolicCredentials::Dynamic(key_name)),
             Credential::Missing => Ok(HyperbolicCredentials::None),
+            Credential::WithFallback { default, fallback } => {
+                Ok(HyperbolicCredentials::WithFallback {
+                    default: Box::new((*default).try_into()?),
+                    fallback: Box::new((*fallback).try_into()?),
+                })
+            }
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for Hyperbolic provider".to_string(),
             })),
@@ -114,6 +109,16 @@ impl HyperbolicCredentials {
                     .into()
                 })
             }
+            HyperbolicCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
+            }
             HyperbolicCredentials::None => Err(ErrorDetails::ApiKeyMissing {
                 provider_name: PROVIDER_NAME.to_string(),
                 message: "No credentials are set".to_string(),
@@ -129,20 +134,22 @@ impl InferenceProvider for HyperbolicProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(HyperbolicRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing Hyperbolic request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
+        let request_body =
+            serde_json::to_value(HyperbolicRequest::new(&self.model_name, request).await?)
+                .map_err(|e| {
+                    Error::new(ErrorDetails::Serialization {
+                        message: format!(
+                            "Error serializing Hyperbolic request: {}",
+                            DisplayOrDebugGateway::new(e)
+                        ),
+                    })
+                })?;
         let request_url = get_chat_url(&HYPERBOLIC_DEFAULT_BASE_URL)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
@@ -223,20 +230,22 @@ impl InferenceProvider for HyperbolicProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(HyperbolicRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing Hyperbolic request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
+        let request_body =
+            serde_json::to_value(HyperbolicRequest::new(&self.model_name, request).await?)
+                .map_err(|e| {
+                    Error::new(ErrorDetails::Serialization {
+                        message: format!(
+                            "Error serializing Hyperbolic request: {}",
+                            DisplayOrDebugGateway::new(e)
+                        ),
+                    })
+                })?;
         let request_url = get_chat_url(&HYPERBOLIC_DEFAULT_BASE_URL)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
@@ -315,7 +324,7 @@ struct HyperbolicRequest<'a> {
 }
 
 impl<'a> HyperbolicRequest<'a> {
-    pub fn new(
+    pub async fn new(
         model: &'a str,
         request: &'a ModelInferenceRequest<'_>,
     ) -> Result<HyperbolicRequest<'a>, Error> {
@@ -332,11 +341,19 @@ impl<'a> HyperbolicRequest<'a> {
         } = request;
 
         let messages = prepare_openai_messages(
-            request.system.as_deref().map(SystemOrDeveloper::System),
+            request
+                .system
+                .as_deref()
+                .map(|m| SystemOrDeveloper::System(Cow::Borrowed(m))),
             &request.messages,
-            Some(&request.json_mode),
-            PROVIDER_TYPE,
-        )?;
+            OpenAIMessagesConfig {
+                json_mode: Some(&request.json_mode),
+                provider_type: PROVIDER_TYPE,
+                fetch_and_encode_input_files_before_inference: request
+                    .fetch_and_encode_input_files_before_inference,
+            },
+        )
+        .await?;
         Ok(HyperbolicRequest {
             messages,
             model,
@@ -442,8 +459,8 @@ mod tests {
     };
     use crate::providers::test_helpers::WEATHER_TOOL_CONFIG;
 
-    #[test]
-    fn test_hyperbolic_request_new() {
+    #[tokio::test]
+    async fn test_hyperbolic_request_new() {
         let request_with_tools = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
             messages: vec![RequestMessage {
@@ -468,6 +485,7 @@ mod tests {
 
         let hyperbolic_request =
             HyperbolicRequest::new("meta-llama/Meta-Llama-3-70B-Instruct", &request_with_tools)
+                .await
                 .expect("failed to create Hyperbolic Request during test");
 
         assert_eq!(hyperbolic_request.messages.len(), 1);
@@ -511,8 +529,8 @@ mod tests {
             ErrorDetails::Config { message } if message.contains("Invalid api_key_location")
         ));
     }
-    #[test]
-    fn test_hyperbolic_response_with_metadata_try_into() {
+    #[tokio::test]
+    async fn test_hyperbolic_response_with_metadata_try_into() {
         let valid_response = OpenAIResponse {
             choices: vec![OpenAIResponseChoice {
                 index: 0,
@@ -526,7 +544,6 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -557,7 +574,9 @@ mod tests {
                 response_time: Duration::from_secs(0),
             },
             raw_request: serde_json::to_string(
-                &HyperbolicRequest::new("test-model", &generic_request).unwrap(),
+                &HyperbolicRequest::new("test-model", &generic_request)
+                    .await
+                    .unwrap(),
             )
             .unwrap(),
             generic_request: &generic_request,

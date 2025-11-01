@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::http::{TensorZeroEventSource, TensorzeroHttpClient};
@@ -25,11 +24,11 @@ use crate::inference::types::{
     ProviderInferenceResponseStreamInner, TextChunk,
 };
 use crate::inference::InferenceProvider;
-use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
+use crate::model::{Credential, ModelProvider};
 use crate::providers::helpers::{
     inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
-use crate::providers::openai::check_api_base_suffix;
+use crate::providers::openai::{check_api_base_suffix, OpenAIMessagesConfig};
 use crate::tool::ToolCallChunk;
 
 use super::openai::{
@@ -37,10 +36,6 @@ use super::openai::{
     OpenAIRequestMessage, OpenAIResponse, OpenAIResponseChoice, OpenAITool, OpenAIToolChoice,
     OpenAIUsage, StreamOptions, SystemOrDeveloper,
 };
-
-fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("SGLANG_API_KEY".to_string())
-}
 
 const PROVIDER_NAME: &str = "SGLang";
 pub const PROVIDER_TYPE: &str = "sglang";
@@ -55,29 +50,16 @@ pub struct SGLangProvider {
     credentials: SGLangCredentials,
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<SGLangCredentials> = OnceLock::new();
-
 impl SGLangProvider {
-    pub fn new(
-        model_name: String,
-        api_base: Url,
-        api_key_location: Option<CredentialLocation>,
-    ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-
+    pub fn new(model_name: String, api_base: Url, credentials: SGLangCredentials) -> Self {
         // Check if the api_base has the `/chat/completions` suffix and warn if it does
         check_api_base_suffix(&api_base);
 
-        Ok(SGLangProvider {
+        SGLangProvider {
             model_name,
             api_base,
             credentials,
-        })
+        }
     }
 
     pub fn model_name(&self) -> &str {
@@ -90,6 +72,10 @@ pub enum SGLangCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    WithFallback {
+        default: Box<SGLangCredentials>,
+        fallback: Box<SGLangCredentials>,
+    },
 }
 
 impl TryFrom<Credential> for SGLangCredentials {
@@ -101,6 +87,10 @@ impl TryFrom<Credential> for SGLangCredentials {
             Credential::Dynamic(key_name) => Ok(SGLangCredentials::Dynamic(key_name)),
             Credential::None => Ok(SGLangCredentials::None),
             Credential::Missing => Ok(SGLangCredentials::None),
+            Credential::WithFallback { default, fallback } => Ok(SGLangCredentials::WithFallback {
+                default: Box::new((*default).try_into()?),
+                fallback: Box::new((*fallback).try_into()?),
+            }),
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for SGLang provider".to_string(),
             })),
@@ -125,6 +115,16 @@ impl SGLangCredentials {
                 }))
                 .transpose()
             }
+            SGLangCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
+            }
             SGLangCredentials::None => Ok(None),
         }
     }
@@ -137,20 +137,23 @@ impl InferenceProvider for SGLangProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(SGLangRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing SGLang request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
+        let request_body = serde_json::to_value(
+            SGLangRequest::new(&self.model_name, request).await?,
+        )
+        .map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!(
+                    "Error serializing SGLang request: {}",
+                    DisplayOrDebugGateway::new(e)
+                ),
+            })
+        })?;
         let request_url = get_chat_url(&self.api_base)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
@@ -230,20 +233,23 @@ impl InferenceProvider for SGLangProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(SGLangRequest::new(&self.model_name, request)?)
-            .map_err(|e| {
-                Error::new(ErrorDetails::Serialization {
-                    message: format!(
-                        "Error serializing SGLang request: {}",
-                        DisplayOrDebugGateway::new(e)
-                    ),
-                })
-            })?;
+        let request_body = serde_json::to_value(
+            SGLangRequest::new(&self.model_name, request).await?,
+        )
+        .map_err(|e| {
+            Error::new(ErrorDetails::Serialization {
+                message: format!(
+                    "Error serializing SGLang request: {}",
+                    DisplayOrDebugGateway::new(e)
+                ),
+            })
+        })?;
 
         let request_url = get_chat_url(&self.api_base)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
@@ -550,7 +556,7 @@ struct SGLangRequest<'a> {
 }
 
 impl<'a> SGLangRequest<'a> {
-    pub fn new(
+    pub async fn new(
         model: &'a str,
         request: &'a ModelInferenceRequest<'_>,
     ) -> Result<SGLangRequest<'a>, Error> {
@@ -563,11 +569,19 @@ impl<'a> SGLangRequest<'a> {
             None
         };
         let messages = prepare_openai_messages(
-            request.system.as_deref().map(SystemOrDeveloper::System),
+            request
+                .system
+                .as_deref()
+                .map(|m| SystemOrDeveloper::System(Cow::Borrowed(m))),
             &request.messages,
-            Some(&request.json_mode),
-            PROVIDER_TYPE,
-        )?;
+            OpenAIMessagesConfig {
+                json_mode: Some(&request.json_mode),
+                provider_type: PROVIDER_TYPE,
+                fetch_and_encode_input_files_before_inference: request
+                    .fetch_and_encode_input_files_before_inference,
+            },
+        )
+        .await?;
 
         let (tools, tool_choice, parallel_tool_calls) = prepare_openai_tools(request);
         Ok(SGLangRequest {
@@ -683,8 +697,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_sglang_request_new() {
+    #[tokio::test]
+    async fn test_sglang_request_new() {
         let model_name = PROVIDER_TYPE.to_string();
         let basic_request = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
@@ -713,7 +727,9 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let sglang_request = SGLangRequest::new(&model_name, &basic_request).unwrap();
+        let sglang_request = SGLangRequest::new(&model_name, &basic_request)
+            .await
+            .unwrap();
 
         assert_eq!(sglang_request.model, &model_name);
         assert_eq!(sglang_request.messages.len(), 2);
@@ -750,7 +766,9 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        SGLangRequest::new(&model_name, &request_with_tools).expect_err("requires a schema");
+        SGLangRequest::new(&model_name, &request_with_tools)
+            .await
+            .expect_err("requires a schema");
 
         // Test request with in strict JSON mode requires an no output schema
         let request_with_tools = ModelInferenceRequest {
@@ -774,7 +792,9 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        SGLangRequest::new(&model_name, &request_with_tools).expect_err("requires a schema");
+        SGLangRequest::new(&model_name, &request_with_tools)
+            .await
+            .expect_err("requires a schema");
 
         // Test request with strict JSON mode with an output schema
         let output_schema = json!({});
@@ -800,7 +820,9 @@ mod tests {
             ..Default::default()
         };
 
-        let sglang_request = SGLangRequest::new(&model_name, &request_with_tools).unwrap();
+        let sglang_request = SGLangRequest::new(&model_name, &request_with_tools)
+            .await
+            .unwrap();
 
         assert_eq!(sglang_request.model, &model_name);
         assert_eq!(sglang_request.messages.len(), 1);
@@ -813,8 +835,8 @@ mod tests {
         assert_eq!(sglang_request.frequency_penalty, None);
     }
 
-    #[test]
-    fn test_sglang_response_with_metadata_try_into() {
+    #[tokio::test]
+    async fn test_sglang_response_with_metadata_try_into() {
         let valid_response = OpenAIResponse {
             choices: vec![OpenAIResponseChoice {
                 index: 0,
@@ -828,7 +850,6 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -859,7 +880,9 @@ mod tests {
                 response_time: Duration::from_secs(0),
             },
             raw_request: serde_json::to_string(
-                &SGLangRequest::new("test-model", &generic_request).unwrap(),
+                &SGLangRequest::new("test-model", &generic_request)
+                    .await
+                    .unwrap(),
             )
             .unwrap(),
             generic_request: &generic_request,
@@ -888,31 +911,27 @@ mod tests {
     #[traced_test]
     fn test_sglang_provider_new_api_base_check() {
         let model_name = "test-model".to_string();
-        let api_key_location = Some(CredentialLocation::None);
 
         // Valid cases (should not warn)
         let _ = SGLangProvider::new(
             model_name.clone(),
             Url::parse("http://localhost:1234/v1/").unwrap(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            SGLangCredentials::None,
+        );
 
         let _ = SGLangProvider::new(
             model_name.clone(),
             Url::parse("http://localhost:1234/v1").unwrap(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            SGLangCredentials::None,
+        );
 
         // Invalid cases (should warn)
         let invalid_url_1 = Url::parse("http://localhost:1234/chat/completions").unwrap();
         let _ = SGLangProvider::new(
             model_name.clone(),
             invalid_url_1.clone(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            SGLangCredentials::None,
+        );
         assert!(logs_contain("automatically appends `/chat/completions`"));
         assert!(logs_contain(invalid_url_1.as_ref()));
 
@@ -920,15 +939,14 @@ mod tests {
         let _ = SGLangProvider::new(
             model_name.clone(),
             invalid_url_2.clone(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            SGLangCredentials::None,
+        );
         assert!(logs_contain("automatically appends `/chat/completions`"));
         assert!(logs_contain(invalid_url_2.as_ref()));
     }
 
-    #[test]
-    fn test_sglang_tools() {
+    #[tokio::test]
+    async fn test_sglang_tools() {
         let model_name = PROVIDER_TYPE.to_string();
         let request_with_tools = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
@@ -952,7 +970,9 @@ mod tests {
             ..Default::default()
         };
 
-        let sglang_request = SGLangRequest::new(&model_name, &request_with_tools).unwrap();
+        let sglang_request = SGLangRequest::new(&model_name, &request_with_tools)
+            .await
+            .unwrap();
 
         let tools = sglang_request.tools.unwrap();
         assert_eq!(tools.len(), 2);
@@ -968,9 +988,9 @@ mod tests {
         let parallel_tool_calls = sglang_request.parallel_tool_calls.unwrap();
         assert!(parallel_tool_calls);
         let tool_config = ToolCallConfig {
-            tools_available: vec![],
             tool_choice: ToolChoice::Required,
             parallel_tool_calls: Some(true),
+            ..Default::default()
         };
 
         // Test no tools but a tool choice and make sure tool choice output is None
@@ -995,7 +1015,9 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let sglang_request = SGLangRequest::new(&model_name, &request_without_tools).unwrap();
+        let sglang_request = SGLangRequest::new(&model_name, &request_without_tools)
+            .await
+            .unwrap();
         assert!(sglang_request.tools.is_none());
         assert!(sglang_request.tool_choice.is_none());
         assert!(sglang_request.parallel_tool_calls.is_none());

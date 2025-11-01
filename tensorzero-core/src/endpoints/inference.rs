@@ -4,11 +4,12 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{debug_handler, Json};
 use futures::stream::Stream;
+use futures::FutureExt;
+use futures_core::FusedStream;
 use metrics::counter;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -16,21 +17,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::StreamExt;
+use tokio_util::task::TaskTracker;
 use tracing::instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::cache::{CacheOptions, CacheParamsOptions};
-use crate::config::{Config, ErrorContext, SchemaData, UninitializedVariantInfo};
+use crate::config::{Config, ErrorContext, OtlpConfig, SchemaData, UninitializedVariantInfo};
 use crate::db::clickhouse::{ClickHouseConnectionInfo, TableName};
+use crate::db::postgres::PostgresConnectionInfo;
 use crate::embeddings::EmbeddingModelTable;
-use crate::error::{Error, ErrorDetails};
+use crate::error::{Error, ErrorDetails, IMPOSSIBLE_ERROR_MESSAGE};
+use crate::experimentation::ExperimentationConfig;
 use crate::function::FunctionConfig;
-use crate::function::{sample_variant, FunctionConfigChat};
-use crate::gateway_util::{AppState, AppStateData, StructuredJson};
+use crate::function::FunctionConfigChat;
 use crate::http::TensorzeroHttpClient;
 use crate::inference::types::extra_body::UnfilteredInferenceExtraBody;
 use crate::inference::types::extra_headers::UnfilteredInferenceExtraHeaders;
+use crate::inference::types::resolved_input::LazyResolvedInput;
 use crate::inference::types::{
     collect_chunks, ChatInferenceDatabaseInsert, ChatInferenceResultChunk, CollectChunksArgs,
     ContentBlockChatOutput, ContentBlockChunk, FetchContext, FinishReason, InferenceResult,
@@ -41,13 +45,15 @@ use crate::inference::types::{
 use crate::jsonschema_util::DynamicJSONSchema;
 use crate::minijinja_util::TemplateConfig;
 use crate::model::ModelTable;
+use crate::rate_limiting::{RateLimitingConfig, ScopeInfo};
 use crate::tool::{DynamicToolParams, ToolCallConfig, ToolChoice};
+use crate::utils::gateway::{AppState, AppStateData, StructuredJson};
 use crate::variant::chat_completion::UninitializedChatCompletionConfig;
 use crate::variant::dynamic::load_dynamic_variant_info;
 use crate::variant::{InferenceConfig, JsonMode, Variant, VariantConfig, VariantInfo};
 
-use super::dynamic_evaluation_run::validate_inference_episode_id_and_apply_dynamic_evaluation_run;
 use super::validate_tags;
+use super::workflow_evaluation_run::validate_inference_episode_id_and_apply_workflow_evaluation_run;
 
 /// The expected payload is a JSON object with the following fields:
 #[derive(Debug, Default, Deserialize)]
@@ -93,6 +99,9 @@ pub struct Params {
     // parallel_tool_calls: Option<bool>,
     // If provided for a JSON inference, the inference will use the specified output schema instead of the
     // configured one. We only lazily validate this schema.
+    // provider_tools: Vec<ProviderTool> (defaults to [])
+    // If set, will attempt to pass this vector of tools to providers which run server-side tools
+    // that satisfy the scopes required.
     pub output_schema: Option<Value>,
     #[serde(default)]
     pub cache_options: CacheParamsOptions,
@@ -111,13 +120,13 @@ pub struct Params {
     pub internal_dynamic_variant_config: Option<UninitializedVariantInfo>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct InferenceMetadata {
     pub function_name: String,
     pub variant_name: String,
     pub episode_id: Uuid,
     pub inference_id: Uuid,
-    pub input: ResolvedInput,
+    pub input: Arc<LazyResolvedInput>,
     pub dryrun: bool,
     pub start_time: Instant,
     pub inference_params: InferenceParams,
@@ -134,6 +143,7 @@ struct InferenceMetadata {
     pub cached: bool,
     pub extra_body: UnfilteredInferenceExtraBody,
     pub extra_headers: UnfilteredInferenceExtraHeaders,
+    pub fetch_and_encode_input_files_before_inference: bool,
     pub include_original_response: bool,
 }
 
@@ -146,12 +156,21 @@ pub async fn inference_handler(
         config,
         http_client,
         clickhouse_connection_info,
+        postgres_connection_info,
+        deferred_tasks,
         ..
     }): AppState,
     StructuredJson(params): StructuredJson<Params>,
 ) -> Result<Response<Body>, Error> {
-    let inference_output =
-        inference(config, &http_client, clickhouse_connection_info, params).await?;
+    let inference_output = inference(
+        config,
+        &http_client,
+        clickhouse_connection_info,
+        postgres_connection_info,
+        deferred_tasks,
+        params,
+    )
+    .await?;
     match inference_output {
         InferenceOutput::NonStreaming(response) => Ok(Json(response).into_response()),
         InferenceOutput::Streaming(stream) => {
@@ -165,7 +184,7 @@ pub async fn inference_handler(
 }
 
 pub type InferenceStream =
-    Pin<Box<dyn Stream<Item = Result<InferenceResponseChunk, Error>> + Send>>;
+    Pin<Box<dyn FusedStream<Item = Result<InferenceResponseChunk, Error>> + Send>>;
 
 pub enum InferenceOutput {
     NonStreaming(InferenceResponse),
@@ -191,7 +210,7 @@ pub struct InferenceIds {
 
 #[instrument(
     name="inference",
-    skip(config, http_client, clickhouse_connection_info, params),
+    skip_all
     fields(
         function_name,
         model_name,
@@ -205,7 +224,9 @@ pub async fn inference(
     config: Arc<Config>,
     http_client: &TensorzeroHttpClient,
     clickhouse_connection_info: ClickHouseConnectionInfo,
-    params: Params,
+    postgres_connection_info: PostgresConnectionInfo,
+    deferred_tasks: TaskTracker,
+    mut params: Params,
 ) -> Result<InferenceOutput, Error> {
     let span = tracing::Span::current();
     if let Some(function_name) = &params.function_name {
@@ -220,6 +241,20 @@ pub async fn inference(
     if let Some(episode_id) = &params.episode_id {
         span.record("episode_id", episode_id.to_string());
     }
+
+    config
+        .gateway
+        .export
+        .otlp
+        .mark_openinference_chain_span(&span);
+
+    // Automatically add internal tag when internal=true
+    if params.internal {
+        params
+            .tags
+            .insert("tensorzero::internal".to_string(), "true".to_string());
+    }
+
     for (tag_key, tag_value) in &params.tags {
         span.set_attribute(format!("tags.{tag_key}"), tag_value.clone());
     }
@@ -231,8 +266,8 @@ pub async fn inference(
 
     // Retrieve or generate the episode ID
     let episode_id = params.episode_id.unwrap_or_else(Uuid::now_v7);
-    let mut params = params;
-    validate_inference_episode_id_and_apply_dynamic_evaluation_run(
+
+    validate_inference_episode_id_and_apply_workflow_evaluation_run(
         episode_id,
         params.function_name.as_ref(),
         &mut params.variant_name,
@@ -272,9 +307,9 @@ pub async fn inference(
     }
 
     let tool_config = function.prepare_tool_config(params.dynamic_tool_params, &config.tools)?;
-    let mut templates = Cow::Borrowed(&config.templates);
+    let mut templates = Arc::clone(&config.templates);
 
-    prepare_candidate_variants(
+    let needs_sampling = prepare_candidate_variants(
         &mut candidate_variants,
         &mut params.tags,
         params.variant_name.as_deref(),
@@ -283,7 +318,7 @@ pub async fn inference(
         &function,
         function_name.clone(),
     )?;
-    let templates = &*templates;
+    let templates = &templates;
 
     // Increment the request count if we're not in dryrun mode
     if !dryrun {
@@ -295,7 +330,9 @@ pub async fn inference(
             labels.push(("model_name", model_name.clone()));
         }
         counter!("request_count", &labels).increment(1);
+        counter!("tensorzero_requests_total", &labels).increment(1);
         counter!("inference_count", &labels).increment(1);
+        counter!("tensorzero_inferences_total", &labels).increment(1);
     }
 
     // Should we stream the inference?
@@ -307,180 +344,130 @@ pub async fn inference(
     // Set up inference config
     let output_schema = params.output_schema.map(DynamicJSONSchema::new);
 
+    let tags = Arc::new(params.tags.clone());
+
     let inference_clients = InferenceClients {
-        http_client,
-        clickhouse_connection_info: &clickhouse_connection_info,
-        credentials: &params.credentials,
-        cache_options: &(params.cache_options, dryrun).into(),
+        http_client: http_client.clone(),
+        clickhouse_connection_info: clickhouse_connection_info.clone(),
+        postgres_connection_info: postgres_connection_info.clone(),
+        credentials: Arc::new(params.credentials.clone()),
+        cache_options: (params.cache_options, dryrun).into(),
+        tags: tags.clone(),
+        rate_limiting_config: Arc::new(config.rate_limiting.clone()),
+        otlp_config: config.gateway.export.otlp.clone(),
+        deferred_tasks,
+        scope_info: ScopeInfo { tags: tags.clone() },
     };
 
     let inference_models = InferenceModels {
-        models: &config.models,
-        embedding_models: &config.embedding_models,
+        models: config.models.clone(),
+        embedding_models: config.embedding_models.clone(),
     };
-    let resolved_input = params
-        .input
-        .resolve(&FetchContext {
-            client: http_client,
-            object_store_info: &config.object_store_info,
+    let resolved_input = Arc::new(params.input.into_lazy_resolved_input(FetchContext {
+        client: http_client,
+        object_store_info: &config.object_store_info,
+    })?);
+
+    // If we don't need sampling (pinned or dynamic variant), directly infer with the single variant
+    if !needs_sampling {
+        // Extract the single variant (should be exactly one)
+        let (variant_name, variant) = candidate_variants
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                Error::new(ErrorDetails::Inference {
+                    message: format!("No candidate variants available for direct inference. {IMPOSSIBLE_ERROR_MESSAGE}"),
+                })
+            })?;
+
+        return infer_variant(InferVariantArgs {
+            variant_name,
+            variant,
+            function: &function,
+            function_name: &function_name,
+            inference_id,
+            episode_id,
+            dryrun,
+            start_time,
+            stream,
+            resolved_input,
+            inference_models,
+            inference_clients,
+            inference_params: params.params.clone(),
+            templates,
+            tool_config: &tool_config,
+            output_schema: &output_schema,
+            config: &config,
+            clickhouse_connection_info: &clickhouse_connection_info,
+            tags: &params.tags,
+            extra_body: &params.extra_body,
+            extra_headers: &params.extra_headers,
+            include_original_response: params.include_original_response,
         })
-        .await?;
+        .await;
+    }
+
     // Keep sampling variants until one succeeds
     while !candidate_variants.is_empty() {
-        let (variant_name, variant) =
-            sample_variant(&mut candidate_variants, &function_name, &episode_id)?;
-        // Will be edited by the variant as part of making the request so we must clone here
-        let variant_inference_params = params.params.clone();
-        let inference_config = InferenceConfig {
-            function_name: &function_name,
-            variant_name: &variant_name,
-            templates,
-            tool_config: tool_config.as_ref(),
-            dynamic_output_schema: output_schema.as_ref(),
-            ids: InferenceIds {
-                inference_id,
+        let result = function
+            .experimentation()
+            .sample(
+                &function_name,
                 episode_id,
-            },
-            extra_cache_key: None,
-            extra_body: Cow::Borrowed(&params.extra_body),
-            extra_headers: Cow::Borrowed(&params.extra_headers),
+                &mut candidate_variants,
+                &postgres_connection_info,
+            )
+            .await;
+        let (variant_name, variant) = match result {
+            Ok((variant_name, variant)) => (variant_name, variant),
+            Err(e) => {
+                if variant_errors.is_empty() {
+                    return Err(e);
+                }
+                // If the sampling fails we break out of the loop and return the AllVariantsExhausted error
+                // It is more informative to the caller that variants have failed than that there's some internal error with the sampling strategy.
+                // As we continue work on experimentation we will make sure that the sampler only errors if there is no way to provide a valid variant.
+                break;
+            }
         };
-        if stream {
-            let result = variant
-                .infer_stream(
-                    &resolved_input,
-                    &inference_models,
-                    function.as_ref(),
-                    &inference_config,
-                    &inference_clients,
-                    variant_inference_params,
-                )
-                .await;
 
-            // Make sure the response worked prior to launching the thread and starting to return chunks.
-            // The provider has already checked that the first chunk is OK.
-            let (stream, model_used_info) = match result {
-                Ok((stream, model_used_info)) => (stream, model_used_info),
-                Err(e) => {
-                    tracing::warn!(
-                        "functions.{function_name:?}.variants.{variant_name:?} failed during inference: {e}",
-                        function_name = params.function_name,
-                        variant_name = inference_config.variant_name,
-                    );
-                    variant_errors.insert(inference_config.variant_name.to_string(), e);
-                    continue;
-                }
-            };
-            let extra_body = inference_config.extra_body.into_owned();
-            let extra_headers = inference_config.extra_headers.into_owned();
-            // Create InferenceMetadata for a streaming inference
-            let inference_metadata = InferenceMetadata {
-                function_name: function_name.to_string(),
-                variant_name: inference_config.variant_name.to_string(),
-                inference_id,
-                episode_id,
-                input: resolved_input.clone(),
-                dryrun,
-                start_time,
-                inference_params: model_used_info.inference_params,
-                model_name: model_used_info.model_name,
-                model_provider_name: model_used_info.model_provider_name,
-                raw_request: model_used_info.raw_request,
-                raw_response: model_used_info.raw_response,
-                system: model_used_info.system,
-                input_messages: model_used_info.input_messages,
-                previous_model_inference_results: model_used_info.previous_model_inference_results,
-                tags: params.tags,
-                tool_config,
-                dynamic_output_schema: output_schema,
-                cached: model_used_info.cached,
-                extra_body,
-                extra_headers,
-                include_original_response: params.include_original_response,
-            };
+        let result = infer_variant(InferVariantArgs {
+            variant_name: variant_name.clone(),
+            variant,
+            function: &function,
+            function_name: &function_name,
+            inference_id,
+            episode_id,
+            dryrun,
+            start_time,
+            stream,
+            resolved_input: resolved_input.clone(),
+            inference_models: inference_models.clone(),
+            inference_clients: inference_clients.clone(),
+            inference_params: params.params.clone(),
+            templates,
+            tool_config: &tool_config,
+            output_schema: &output_schema,
+            config: &config,
+            clickhouse_connection_info: &clickhouse_connection_info,
+            tags: &params.tags,
+            extra_body: &params.extra_body,
+            extra_headers: &params.extra_headers,
+            include_original_response: params.include_original_response,
+        })
+        .await;
 
-            let stream = create_stream(
-                function,
-                config.clone(),
-                inference_metadata,
-                stream,
-                clickhouse_connection_info,
-            );
-
-            return Ok(InferenceOutput::Streaming(Box::pin(stream)));
-        } else {
-            let result = variant
-                .infer(
-                    &resolved_input,
-                    &inference_models,
-                    function.as_ref(),
-                    &inference_config,
-                    &inference_clients,
-                    variant_inference_params,
-                )
-                .await;
-
-            let mut result = match result {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::warn!(
-                        "functions.{function_name}.variants.{variant_name} failed during inference: {e}",
-                        function_name = function_name,
-                        variant_name = inference_config.variant_name,
-                    );
-                    variant_errors.insert(inference_config.variant_name.to_string(), e);
-                    continue;
-                }
-            };
-
-            if !dryrun {
-                // Spawn a thread for a trailing write to ClickHouse so that it doesn't block the response
-                let result_to_write = result.clone();
-                let extra_body = inference_config.extra_body.into_owned();
-                let extra_headers = inference_config.extra_headers.into_owned();
-                let write_metadata = InferenceDatabaseInsertMetadata {
-                    function_name: function_name.to_string(),
-                    variant_name: inference_config.variant_name.to_string(),
-                    episode_id,
-                    tool_config,
-                    processing_time: Some(start_time.elapsed()),
-                    ttft_ms: None,
-                    tags: params.tags,
-                    extra_body,
-                    extra_headers,
-                };
-
-                let async_writes = config.gateway.observability.async_writes;
-                // Always spawn a tokio task here. This ensures that 'write_inference' will
-                // not be cancelled partway through execution if the outer '/inference' request
-                // is cancelled. This reduces the chances that we only write to some tables and not others
-                // (but this is inherently best-effort due to ClickHouse's lack of transactions).
-                let write_future = tokio::spawn(async move {
-                    write_inference(
-                        &clickhouse_connection_info,
-                        &config,
-                        resolved_input,
-                        result_to_write,
-                        write_metadata,
-                    )
-                    .await;
-                });
-                if !async_writes {
-                    write_future.await.map_err(|e| {
-                        Error::new(ErrorDetails::InternalError {
-                            message: format!("Failed to await ClickHouse inference write: {e:?}"),
-                        })
-                    })?;
-                }
+        match result {
+            Ok(output) => return Ok(output),
+            Err(e) => {
+                tracing::warn!(
+                    "functions.{function_name}.variants.{variant_name} failed during inference: {e}",
+                    function_name = function_name,
+                    variant_name = variant_name,
+                );
+                variant_errors.insert(variant_name, e);
+                continue;
             }
-
-            if !params.include_original_response {
-                result.set_original_response(None);
-            }
-
-            let response = InferenceResponse::new(result, episode_id, variant_name);
-
-            return Ok(InferenceOutput::NonStreaming(response));
         }
     }
 
@@ -489,6 +476,206 @@ pub async fn inference(
         errors: variant_errors,
     }
     .into())
+}
+
+struct InferVariantArgs<'a> {
+    variant_name: String,
+    variant: Arc<VariantInfo>,
+    function: &'a Arc<FunctionConfig>,
+    function_name: &'a str,
+    inference_id: Uuid,
+    episode_id: Uuid,
+    dryrun: bool,
+    start_time: Instant,
+    stream: bool,
+    resolved_input: Arc<LazyResolvedInput>,
+    inference_models: InferenceModels,
+    inference_clients: InferenceClients,
+    inference_params: InferenceParams,
+    templates: &'a Arc<TemplateConfig<'static>>,
+    tool_config: &'a Option<ToolCallConfig>,
+    output_schema: &'a Option<DynamicJSONSchema>,
+    config: &'a Arc<Config>,
+    clickhouse_connection_info: &'a ClickHouseConnectionInfo,
+    tags: &'a HashMap<String, String>,
+    extra_body: &'a UnfilteredInferenceExtraBody,
+    extra_headers: &'a UnfilteredInferenceExtraHeaders,
+    include_original_response: bool,
+}
+
+async fn infer_variant(args: InferVariantArgs<'_>) -> Result<InferenceOutput, Error> {
+    let InferVariantArgs {
+        variant_name,
+        variant,
+        function,
+        function_name,
+        inference_id,
+        episode_id,
+        dryrun,
+        start_time,
+        stream,
+        resolved_input,
+        inference_models,
+        inference_clients,
+        inference_params,
+        templates,
+        tool_config,
+        output_schema,
+        config,
+        clickhouse_connection_info,
+        tags,
+        extra_body,
+        extra_headers,
+        include_original_response,
+    } = args;
+
+    // Will be edited by the variant as part of making the request so we must clone here
+    let variant_inference_params = inference_params.clone();
+    let inference_config = Arc::new(InferenceConfig {
+        function_name: Arc::from(function_name),
+        variant_name: Arc::from(variant_name.as_str()),
+        templates: Arc::clone(templates),
+        tool_config: tool_config.as_ref().map(|tc| Arc::new(tc.clone())),
+        dynamic_output_schema: output_schema
+            .as_ref()
+            .map(|schema| Arc::new(schema.clone())),
+        ids: InferenceIds {
+            inference_id,
+            episode_id,
+        },
+        fetch_and_encode_input_files_before_inference: config
+            .gateway
+            .fetch_and_encode_input_files_before_inference,
+        extra_cache_key: None,
+        extra_body: extra_body.clone(),
+        extra_headers: extra_headers.clone(),
+    });
+
+    if stream {
+        let result = variant
+            .infer_stream(
+                resolved_input.clone(),
+                inference_models,
+                function.clone(),
+                inference_config.clone(),
+                inference_clients,
+                variant_inference_params,
+            )
+            .await;
+
+        // Make sure the response worked prior to launching the thread and starting to return chunks.
+        // The provider has already checked that the first chunk is OK.
+        let (stream, model_used_info) = result?;
+
+        let extra_body = inference_config.extra_body.clone();
+        let extra_headers = inference_config.extra_headers.clone();
+        // Create InferenceMetadata for a streaming inference
+        let inference_metadata = InferenceMetadata {
+            function_name: function_name.to_string(),
+            variant_name: inference_config.variant_name.to_string(),
+            inference_id,
+            episode_id,
+            input: resolved_input,
+            dryrun,
+            start_time,
+            inference_params: model_used_info.inference_params,
+            model_name: model_used_info.model_name,
+            model_provider_name: model_used_info.model_provider_name,
+            raw_request: model_used_info.raw_request,
+            raw_response: model_used_info.raw_response,
+            system: model_used_info.system,
+            input_messages: model_used_info.input_messages,
+            previous_model_inference_results: model_used_info.previous_model_inference_results,
+            tags: tags.clone(),
+            tool_config: tool_config.clone(),
+            dynamic_output_schema: output_schema.clone(),
+            cached: model_used_info.cached,
+            extra_body,
+            extra_headers,
+            include_original_response,
+            fetch_and_encode_input_files_before_inference: config
+                .gateway
+                .fetch_and_encode_input_files_before_inference,
+        };
+
+        let stream = create_stream(
+            function.clone(),
+            config.clone(),
+            inference_metadata,
+            stream,
+            clickhouse_connection_info.clone(),
+        );
+
+        Ok(InferenceOutput::Streaming(Box::pin(stream)))
+    } else {
+        let result = variant
+            .infer(
+                Arc::clone(&resolved_input),
+                inference_models,
+                function.clone(),
+                Arc::clone(&inference_config),
+                inference_clients,
+                variant_inference_params,
+            )
+            .await;
+
+        let mut result = result?;
+
+        if !dryrun {
+            // Spawn a thread for a trailing write to ClickHouse so that it doesn't block the response
+            let result_to_write = result.clone();
+            let extra_body = inference_config.extra_body.clone();
+            let extra_headers = inference_config.extra_headers.clone();
+            let write_metadata = InferenceDatabaseInsertMetadata {
+                function_name: function_name.to_string(),
+                variant_name: inference_config.variant_name.to_string(),
+                episode_id,
+                tool_config: tool_config.clone(),
+                processing_time: Some(start_time.elapsed()),
+                ttft_ms: None,
+                tags: tags.clone(),
+                extra_body,
+                extra_headers,
+            };
+
+            let async_writes = config.gateway.observability.async_writes;
+            let clickhouse_connection_info = clickhouse_connection_info.clone();
+            let config = config.clone();
+            let resolved_input = resolved_input.clone();
+            // Always spawn a tokio task here. This ensures that 'write_inference' will
+            // not be cancelled partway through execution if the outer '/inference' request
+            // is cancelled. This reduces the chances that we only write to some tables and not others
+            // (but this is inherently best-effort due to ClickHouse's lack of transactions).
+            // TODO(https://github.com/tensorzero/tensorzero/issues/3983): Audit this callsite
+            #[expect(clippy::disallowed_methods)]
+            let write_future = tokio::spawn(async move {
+                let _: () = write_inference(
+                    &clickhouse_connection_info,
+                    &config,
+                    Arc::unwrap_or_clone(resolved_input).resolve().await?,
+                    result_to_write,
+                    write_metadata,
+                )
+                .await;
+                Ok::<_, Error>(())
+            });
+            if !async_writes {
+                write_future.await.map_err(|e| {
+                    Error::new(ErrorDetails::InternalError {
+                        message: format!("Failed to await ClickHouse inference write: {e:?}"),
+                    })
+                })??;
+            }
+        }
+
+        if !include_original_response {
+            result.set_original_response(None);
+        }
+
+        let response = InferenceResponse::new(result, episode_id, variant_name.clone());
+
+        Ok(InferenceOutput::NonStreaming(response))
+    }
 }
 
 /// Finds a function by `function_name` or `model_name`, erroring if an
@@ -503,7 +690,7 @@ fn find_function(params: &Params, config: &Config) -> Result<(Arc<FunctionConfig
     ) {
         // Get the function config or return an error if it doesn't exist
         (Some(function_name), None, _) => Ok((
-            config.get_function(function_name)?.into_owned(),
+            config.get_function(function_name)?.clone().into_owned(),
             function_name.to_string(),
         )),
         (None, Some(model_name), None) => {
@@ -550,6 +737,7 @@ fn find_function(params: &Params, config: &Config) -> Result<(Arc<FunctionConfig
                     parallel_tool_calls: None,
                     description: None,
                     all_explicit_templates_names: HashSet::new(),
+                    experimentation: ExperimentationConfig::default(),
                 })),
                 DEFAULT_FUNCTION_NAME.to_string(),
             ))
@@ -576,7 +764,7 @@ fn create_stream(
     metadata: InferenceMetadata,
     mut stream: InferenceResultStream,
     clickhouse_connection_info: ClickHouseConnectionInfo,
-) -> impl Stream<Item = Result<InferenceResponseChunk, Error>> + Send {
+) -> impl FusedStream<Item = Result<InferenceResponseChunk, Error>> + Send {
     async_stream::stream! {
         let mut buffer = vec![];
         let mut extra_usage = Some(metadata.previous_model_inference_results.iter().map(ModelInferenceResponseWithMetadata::usage_considering_cached).sum());
@@ -659,13 +847,14 @@ fn create_stream(
                 cached,
                 extra_body,
                 extra_headers,
+                fetch_and_encode_input_files_before_inference,
                 include_original_response: _,
             } = metadata;
 
             let config = config.clone();
             let async_write = config.gateway.observability.async_writes;
             let write_future = async move {
-                let templates = Cow::Borrowed(&config.templates);
+                let templates = Arc::clone(&config.templates);
                 let collect_chunks_args = CollectChunksArgs {
                     value: buffer,
                     inference_id,
@@ -678,14 +867,15 @@ fn create_stream(
                     raw_request,
                     raw_response,
                     inference_params,
-                    function_name: &function_name,
-                    variant_name: &variant_name,
-                    dynamic_output_schema,
-                    templates: &templates,
-                    tool_config: tool_config.as_ref(),
+                    function_name: Arc::from(function_name.as_str()),
+                    variant_name: Arc::from(variant_name.as_str()),
+                    dynamic_output_schema: dynamic_output_schema.map(Arc::new),
+                    templates,
+                    tool_config: tool_config.as_ref().map(|tc| Arc::new(tc.clone())),
                     cached,
                     extra_body: extra_body.clone(),
                     extra_headers: extra_headers.clone(),
+                    fetch_and_encode_input_files_before_inference,
                 };
                 let inference_response: Result<InferenceResult, Error> =
                     collect_chunks(collect_chunks_args).await;
@@ -707,20 +897,30 @@ fn create_stream(
                         extra_headers,
                     };
                     let config = config.clone();
+                        match Arc::unwrap_or_clone(input).resolve().await {
+                            Ok(input) => {
+                                let clickhouse_connection_info = clickhouse_connection_info.clone();
+                                write_inference(
+                                    &clickhouse_connection_info,
+                                    &config,
+                                    input,
+                                    inference_response,
+                                    write_metadata,
+                                ).await;
+                            },
+                            Err(e) => {
+                                tracing::error!("Failed to resolve input: {e:?}");
 
-                        let clickhouse_connection_info = clickhouse_connection_info.clone();
-                        write_inference(
-                            &clickhouse_connection_info,
-                            &config,
-                            input,
-                            inference_response,
-                            write_metadata,
-                        ).await;
+                            }
+                        };
+
 
                 }
                 drop(clickhouse_connection_info);
             };
             if async_write {
+                // TODO(https://github.com/tensorzero/tensorzero/issues/3983): Audit this callsite
+                #[expect(clippy::disallowed_methods)]
                 tokio::spawn(write_future);
             } else {
                 write_future.await;
@@ -795,38 +995,45 @@ async fn write_inference(
     result: InferenceResult,
     metadata: InferenceDatabaseInsertMetadata,
 ) {
+    let model_responses: Vec<serde_json::Value> = result.get_serialized_model_inferences().await;
     let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
         input.clone().write_all_files(config);
-    let model_responses: Vec<serde_json::Value> = result.get_serialized_model_inferences();
-    futures.push(Box::pin(async {
-        // Write the model responses to the ModelInference table
-        for response in model_responses {
+    // Write the model responses to the ModelInference table
+    futures.push(
+        async {
             let _ = clickhouse_connection_info
-                .write_batched(&[response], TableName::ModelInference)
+                .write_batched(&model_responses, TableName::ModelInference)
                 .await;
         }
+        .boxed(),
+    );
+    futures.push(Box::pin(async {
         // Write the inference to the Inference table
         match result {
-            InferenceResult::Chat(result) => {
-                let chat_inference = ChatInferenceDatabaseInsert::new(
-                    result,
-                    input.clone().into_stored_input(),
-                    metadata,
-                );
-                let _ = clickhouse_connection_info
-                    .write_batched(&[chat_inference], TableName::ChatInference)
-                    .await;
-            }
-            InferenceResult::Json(result) => {
-                let json_inference = JsonInferenceDatabaseInsert::new(
-                    result,
-                    input.clone().into_stored_input(),
-                    metadata,
-                );
-                let _ = clickhouse_connection_info
-                    .write_batched(&[json_inference], TableName::JsonInference)
-                    .await;
-            }
+            InferenceResult::Chat(result) => match input.clone().into_stored_input() {
+                Ok(stored_input) => {
+                    let chat_inference =
+                        ChatInferenceDatabaseInsert::new(result, stored_input, metadata);
+                    let _ = clickhouse_connection_info
+                        .write_batched(&[chat_inference], TableName::ChatInference)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to convert input to stored input: {e:?}");
+                }
+            },
+            InferenceResult::Json(result) => match input.clone().into_stored_input() {
+                Ok(stored_input) => {
+                    let json_inference =
+                        JsonInferenceDatabaseInsert::new(result, stored_input, metadata);
+                    let _ = clickhouse_connection_info
+                        .write_batched(&[json_inference], TableName::JsonInference)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to convert input to stored input: {e:?}");
+                }
+            },
         }
     }));
     futures::future::join_all(futures).await;
@@ -1080,18 +1287,25 @@ impl InferenceResponseChunk {
 }
 
 // Carryall struct for clients used in inference
-pub struct InferenceClients<'a> {
-    pub http_client: &'a TensorzeroHttpClient,
-    pub clickhouse_connection_info: &'a ClickHouseConnectionInfo,
-    pub credentials: &'a InferenceCredentials,
-    pub cache_options: &'a CacheOptions,
+#[derive(Clone)]
+pub struct InferenceClients {
+    pub http_client: TensorzeroHttpClient,
+    pub clickhouse_connection_info: ClickHouseConnectionInfo,
+    pub postgres_connection_info: PostgresConnectionInfo,
+    pub credentials: Arc<InferenceCredentials>,
+    pub cache_options: CacheOptions,
+    pub tags: Arc<HashMap<String, String>>,
+    pub rate_limiting_config: Arc<RateLimitingConfig>,
+    pub otlp_config: OtlpConfig,
+    pub deferred_tasks: TaskTracker,
+    pub scope_info: ScopeInfo,
 }
 
 // Carryall struct for models used in inference
-#[derive(Debug)]
-pub struct InferenceModels<'a> {
-    pub models: &'a ModelTable,
-    pub embedding_models: &'a EmbeddingModelTable,
+#[derive(Clone, Debug)]
+pub struct InferenceModels {
+    pub models: Arc<ModelTable>,
+    pub embedding_models: Arc<EmbeddingModelTable>,
 }
 
 /// InferenceParams is the top-level struct for inference parameters.
@@ -1161,16 +1375,25 @@ impl ChatCompletionInferenceParams {
     }
 }
 
+/// Prepares the candidate variants map using inference parameters prior to sampling
+/// This function handles 2 cases:
+/// 1. If a variant is pinned, only that variant should be attempted
+/// 2. If a dynamic variant is configured, only that variant should be attempted
+///
+/// It also errors if both are configured or there is a failure to initialize the dynamic variant
+///
+/// Returns `Ok(true)` if experimentation/sampling is needed (multiple candidate variants)
+/// Returns `Ok(false)` if direct inference is needed (single predetermined variant - no sampling)
 fn prepare_candidate_variants(
     candidate_variants: &mut BTreeMap<String, Arc<VariantInfo>>,
     tags: &mut HashMap<String, String>,
     pinned_variant_name: Option<&str>,
     dynamic_variant_config: Option<UninitializedVariantInfo>,
-    template_config: &mut Cow<'_, TemplateConfig>,
+    template_config: &mut Arc<TemplateConfig<'static>>,
     function: &FunctionConfig,
     function_name: String,
-) -> Result<(), Error> {
-    match (pinned_variant_name, dynamic_variant_config) {
+) -> Result<bool, Error> {
+    let needs_sampling = match (pinned_variant_name, dynamic_variant_config) {
         // If a variant is pinned, only that variant should be attempted
         (Some(variant_name), None) => {
             candidate_variants.retain(|k, _| k == variant_name);
@@ -1186,6 +1409,7 @@ fn prepare_candidate_variants(
                 "tensorzero::variant_pinned".to_string(),
                 variant_name.to_string(),
             );
+            false // Direct inference - no sampling needed
         }
         (None, Some(dynamic_variant_config)) => {
             // Replace the variant config with just the dynamic variant
@@ -1197,7 +1421,7 @@ fn prepare_candidate_variants(
 
             // Replace templates in the template config with the ones passed in
             // We Clone here so that we can still reference the old templates that don't conflict
-            let mut dynamic_template_config: TemplateConfig = template_config.clone().into_owned();
+            let mut dynamic_template_config: TemplateConfig = (**template_config).clone();
             for path_with_contents in candidate_variant_info.get_all_template_paths() {
                 let template_name = path_with_contents.path.get_template_key();
                 if dynamic_template_config.contains_template(&template_name) {
@@ -1209,42 +1433,40 @@ fn prepare_candidate_variants(
                 dynamic_template_config
                     .add_template(template_name, path_with_contents.contents.clone())?;
             }
-            *template_config = Cow::Owned(dynamic_template_config);
+            *template_config = Arc::new(dynamic_template_config);
             candidate_variants.clear();
             candidate_variants.insert(
                 "tensorzero::dynamic_variant".to_string(),
                 Arc::new(candidate_variant_info),
             );
+            false // Direct inference - no sampling needed
         }
-        (None, None) => {
-            // Remove all zero-weight variants - these can only be used if explicitly pinned above
-            candidate_variants.retain(|_, variant| {
-                // Retain 'None' and positive-weight variants, discarding zero-weight variants
-                variant.inner.weight().is_none_or(|w| w > 0.0)
-            });
-        }
-        _ => {
+        // If neither variant_name nor internal_dynamic_variant_config is set, we need sampling
+        (None, None) => true,
+        (Some(_), Some(_)) => {
             return Err(ErrorDetails::InvalidRequest {
                 message: "`variant_name` and `internal_dynamic_variant_config` cannot both be set."
                     .to_string(),
             }
             .into())
         }
-    }
-    Ok(())
+    };
+    Ok(needs_sampling)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use object_store::path::Path;
     use serde_json::json;
     use std::time::Duration;
     use uuid::Uuid;
 
     use crate::inference::types::{
-        ChatInferenceResultChunk, ContentBlockChunk, File, InputMessageContent,
-        JsonInferenceResultChunk, Role, TextChunk,
+        storage::{StorageKind, StoragePath},
+        Base64File, ChatInferenceResultChunk, ContentBlockChunk, File, InputMessageContent,
+        JsonInferenceResultChunk, ObjectStoragePointer, Role, TextChunk, UrlFile,
     };
 
     #[tokio::test]
@@ -1268,10 +1490,10 @@ mod tests {
             variant_name: "test_variant".to_string(),
             episode_id: Uuid::now_v7(),
             inference_id: Uuid::now_v7(),
-            input: ResolvedInput {
+            input: Arc::new(LazyResolvedInput {
                 messages: vec![],
                 system: None,
-            },
+            }),
             dryrun: false,
             inference_params: InferenceParams::default(),
             start_time: Instant::now(),
@@ -1288,6 +1510,7 @@ mod tests {
             cached: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            fetch_and_encode_input_files_before_inference: false,
             include_original_response: false,
         };
 
@@ -1321,10 +1544,10 @@ mod tests {
             variant_name: "test_variant".to_string(),
             inference_id: Uuid::now_v7(),
             episode_id: Uuid::now_v7(),
-            input: ResolvedInput {
+            input: Arc::new(LazyResolvedInput {
                 messages: vec![],
                 system: None,
-            },
+            }),
             dryrun: false,
             inference_params: InferenceParams::default(),
             start_time: Instant::now(),
@@ -1341,6 +1564,7 @@ mod tests {
             cached: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            fetch_and_encode_input_files_before_inference: false,
             include_original_response: false,
         };
 
@@ -1452,7 +1676,8 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_file_content() {
+    fn test_deserialize_file_content_untagged_url() {
+        // Test backwards compatibility: untagged URL should still deserialize
         let input_with_url = json!({
             "messages": [
                 {
@@ -1461,6 +1686,7 @@ mod tests {
                         {
                             "type": "file",
                             "url": "https://example.com/file.txt",
+                            "mime_type": "image/png"
                         }
                     ]
                 }
@@ -1473,12 +1699,16 @@ mod tests {
         assert_eq!(input_with_url.messages[0].content.len(), 1);
         assert_eq!(
             input_with_url.messages[0].content[0],
-            InputMessageContent::File(File::Url {
+            InputMessageContent::File(File::Url(UrlFile {
                 url: "https://example.com/file.txt".parse().unwrap(),
-                mime_type: None,
-            })
+                mime_type: Some(mime::IMAGE_PNG),
+            }))
         );
+    }
 
+    #[test]
+    fn test_deserialize_file_content_untagged_base64() {
+        // Test backwards compatibility: untagged Base64 should still deserialize
         let input_with_base64 = json!({
             "messages": [
                 {
@@ -1500,10 +1730,167 @@ mod tests {
         assert_eq!(input_with_base64.messages[0].content.len(), 1);
         assert_eq!(
             input_with_base64.messages[0].content[0],
-            InputMessageContent::File(File::Base64 {
+            InputMessageContent::File(File::Base64(Base64File {
+                source_url: None,
                 mime_type: mime::IMAGE_PNG,
                 data: "fake_base64_data".to_string(),
-            })
+            }))
         );
+    }
+
+    #[test]
+    fn test_serialize_file_content_always_tagged() {
+        // Test that serialization always produces tagged format
+        let file_url = File::Url(UrlFile {
+            url: "https://example.com/file.txt".parse().unwrap(),
+            mime_type: Some(mime::IMAGE_PNG),
+        });
+        let serialized = serde_json::to_value(&file_url).unwrap();
+        assert_eq!(serialized["file_type"], "url");
+        assert_eq!(serialized["url"], "https://example.com/file.txt");
+        assert_eq!(serialized["mime_type"], "image/png");
+
+        let file_base64 = File::Base64(Base64File {
+            source_url: None,
+            mime_type: mime::IMAGE_PNG,
+            data: "fake_base64_data".to_string(),
+        });
+        let serialized = serde_json::to_value(&file_base64).unwrap();
+        assert_eq!(serialized["file_type"], "base64");
+        assert_eq!(serialized["mime_type"], "image/png");
+        assert_eq!(serialized["data"], "fake_base64_data");
+    }
+
+    #[test]
+    fn test_deserialize_file_content_for_url() {
+        let input_with_url = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file_type": "url",
+                            "url": "https://example.com/file.txt",
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let input_with_url: Input = serde_json::from_value(input_with_url).unwrap();
+        assert_eq!(input_with_url.messages.len(), 1);
+        assert_eq!(input_with_url.messages[0].role, Role::User);
+        assert_eq!(input_with_url.messages[0].content.len(), 1);
+        assert_eq!(
+            input_with_url.messages[0].content[0],
+            InputMessageContent::File(File::Url(UrlFile {
+                url: "https://example.com/file.txt".parse().unwrap(),
+                mime_type: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_deserialize_file_content_for_base64() {
+        let input_with_base64 = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file_type": "base64",
+                            "data": "fake_base64_data",
+                            "mime_type": "image/png"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let input_with_base64: Input = serde_json::from_value(input_with_base64).unwrap();
+        assert_eq!(input_with_base64.messages.len(), 1);
+        assert_eq!(input_with_base64.messages[0].role, Role::User);
+        assert_eq!(input_with_base64.messages[0].content.len(), 1);
+        assert_eq!(
+            input_with_base64.messages[0].content[0],
+            InputMessageContent::File(File::Base64(Base64File {
+                source_url: None,
+                mime_type: mime::IMAGE_PNG,
+                data: "fake_base64_data".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn test_deserialize_file_content_for_object_storage() {
+        let input_with_object_storage = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "file",
+                            "file_type": "object_storage",
+                            "mime_type": "image/png",
+                            "storage_path": {
+                                "kind": {
+                                    "type": "s3_compatible",
+                                    "bucket_name": "test-bucket",
+                                    "region": "test-region",
+                                    "endpoint": "test-endpoint",
+                                    "allow_http": false,
+                                    "prefix": ""
+                                },
+                                "path": "test-path"
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let input_with_object_storage: Input =
+            serde_json::from_value(input_with_object_storage).unwrap();
+        assert_eq!(input_with_object_storage.messages.len(), 1);
+        assert_eq!(input_with_object_storage.messages[0].role, Role::User);
+        assert_eq!(input_with_object_storage.messages[0].content.len(), 1);
+        assert_eq!(
+            input_with_object_storage.messages[0].content[0],
+            InputMessageContent::File(File::ObjectStoragePointer(ObjectStoragePointer {
+                source_url: None,
+                mime_type: mime::IMAGE_PNG,
+                storage_path: StoragePath {
+                    kind: StorageKind::S3Compatible {
+                        bucket_name: Some("test-bucket".to_string()),
+                        region: Some("test-region".to_string()),
+                        endpoint: Some("test-endpoint".to_string()),
+                        allow_http: Some(false),
+                        prefix: String::new(),
+                    },
+                    path: Path::from("test-path"),
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn test_file_roundtrip_serialization() {
+        // Test that serialize -> deserialize maintains data integrity
+        let original = File::Base64(Base64File {
+            source_url: None,
+            mime_type: mime::IMAGE_JPEG,
+            data: "base64data".to_string(),
+        });
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let deserialized: File = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(original, deserialized);
+
+        // Verify serialized format is tagged
+        let serialized_value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(serialized_value["file_type"], "base64");
     }
 }

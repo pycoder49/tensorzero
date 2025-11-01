@@ -14,7 +14,7 @@ test("playground should work for a chat function that sets 2 variants", async ({
   // Select dataset 'foo'
   await page.getByText("Select a dataset").click();
   await page.getByPlaceholder(/dataset/i).fill("foo");
-  await page.getByRole("option", { name: "foo" }).click();
+  await page.locator('[data-dataset-name="foo"]').click();
 
   // Select variant 'initial_prompt_gpt4o_mini'
   await page
@@ -64,7 +64,7 @@ test("playground should work for extract_entities JSON function with 2 variants"
   // Select dataset 'foo'
   await page.getByText("Select a dataset").click();
   await page.getByPlaceholder(/dataset/i).fill("foo");
-  await page.getByRole("option", { name: "foo" }).click();
+  await page.locator('[data-dataset-name="foo"]').click();
 
   // Select variants 'baseline' and 'gpt4o_mini_initial_prompt'
   await page.getByPlaceholder("Filter by variant...").fill("baseline");
@@ -122,7 +122,7 @@ test("playground should work for image_judger function with images in input", as
   // Select dataset 'baz'
   await page.getByText("Select a dataset").click();
   await page.getByPlaceholder(/dataset/i).fill("baz");
-  await page.getByRole("option", { name: "baz" }).click();
+  await page.locator('[data-dataset-name="baz"]').click();
 
   // Select variant 'honest_answer'
   await page.getByPlaceholder("Filter by variant...").fill("honest_answer");
@@ -180,7 +180,7 @@ test("playground should work for data with tools", async ({ page }) => {
       .getByTestId("datapoint-playground-output")
       .getByText("Tool Call")
       .first(),
-  ).toBeVisible({ timeout: 20_000 });
+  ).toBeVisible({ timeout: 30_000 });
 
   // Verify that at least one tool call has the expected fields
   await expect(page.getByText("Name").first()).toBeVisible();
@@ -230,7 +230,7 @@ test("playground should work for data with tools", async ({ page }) => {
       .getByTestId("datapoint-playground-output")
       .getByText("Tool Call")
       .first(),
-  ).toBeVisible({ timeout: 20_000 });
+  ).toBeVisible({ timeout: 30_000 });
 
   // Verify that at least one tool call has the expected fields
   await expect(page.getByText("Name").first()).toBeVisible();
@@ -272,7 +272,7 @@ test("editing variants works @credentials", async ({ page }) => {
   // Target the system template editor specifically within the modal/sheet content
   const systemTemplateEditor = page
     .getByRole("dialog")
-    .getByText("System Template")
+    .getByText("system")
     .locator("..")
     .locator(".cm-content")
     .first();
@@ -295,4 +295,61 @@ test("editing variants works @credentials", async ({ page }) => {
   await expect(
     page.getByRole("textbox").filter({ hasText: "obtuse" }).first(),
   ).toBeVisible({ timeout: 10000 });
+});
+
+test("playground should work with tool config ID different from display name @credentials", async ({
+  page,
+}) => {
+  // This test verifies that tool filtering works correctly when a tool's config ID
+  // differs from its display name. The function 'multi_hop_rag_agent' has a tool
+  // configured with config ID 'answer_question' but display name 'submit_answer'.
+  // Before the fix, the tool filtering logic would incorrectly compare these values
+  // directly, causing tools not to be filtered properly.
+  await page.goto("/playground?limit=1");
+  await expect(page.getByText("Select a function")).toBeVisible();
+
+  // Select function 'multi_hop_rag_agent'
+  await page.getByText("Select a function").click();
+  await page.getByPlaceholder("Find a function...").fill("multi_hop_rag_agent");
+  await page.getByRole("option", { name: "multi_hop_rag_agent" }).click();
+
+  // Select dataset 'tool_call_examples'
+  await page.getByText("Select a dataset").click();
+  await page.getByPlaceholder(/dataset/i).fill("tool_call_examples");
+  await page.getByRole("option", { name: "tool_call_examples" }).click();
+
+  // Select variant 'baseline'
+  await page.getByPlaceholder("Filter by variant...").fill("baseline");
+  await page.getByRole("option", { name: "baseline" }).click();
+
+  // Verify the selections are visible
+  await expect(page.getByText("multi_hop_rag_agent")).toBeVisible();
+  await expect(
+    page.getByRole("combobox").filter({ hasText: "tool_call_examples" }),
+  ).toBeVisible();
+  await expect(page.getByRole("link", { name: "baseline" })).toBeVisible();
+
+  // Verify that there is at least 1 input
+  await expect(page.getByRole("heading", { name: "Input" })).toHaveCount(1);
+
+  // Wait for the inference to complete by verifying the tool call appears
+  // The inference should complete successfully because the tool filtering logic
+  // correctly maps config IDs to display names before filtering
+  await expect(
+    page
+      .getByTestId("datapoint-playground-output")
+      .getByText("Tool Call")
+      .first(),
+  ).toBeVisible({ timeout: 30_000 });
+
+  // Verify the tool call has expected fields
+  await expect(page.getByText("Name").first()).toBeVisible();
+  await expect(page.getByText("ID").first()).toBeVisible();
+  await expect(page.getByText("Arguments").first()).toBeVisible();
+
+  // Verify that there are no inference errors
+  // This is the key assertion - if tool filtering was broken, we'd see an error here
+  await expect(
+    page.getByRole("heading", { name: "Inference Error" }),
+  ).toHaveCount(0);
 });

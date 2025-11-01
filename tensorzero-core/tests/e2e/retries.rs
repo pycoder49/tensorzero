@@ -3,7 +3,7 @@ use reqwest::{Client, StatusCode};
 use reqwest_eventsource::{Event, RequestBuilderExt};
 use serde_json::{json, Value};
 use tensorzero_core::{
-    inference::types::{ContentBlock, RequestMessage, Role, Text},
+    inference::types::{Role, StoredContentBlock, StoredRequestMessage, Text},
     providers::dummy::{
         DUMMY_INFER_RESPONSE_CONTENT, DUMMY_INFER_RESPONSE_RAW, DUMMY_RAW_REQUEST,
         DUMMY_STREAMING_RESPONSE,
@@ -86,7 +86,7 @@ async fn e2e_test_inference_flaky() {
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "Hello, world!"}]
+                    "content": [{"type": "text", "text": "Hello, world!"}]
                 }
             ]
         }
@@ -140,19 +140,21 @@ async fn e2e_test_inference_flaky() {
         "You are a helpful and friendly assistant named AskJeeves"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
     assert_eq!(
         input_messages,
-        vec![RequestMessage {
+        vec![StoredRequestMessage {
             role: Role::User,
-            content: vec!["Hello, world!".to_string().into()],
+            content: vec![StoredContentBlock::Text(Text {
+                text: "Hello, world!".to_string()
+            })],
         }]
     );
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(
         output,
-        vec![ContentBlock::Text(Text {
+        vec![StoredContentBlock::Text(Text {
             text: DUMMY_INFER_RESPONSE_CONTENT.to_string(),
         })]
     );
@@ -255,7 +257,7 @@ async fn e2e_test_streaming_flaky() {
             "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "Hello, world!"}]
+                "content": [{"type": "text", "text": "Hello, world!"}]
             }
         ]}
     );
@@ -325,19 +327,21 @@ async fn e2e_test_streaming_flaky() {
         "You are a helpful and friendly assistant named AskJeeves"
     );
     let input_messages = result.get("input_messages").unwrap().as_str().unwrap();
-    let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+    let input_messages: Vec<StoredRequestMessage> = serde_json::from_str(input_messages).unwrap();
     assert_eq!(
         input_messages,
-        vec![RequestMessage {
+        vec![StoredRequestMessage {
             role: Role::User,
-            content: vec!["Hello, world!".to_string().into(),],
+            content: vec![StoredContentBlock::Text(Text {
+                text: "Hello, world!".to_string()
+            })],
         }]
     );
     let output = result.get("output").unwrap().as_str().unwrap();
-    let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+    let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
     assert_eq!(
         output,
-        vec![ContentBlock::Text(Text {
+        vec![StoredContentBlock::Text(Text {
             text: DUMMY_STREAMING_RESPONSE.join(""),
         })]
     );
@@ -416,7 +420,7 @@ async fn e2e_test_best_of_n_dummy_candidates_flaky_judge() {
             "messages": [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "value": "Please write me a sentence about Megumin making an explosion."}]
+                    "content": [{"type": "text", "text": "Please write me a sentence about Megumin making an explosion."}]
                 }
             ]
         }

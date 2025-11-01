@@ -20,6 +20,7 @@ pub fn get_gateway_endpoint(endpoint: &str) -> Url {
     base_url.join(endpoint).unwrap()
 }
 
+// TODO(shuyangli): delete after uniting with tensorzero-core/src/db/clickhouse/dataset_queries.rs::stale_datapoint.
 pub async fn delete_datapoint(
     clickhouse: &ClickHouseConnectionInfo,
     datapoint_kind: DatapointKind,
@@ -42,7 +43,7 @@ pub async fn delete_datapoint(
 
     // We delete datapoints by writing a new row (which ClickHouse will merge)
     // with the 'is_deleted' and 'updated_at' fields modified.
-    datapoint_json["is_deleted"] = serde_json::Value::Bool(true);
+    datapoint_json["is_deleted"] = true.into();
     datapoint_json["updated_at"] =
         format!("{}", chrono::Utc::now().format(CLICKHOUSE_DATETIME_FORMAT)).into();
 

@@ -11,13 +11,13 @@ use serde_json::json;
 use tensorzero::input_handling::resolved_input_to_client_input;
 use tensorzero_core::cache::CacheEnabledMode;
 use tensorzero_core::db::clickhouse::test_helpers::{
-    select_human_static_evaluation_feedback_clickhouse, select_model_inferences_clickhouse,
+    select_inference_evaluation_human_feedback_clickhouse, select_model_inferences_clickhouse,
 };
-use tensorzero_core::endpoints::datasets::Datapoint;
+use tensorzero_core::endpoints::datasets::StoredDatapoint;
 use tensorzero_core::evaluations::{LLMJudgeConfig, LLMJudgeInputFormat, LLMJudgeOutputType};
 use tensorzero_core::function::{FunctionConfig, FunctionConfigJson};
 use tensorzero_core::inference::types::{
-    StoredInput, StoredInputMessage, StoredInputMessageContent, TemplateInput, Text,
+    StoredInput, StoredInputMessage, StoredInputMessageContent, Text,
 };
 use tokio::time::sleep;
 use url::Url;
@@ -39,7 +39,7 @@ use tensorzero_core::{
 };
 use tensorzero_core::{
     endpoints::{
-        datasets::{ChatInferenceDatapoint, JsonInferenceDatapoint},
+        datasets::{JsonInferenceDatapoint, StoredChatInferenceDatapoint},
         inference::{ChatInferenceResponse, JsonInferenceResponse},
     },
     evaluations::{LLMJudgeIncludeConfig, LLMJudgeOptimize},
@@ -101,6 +101,7 @@ async fn run_evaluations_json() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert_eq!(parsed.evaluator_errors.len(), 1);
         let error = parsed.evaluator_errors.get("error").unwrap();
@@ -259,7 +260,7 @@ async fn run_evaluations_json() {
         // Sleep for 5s to make sure the feedback is recorded
         sleep(Duration::from_secs(5)).await;
 
-        let human_feedback = select_human_static_evaluation_feedback_clickhouse(
+        let human_feedback = select_inference_evaluation_human_feedback_clickhouse(
             &clickhouse,
             metric_name,
             datapoint_id,
@@ -296,6 +297,7 @@ async fn run_evaluations_json() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         let inference_id = parsed.response.inference_id();
         // We only check the total_topic_fs for the second run
@@ -371,6 +373,7 @@ async fn run_exact_match_evaluation_chat() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(parsed.evaluator_errors.is_empty());
         let inference_id = parsed.response.inference_id();
@@ -383,22 +386,8 @@ async fn run_exact_match_evaluation_chat() {
         };
         let clickhouse_input: StoredInput =
             serde_json::from_str(clickhouse_inference["input"].as_str().unwrap()).unwrap();
-        // The fixture is parsed from the old-style template, so convert it in place
-        let mut parsed_input = parsed.datapoint.input().clone();
-        for message in &mut parsed_input.messages {
-            for content in &mut message.content {
-                if let StoredInputMessageContent::Text { value } = content {
-                    if value.is_object() {
-                        *content = StoredInputMessageContent::Template(TemplateInput {
-                            name: message.role.implicit_template_name().to_string(),
-                            arguments: value.as_object().unwrap().clone(),
-                        });
-                    }
-                }
-            }
-        }
         // Check the input to the inference is the same as the input to the datapoint
-        assert_eq!(&clickhouse_input, &parsed_input);
+        assert_eq!(&clickhouse_input, parsed.datapoint.input());
         let clickhouse_output: Vec<ContentBlockChatOutput> =
             serde_json::from_str(clickhouse_inference["output"].as_str().unwrap()).unwrap();
         // Check the output to the inference is the same as the output in the response
@@ -509,6 +498,7 @@ async fn run_llm_judge_evaluation_chat() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(parsed.evaluator_errors.is_empty());
         let inference_id = parsed.response.inference_id();
@@ -521,22 +511,8 @@ async fn run_llm_judge_evaluation_chat() {
         };
         let clickhouse_input: StoredInput =
             serde_json::from_str(clickhouse_inference["input"].as_str().unwrap()).unwrap();
-        // The fixture is parsed from the old-style template, so convert it in place
-        let mut parsed_input = parsed.datapoint.input().clone();
-        for message in &mut parsed_input.messages {
-            for content in &mut message.content {
-                if let StoredInputMessageContent::Text { value } = content {
-                    if value.is_object() {
-                        *content = StoredInputMessageContent::Template(TemplateInput {
-                            name: message.role.implicit_template_name().to_string(),
-                            arguments: value.as_object().unwrap().clone(),
-                        });
-                    }
-                }
-            }
-        }
         // Check the input to the inference is the same as the input to the datapoint
-        assert_eq!(&clickhouse_input, &parsed_input);
+        assert_eq!(&clickhouse_input, parsed.datapoint.input());
         let clickhouse_output: Vec<ContentBlockChatOutput> =
             serde_json::from_str(clickhouse_inference["output"].as_str().unwrap()).unwrap();
         // Check the output to the inference is the same as the output in the response
@@ -667,6 +643,7 @@ async fn run_llm_judge_evaluation_chat() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         let inference_id = parsed.response.inference_id();
         // We only check the total_topic_fs for the second run
@@ -743,6 +720,7 @@ async fn run_image_evaluation() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(parsed.evaluator_errors.is_empty());
         let inference_id = parsed.response.inference_id();
@@ -954,6 +932,7 @@ async fn check_invalid_image_evaluation() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert_eq!(parsed.evaluator_errors.len(), 1);
         let honest_answer_error = &parsed.evaluator_errors["honest_answer"];
@@ -1255,6 +1234,7 @@ async fn run_evaluations_errors() {
                 serde_json::to_string_pretty(&evaluation_info).unwrap()
             ),
             EvaluationUpdate::Error(evaluation_error) => evaluation_error,
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(error
             .message
@@ -1298,14 +1278,14 @@ async fn test_run_llm_judge_evaluator_chat() {
         },
         variant_name: "test_variant".to_string(),
     });
-    let datapoint = Datapoint::Chat(ChatInferenceDatapoint {
+    let datapoint = StoredDatapoint::Chat(StoredChatInferenceDatapoint {
         input: StoredInput {
             system: None,
             messages: vec![StoredInputMessage {
                 role: Role::User,
-                content: vec![StoredInputMessageContent::Text {
-                    value: json!("Hello, world!"),
-                }],
+                content: vec![StoredInputMessageContent::Text(Text {
+                    text: "Hello, world!".to_string(),
+                })],
             }],
         },
         auxiliary: String::new(),
@@ -1321,7 +1301,9 @@ async fn test_run_llm_judge_evaluator_chat() {
         tool_params: None,
         source_inference_id: None,
         staled_at: None,
+        updated_at: "2025-10-13T20:17:36Z".to_string(),
         is_custom: true,
+        name: None,
     });
     let llm_judge_config = LLMJudgeConfig {
         input_format: LLMJudgeInputFormat::Serialized,
@@ -1405,14 +1387,14 @@ async fn test_run_llm_judge_evaluator_chat() {
     assert_eq!(result.value, json!(1));
 
     // Try without output
-    let datapoint = Datapoint::Chat(ChatInferenceDatapoint {
+    let datapoint = StoredDatapoint::Chat(StoredChatInferenceDatapoint {
         input: StoredInput {
             system: None,
             messages: vec![StoredInputMessage {
                 role: Role::User,
-                content: vec![StoredInputMessageContent::Text {
-                    value: json!("Hello, world!"),
-                }],
+                content: vec![StoredInputMessageContent::Text(Text {
+                    text: "Hello, world!".to_string(),
+                })],
             }],
         },
         auxiliary: String::new(),
@@ -1426,7 +1408,9 @@ async fn test_run_llm_judge_evaluator_chat() {
         tool_params: None,
         source_inference_id: None,
         staled_at: None,
+        updated_at: "2025-10-13T20:17:36Z".to_string(),
         is_custom: true,
+        name: None,
     });
 
     let result = run_llm_judge_evaluator(RunLLMJudgeEvaluatorParams {
@@ -1469,14 +1453,14 @@ async fn test_run_llm_judge_evaluator_json() {
         },
         variant_name: "test_variant".to_string(),
     });
-    let datapoint = Datapoint::Json(JsonInferenceDatapoint {
+    let datapoint = StoredDatapoint::Json(JsonInferenceDatapoint {
         input: StoredInput {
             system: None,
             messages: vec![StoredInputMessage {
                 role: Role::User,
-                content: vec![StoredInputMessageContent::Text {
-                    value: json!("Hello, world!"),
-                }],
+                content: vec![StoredInputMessageContent::Text(Text {
+                    text: "Hello, world!".to_string(),
+                })],
             }],
         },
         auxiliary: String::new(),
@@ -1493,7 +1477,9 @@ async fn test_run_llm_judge_evaluator_json() {
         tags: None,
         source_inference_id: None,
         staled_at: None,
+        updated_at: "2025-10-13T20:17:36Z".to_string(),
         is_custom: true,
+        name: None,
     });
     let llm_judge_config = LLMJudgeConfig {
         input_format: LLMJudgeInputFormat::Serialized,
@@ -1577,14 +1563,14 @@ async fn test_run_llm_judge_evaluator_json() {
     assert_eq!(result.value, json!(1));
 
     // Try without output
-    let datapoint = Datapoint::Chat(ChatInferenceDatapoint {
+    let datapoint = StoredDatapoint::Chat(StoredChatInferenceDatapoint {
         input: StoredInput {
             system: None,
             messages: vec![StoredInputMessage {
                 role: Role::User,
-                content: vec![StoredInputMessageContent::Text {
-                    value: json!("Hello, world!"),
-                }],
+                content: vec![StoredInputMessageContent::Text(Text {
+                    text: "Hello, world!".to_string(),
+                })],
             }],
         },
         auxiliary: String::new(),
@@ -1598,7 +1584,9 @@ async fn test_run_llm_judge_evaluator_json() {
         tool_params: None,
         source_inference_id: None,
         staled_at: None,
+        updated_at: "2025-10-13T20:17:36Z".to_string(),
         is_custom: true,
+        name: None,
     });
 
     let result = run_llm_judge_evaluator(RunLLMJudgeEvaluatorParams {
@@ -1663,6 +1651,7 @@ async fn run_evaluations_best_of_3() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(parsed.evaluator_errors.is_empty());
         let inference_id = parsed.response.inference_id();
@@ -1850,6 +1839,7 @@ async fn run_evaluations_mixture_of_3() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(parsed.evaluator_errors.is_empty());
         let inference_id = parsed.response.inference_id();
@@ -2040,6 +2030,7 @@ async fn run_evaluations_dicl() {
             EvaluationUpdate::Error(evaluation_error) => {
                 panic!("evaluation error: {}", evaluation_error.message);
             }
+            EvaluationUpdate::RunInfo(_) => continue,
         };
         assert!(parsed.evaluator_errors.is_empty());
         let inference_id = parsed.response.inference_id();

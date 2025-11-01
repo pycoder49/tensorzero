@@ -57,11 +57,13 @@ dev = [
     "pytest-xdist",
     "pytest-rerunfailures",
     "pytest",
+    "pytest-httpserver",
     "openai",
     "clickhouse-connect",
     "pandas",
+    "requests",
 ]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-include = [".cargo/*"]
+include = [".cargo/*", ".sqlx/*"]

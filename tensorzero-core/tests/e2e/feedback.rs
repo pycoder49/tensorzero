@@ -3,20 +3,24 @@ use serde_json::{json, Value};
 use tensorzero_core::{
     config::{Config, MetricConfig, MetricConfigLevel, MetricConfigOptimize, MetricConfigType},
     db::{
-        clickhouse::test_helpers::{select_feedback_clickhouse, select_feedback_tags_clickhouse},
+        clickhouse::test_helpers::{
+            select_feedback_clickhouse, select_feedback_tags_clickhouse,
+            select_feedback_tags_clickhouse_with_feedback_id,
+        },
         postgres::PostgresConnectionInfo,
     },
     endpoints::feedback::{feedback, Params},
-    gateway_util::GatewayHandle,
     http::TensorzeroHttpClient,
-    inference::types::{ContentBlockChatOutput, JsonInferenceOutput, Role, Text, TextKind},
+    inference::types::{
+        Arguments, ContentBlockChatOutput, JsonInferenceOutput, Role, System, Text, TextKind,
+    },
+    utils::gateway::GatewayHandle,
 };
 use tokio::time::{sleep, Duration};
 use tracing_test::traced_test;
 use uuid::Uuid;
 
 use crate::common::get_gateway_endpoint;
-use crate::providers::common::make_embedded_gateway;
 use tensorzero_core::db::clickhouse::test_helpers::get_clickhouse;
 
 #[tokio::test]
@@ -25,7 +29,7 @@ async fn e2e_test_comment_feedback_normal_function() {
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     })).await;
@@ -127,7 +131,7 @@ async fn e2e_test_comment_feedback_with_payload(inference_payload: serde_json::V
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     });
@@ -179,7 +183,7 @@ async fn e2e_test_comment_feedback_with_payload(inference_payload: serde_json::V
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_test_comment_feedback_validation_disabled() {
-    let mut config = Config::default();
+    let mut config = Config::new_empty().await.unwrap();
     let clickhouse = get_clickhouse().await;
     config.gateway.unstable_disable_feedback_target_validation = true;
     let handle = GatewayHandle::new_with_database_and_http_client(
@@ -187,7 +191,9 @@ async fn e2e_test_comment_feedback_validation_disabled() {
         clickhouse.clone(),
         PostgresConnectionInfo::Disabled,
         TensorzeroHttpClient::new().unwrap(),
-    );
+    )
+    .await
+    .unwrap();
     let inference_id = Uuid::now_v7();
     let params = Params {
         inference_id: Some(inference_id),
@@ -335,7 +341,7 @@ async fn e2e_test_demonstration_feedback_with_payload(inference_payload: serde_j
 
     // Try a tool call demonstration
     // This should fail because the inference was made for a function that doesn't support tool calls
-    let tool_call = json!({"type": "tool_call", "name": "tool_name", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "tool_name", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -380,7 +386,7 @@ async fn e2e_test_demonstration_feedback_json() {
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     });
@@ -456,7 +462,7 @@ async fn e2e_test_demonstration_feedback_json() {
 
     // Try a tool call demonstration
     // This should fail because the inference was made for a function that doesn't support tool calls
-    let tool_call = json!({"type": "tool_call", "name": "tool_name", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "tool_name", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -494,7 +500,7 @@ async fn e2e_test_demonstration_feedback_llm_judge() {
         "function_name": "tensorzero::llm_judge::haiku_without_outputs::topic_starts_with_f",
         "input": {
             "messages": [{"role": "user", "content": [
-                {"type": "text", "arguments": {"input": "foo", "reference_output": null, "generated_output": "A poem about a cat"}},
+                {"type": "template", "name": "user", "arguments": {"input": "foo", "reference_output": null, "generated_output": "A poem about a cat"}},
             ]}]
         },
         "stream": false,
@@ -587,7 +593,7 @@ async fn e2e_test_demonstration_feedback_dynamic_json() {
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
         "output_schema": new_output_schema,
@@ -664,7 +670,7 @@ async fn e2e_test_demonstration_feedback_dynamic_json() {
 
     // Try a tool call demonstration
     // This should fail because the inference was made for a function that doesn't support tool calls
-    let tool_call = json!({"type": "tool_call", "name": "tool_name", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "tool_name", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -786,7 +792,7 @@ async fn e2e_test_demonstration_feedback_tool() {
 
     // Try a tool call demonstration
     // This should fail because the name is incorrect
-    let tool_call = json!({"type": "tool_call", "name": "tool_name", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "tool_name", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -800,8 +806,7 @@ async fn e2e_test_demonstration_feedback_tool() {
     assert_eq!(error_message, "Demonstration contains invalid tool name");
 
     // Try a tool call demonstration with correct name incorrect args
-    let tool_call =
-        json!({"type": "tool_call", "name": "get_temperature", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "get_temperature", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -818,7 +823,7 @@ async fn e2e_test_demonstration_feedback_tool() {
     );
 
     // Try a tool call demonstration with correct name and args
-    let tool_call = json!({"type": "tool_call", "name": "get_temperature", "arguments": {"location": "Tokyo", "units": "celsius"}});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "get_temperature", "arguments": {"location": "Tokyo", "units": "celsius"}});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -845,7 +850,7 @@ async fn e2e_test_demonstration_feedback_tool() {
     assert_eq!(retrieved_inference_id_uuid, inference_id);
     let retrieved_value = result.get("value").unwrap().as_str().unwrap();
     let retrieved_value = serde_json::from_str::<Value>(retrieved_value).unwrap();
-    let expected_value = json!([{"type": "tool_call", "name": "get_temperature", "arguments": {"location": "Tokyo", "units": "celsius"}, "raw_name": "get_temperature", "raw_arguments": "{\"location\":\"Tokyo\",\"units\":\"celsius\"}", "id": "" }]);
+    let expected_value = json!([{"type": "tool_call", "name": "get_temperature", "arguments": {"location": "Tokyo", "units": "celsius"}, "raw_name": "get_temperature", "raw_arguments": "{\"location\":\"Tokyo\",\"units\":\"celsius\"}", "id": "tool_call_id" }]);
     assert_eq!(retrieved_value, expected_value);
 }
 
@@ -946,7 +951,7 @@ async fn e2e_test_demonstration_feedback_dynamic_tool() {
 
     // Try a tool call demonstration
     // This should fail because the name is incorrect
-    let tool_call = json!({"type": "tool_call", "name": "tool_name", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "tool_name", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -960,7 +965,7 @@ async fn e2e_test_demonstration_feedback_dynamic_tool() {
     assert_eq!(error_message, "Demonstration contains invalid tool name");
 
     // Try a tool call demonstration with the dynamic tool name and incorrect args
-    let tool_call = json!({"type": "tool_call", "name": "get_humidity", "arguments": "tool_input"});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "get_humidity", "arguments": "tool_input"});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -977,8 +982,7 @@ async fn e2e_test_demonstration_feedback_dynamic_tool() {
     );
 
     // Try a tool call demonstration with the dynamic tool name and correct args
-    let tool_call =
-        json!({"type": "tool_call", "name": "get_humidity", "arguments": {"location": "Tokyo"}});
+    let tool_call = json!({"type": "tool_call", "id": "tool_call_id", "name": "get_humidity", "arguments": {"location": "Tokyo"}});
     let payload = json!({"inference_id": inference_id, "metric_name": "demonstration", "value": vec![tool_call]});
     let response = client
         .post(get_gateway_endpoint("/feedback"))
@@ -1005,7 +1009,7 @@ async fn e2e_test_demonstration_feedback_dynamic_tool() {
     assert_eq!(retrieved_inference_id_uuid, inference_id);
     let retrieved_value = result.get("value").unwrap().as_str().unwrap();
     let retrieved_value = serde_json::from_str::<Value>(retrieved_value).unwrap();
-    let expected_value = json!([{"type": "tool_call", "name": "get_humidity", "arguments": {"location": "Tokyo"}, "raw_name": "get_humidity", "raw_arguments": "{\"location\":\"Tokyo\"}", "id": "" }]);
+    let expected_value = json!([{"type": "tool_call", "name": "get_humidity", "arguments": {"location": "Tokyo"}, "raw_name": "get_humidity", "raw_arguments": "{\"location\":\"Tokyo\"}", "id": "tool_call_id" }]);
     assert_eq!(retrieved_value, expected_value);
 }
 
@@ -1015,7 +1019,7 @@ async fn e2e_test_float_feedback_normal_function() {
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     })).await;
@@ -1147,7 +1151,7 @@ async fn e2e_test_float_feedback_with_payload(inference_payload: serde_json::Val
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     });
@@ -1203,7 +1207,7 @@ async fn e2e_test_float_feedback_with_payload(inference_payload: serde_json::Val
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_test_float_feedback_validation_disabled() {
-    let mut config = Config::default();
+    let mut config = Config::new_empty().await.unwrap();
     let metric_config = MetricConfig {
         r#type: MetricConfigType::Float,
         optimize: MetricConfigOptimize::Max,
@@ -1219,7 +1223,9 @@ async fn e2e_test_float_feedback_validation_disabled() {
         clickhouse.clone(),
         PostgresConnectionInfo::Disabled,
         TensorzeroHttpClient::new().unwrap(),
-    );
+    )
+    .await
+    .unwrap();
     let inference_id = Uuid::now_v7();
     let params = Params {
         inference_id: Some(inference_id),
@@ -1249,7 +1255,7 @@ async fn e2e_test_boolean_feedback_normal_function() {
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     })).await;
@@ -1389,7 +1395,7 @@ async fn e2e_test_boolean_feedback_with_payload(inference_payload: serde_json::V
         "function_name": "json_success",
         "input": {
             "system": {"assistant_name": "Alfred Pennyworth"},
-            "messages": [{"role": "user", "content": [{"type": "text", "arguments": {"country": "Japan"}}]}]
+            "messages": [{"role": "user", "content": [{"type": "template", "name": "user", "arguments": {"country": "Japan"}}]}]
         },
         "stream": false,
     });
@@ -1438,7 +1444,7 @@ async fn e2e_test_boolean_feedback_with_payload(inference_payload: serde_json::V
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_test_boolean_feedback_validation_disabled() {
-    let mut config = Config::default();
+    let mut config = Config::new_empty().await.unwrap();
     let metric_config = MetricConfig {
         r#type: MetricConfigType::Boolean,
         optimize: MetricConfigOptimize::Max,
@@ -1454,7 +1460,9 @@ async fn e2e_test_boolean_feedback_validation_disabled() {
         clickhouse.clone(),
         PostgresConnectionInfo::Disabled,
         TensorzeroHttpClient::new().unwrap(),
-    );
+    )
+    .await
+    .unwrap();
     let inference_id = Uuid::now_v7();
     let params = Params {
         inference_id: Some(inference_id),
@@ -1485,13 +1493,15 @@ async fn test_fast_inference_then_feedback() {
     use std::collections::HashMap;
     use std::sync::Arc;
     // Create the client and wrap it in an Arc for shared ownership.
-    let client = make_embedded_gateway().await;
+    let client = tensorzero::test_helpers::make_embedded_gateway().await;
     let client = Arc::new(client);
 
     // Create a collection of tasks, each making an inference then a feedback call.
     let tasks: Vec<_> = (0..20)
         .map(|_| {
             let client = Arc::clone(&client);
+            // TODO(https://github.com/tensorzero/tensorzero/issues/3983): Audit this callsite
+            #[expect(clippy::disallowed_methods)]
             tokio::spawn(async move {
                 let inference_payload = tensorzero::ClientInferenceParams {
                     function_name: Some("basic_test".to_string()),
@@ -1499,7 +1509,9 @@ async fn test_fast_inference_then_feedback() {
                     variant_name: None,
                     episode_id: None,
                     input: tensorzero::ClientInput {
-                        system: Some(json!({"assistant_name": "Alfred Pennyworth"})),
+                        system: Some(System::Template(Arguments(serde_json::Map::from_iter([
+                            ("assistant_name".to_string(), "Alfred Pennyworth".into()),
+                        ])))),
                         messages: vec![tensorzero::ClientInputMessage {
                             role: Role::User,
                             content: vec![tensorzero::ClientInputMessageContent::Text(TextKind::Text {
@@ -1545,4 +1557,87 @@ async fn test_fast_inference_then_feedback() {
     // Wait for all tasks to finish.
     futures::future::join_all(tasks).await;
     assert!(!logs_contain("does not exist"));
+}
+
+#[tokio::test]
+async fn test_feedback_internal_tag_auto_injection() {
+    let client = Client::new();
+
+    // First, run an inference to get a valid inference_id
+    let inference_payload = serde_json::json!({
+        "function_name": "basic_test",
+        "input": {
+            "system": {"assistant_name": "Alfred"},
+            "messages": [{"role": "user", "content": "Hello!"}]
+        },
+    });
+
+    let response = client
+        .post(get_gateway_endpoint("/inference"))
+        .json(&inference_payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+    let response_json = response.json::<Value>().await.unwrap();
+    let inference_id = response_json.get("inference_id").unwrap().as_str().unwrap();
+    let inference_id = Uuid::parse_str(inference_id).unwrap();
+
+    sleep(Duration::from_millis(1000)).await;
+
+    // Now send feedback with internal=true and a custom tag
+    // We should NOT manually set tensorzero::internal - it should be auto-injected
+    let payload = json!({
+        "inference_id": inference_id,
+        "metric_name": "task_success",
+        "value": true,
+        "internal": true,
+        "tags": {
+            "custom_tag": "custom_value"
+        }
+    });
+
+    let response = client
+        .post(get_gateway_endpoint("/feedback"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_json = response.json::<Value>().await.unwrap();
+    let feedback_id = response_json.get("feedback_id").unwrap().as_str().unwrap();
+    let feedback_id = Uuid::parse_str(feedback_id).unwrap();
+
+    sleep(Duration::from_millis(1000)).await;
+
+    println!("Feedback sent with ID: {feedback_id}");
+
+    // Check ClickHouse to verify both tags are present
+    let clickhouse = get_clickhouse().await;
+
+    // Verify custom tag is present
+    let _ = select_feedback_tags_clickhouse_with_feedback_id(
+        &clickhouse,
+        &feedback_id.to_string(),
+        "task_success",
+        "custom_tag",
+        "custom_value",
+    )
+    .await
+    .expect("Failed to call select_feedback_tags_clickhouse_with_feedback_id for task_success");
+
+    // Verify auto-injected tensorzero::internal tag is present
+    let _ = select_feedback_tags_clickhouse_with_feedback_id(
+        &clickhouse,
+        &feedback_id.to_string(),
+        "task_success",
+        "tensorzero::internal",
+        "true",
+    )
+    .await
+    .expect(
+        "Failed to call select_feedback_tags_clickhouse_with_feedback_id for tensorzero::internal",
+    );
 }

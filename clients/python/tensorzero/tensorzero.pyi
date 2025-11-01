@@ -20,8 +20,8 @@ from tensorzero import (
     ChatDatapointInsert,
     ChatInferenceOutput,
     ContentBlock,
-    DynamicEvaluationRunEpisodeResponse,
-    DynamicEvaluationRunResponse,
+    DynamicEvaluationRunEpisodeResponse,  # DEPRECATED
+    DynamicEvaluationRunResponse,  # DEPRECATED
     ExtraBody,
     FeedbackResponse,
     InferenceChunk,
@@ -29,10 +29,12 @@ from tensorzero import (
     InferenceResponse,
     JsonDatapointInsert,
     OptimizationConfig,
+    WorkflowEvaluationRunEpisodeResponse,
+    WorkflowEvaluationRunResponse,
 )
 from tensorzero.internal import ModelInput, ToolCallConfigDatabaseInsert
 from tensorzero.types import (
-    InferenceFilterTreeNode,
+    InferenceFilter,
     JsonInferenceOutput,
     OrderBy,
 )
@@ -46,6 +48,92 @@ class ResolvedInputMessage:
 class ResolvedInput:
     system: Optional[str | Dict[str, Any]]
     messages: List[ResolvedInputMessage]
+
+@final
+class EvaluationJobHandler:
+    """
+    Handler for synchronous evaluation job results.
+
+    Results are cached in memory as you iterate to support summary_stats().
+    For large evaluations, this may use significant memory.
+    """
+
+    @property
+    def run_info(self) -> dict[str, Any]:
+        """Get evaluation run metadata (evaluation_run_id, num_datapoints)."""
+        ...
+
+    def results(self) -> "EvaluationJobHandler":
+        """Returns an iterator over evaluation results."""
+        ...
+
+    def __iter__(self) -> "EvaluationJobHandler": ...
+    def __next__(self) -> dict[str, Any]:
+        """
+        Get next evaluation result.
+
+        Returns dict with:
+          - type: "success" | "error"
+          - For success: datapoint, response, evaluations, evaluator_errors (all as dicts)
+          - For error: datapoint_id (str), message (str)
+
+        Note: Results are cached in memory for summary_stats() computation.
+        """
+        ...
+
+    def summary_stats(self) -> dict[str, dict[str, float]]:
+        """
+        Get summary statistics from all consumed results.
+
+        Uses cached results collected during iteration.
+        Returns dict mapping evaluator names to {"mean": float, "stderr": float}.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+@final
+class AsyncEvaluationJobHandler:
+    """
+    Handler for asynchronous evaluation job results.
+
+    Results are cached in memory as you iterate to support summary_stats().
+    For large evaluations, this may use significant memory.
+    """
+
+    @property
+    def run_info(self) -> dict[str, Any]:
+        """Get evaluation run metadata (evaluation_run_id, num_datapoints)."""
+        ...
+
+    def results(self) -> "AsyncEvaluationJobHandler":
+        """Returns an async iterator over evaluation results."""
+        ...
+
+    def __aiter__(self) -> "AsyncEvaluationJobHandler": ...
+    async def __anext__(self) -> dict[str, Any]:
+        """
+        Get next evaluation result asynchronously.
+
+        Returns dict with:
+          - type: "success" | "error"
+          - For success: datapoint, response, evaluations, evaluator_errors (all as dicts)
+          - For error: datapoint_id (str), message (str)
+
+        Note: Results are cached in memory for summary_stats() computation.
+        """
+        ...
+
+    async def summary_stats(self) -> dict[str, dict[str, float]]:
+        """
+        Get summary statistics from all consumed results.
+
+        Uses cached results collected during iteration.
+        Returns dict mapping evaluator names to {"mean": float, "stderr": float}.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
 
 @final
 class StoredInference:
@@ -62,12 +150,14 @@ class StoredInference:
         episode_id: UUID,
         inference_id: UUID,
         timestamp: str,
-        tool_params: Optional[Any] = None,
+        allowed_tools: Optional[List[str]] = None,
+        additional_tools: Optional[List[Any]] = None,
+        tool_choice: Optional[str] = None,
+        parallel_tool_calls: Optional[bool] = None,
+        provider_tools: Optional[List[Any]] = None,
         output_schema: Optional[Any] = None,
         # Dispreferred outputs are lists because there may be several of them in the future.
-        dispreferred_outputs: Union[
-            List[ChatInferenceOutput], List[JsonInferenceOutput]
-        ] = [],
+        dispreferred_outputs: Union[List[ChatInferenceOutput], List[JsonInferenceOutput]] = [],
         tags: Dict[str, str] = {},
     ) -> None: ...
     def __repr__(self) -> str: ...
@@ -84,7 +174,13 @@ class StoredInference:
     @property
     def inference_id(self) -> Optional[UUID]: ...
     @property
-    def tool_params(self) -> Optional[Any]: ...
+    def allowed_tools(self) -> Optional[List[str]]: ...
+    @property
+    def additional_tools(self) -> Optional[List[Any]]: ...
+    @property
+    def parallel_tool_calls(self) -> Optional[bool]: ...
+    @property
+    def provider_tools(self) -> Optional[List[Any]]: ...
     @property
     def output_schema(self) -> Optional[Any]: ...
     @property
@@ -111,6 +207,14 @@ class RenderedSample:
     output_schema: Optional[Dict[str, Any]]
     dispreferred_outputs: List[ChatInferenceOutput] = []
     tags: Dict[str, str]
+    @property
+    def allowed_tools(self) -> Optional[List[str]]: ...
+    @property
+    def additional_tools(self) -> Optional[List[Any]]: ...
+    @property
+    def parallel_tool_calls(self) -> Optional[bool]: ...
+    @property
+    def provider_tools(self) -> Optional[List[Any]]: ...
 
 @final
 class OptimizationJobHandle:
@@ -297,9 +401,17 @@ class Datapoint:
     @property
     def function_name(self) -> str: ...
     @property
-    def tool_params(self) -> Optional[Any]: ...
+    def allowed_tools(self) -> Optional[List[str]]: ...
+    @property
+    def additional_tools(self) -> Optional[List[Any]]: ...
+    @property
+    def parallel_tool_calls(self) -> Optional[bool]: ...
+    @property
+    def provider_tools(self) -> Optional[List[Any]]: ...
     @property
     def output_schema(self) -> Optional[Any]: ...
+    @property
+    def name(self) -> Optional[str]: ...
     @property
     def is_custom(self) -> bool: ...
 
@@ -374,9 +486,7 @@ class FunctionConfigJson:
 @final
 class FunctionsConfig:
     def __len__(self) -> int: ...
-    def __getitem__(
-        self, key: str
-    ) -> Union[FunctionConfigChat, FunctionConfigJson]: ...
+    def __getitem__(self, key: str) -> Union[FunctionConfigChat, FunctionConfigJson]: ...
 
 @final
 class Config:
@@ -388,13 +498,6 @@ class BaseTensorZeroGateway:
 
 @final
 class TensorZeroGateway(BaseTensorZeroGateway):
-    def __init__(self, base_url: str, *, timeout: Optional[float] = None) -> None:
-        """
-        Initialize the TensorZero client.
-
-        :param base_url: The base URL of the TensorZero gateway. Example: "http://localhost:3000"
-        """
-
     @classmethod
     def build_http(
         cls,
@@ -402,12 +505,14 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         gateway_url: str,
         timeout: Optional[float] = None,
         verbose_errors: bool = False,
+        api_key: Optional[str] = None,
     ) -> "TensorZeroGateway":
         """
         Initialize the TensorZero client, using the HTTP gateway.
         :param gateway_url: The base URL of the TensorZero gateway. Example: "http://localhost:3000"
         :param timeout: The timeout for the HTTP client in seconds. If not provided, no timeout will be set.
         :param verbose_errors: If true, the client will increase the detail in errors (increasing the risk of leaking sensitive information).
+        :param api_key: The API key to use for authentication with the TensorZero Gateway. If not provided, the client will attempt to read from the TENSORZERO_API_KEY environment variable.
         :return: A `TensorZeroGateway` instance configured to use the HTTP gateway.
         """
 
@@ -443,9 +548,8 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         output_schema: Optional[Dict[str, Any]] = None,
         allowed_tools: Optional[List[str]] = None,
         additional_tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[
-            Union[Literal["auto", "required", "off"], Dict[Literal["specific"], str]]
-        ] = None,
+        provider_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[Literal["auto", "required", "off"], Dict[Literal["specific"], str]]] = None,
         parallel_tool_calls: Optional[bool] = None,
         internal: Optional[bool] = None,
         tags: Optional[Dict[str, str]] = None,
@@ -453,7 +557,9 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         cache_options: Optional[Dict[str, Any]] = None,
         extra_body: Optional[List[ExtraBody | Dict[str, Any]]] = None,
         extra_headers: Optional[List[Dict[str, Any]]] = None,
+        otlp_traces_extra_headers: Optional[Dict[str, str]] = None,
         include_original_response: Optional[bool] = None,
+        internal_dynamic_variant_config: Optional[Dict[str, Any]] = None,
     ) -> Union[InferenceResponse, Iterator[InferenceChunk]]:
         """
         Make a POST request to the /inference endpoint.
@@ -478,12 +584,14 @@ class TensorZeroGateway(BaseTensorZeroGateway):
                               The list of names should be a subset of the tools configured for the function.
                               Tools provided at inference time in `additional_tools` (if any) are always available.
         :param additional_tools: A list of additional tools to use for the request. Each element should look like {"name": str, "parameters": valid JSON Schema, "description": str}
+        :param provider_tools: A list of provider-specific tools to use for the request. Structure matches provider requirements.
         :param tool_choice: If set, overrides the tool choice strategy for the request.
                             It should be one of: "auto", "required", "off", or {"specific": str}. The last option pins the request to a specific tool name.
         :param parallel_tool_calls: If true, the request will allow for multiple tool calls in a single inference request.
         :param tags: If set, adds tags to the inference request.
         :param extra_body: If set, injects extra fields into the provider request body.
         :param extra_headers: If set, injects extra headers into the provider request.
+        :param otlp_traces_extra_headers: If set, adds custom headers to OTLP trace exports. Headers will be automatically prefixed with "tensorzero-otlp-traces-extra-header-".
         :param include_original_response: If set, add an `original_response` field to the response, containing the raw string response from the model.
         :return: If stream is false, returns an InferenceResponse.
                  If stream is true, returns an async iterator that yields InferenceChunks as they come in.
@@ -525,6 +633,7 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         display_name: Optional[str] = None,
     ) -> DynamicEvaluationRunResponse:
         """
+        DEPRECATED: Use `workflow_evaluation_run` instead.
         Make a POST request to the /dynamic_evaluation_run endpoint.
 
         :param variants: A dictionary of variant names to variant values.
@@ -539,27 +648,75 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         *,
         run_id: str | UUID | uuid_utils.UUID,
         task_name: Optional[str] = None,
-        datapoint_name: Optional[str] = None,
         tags: Optional[Dict[str, str]] = None,
     ) -> DynamicEvaluationRunEpisodeResponse:
         """
-        Make a POST request to the /dynamic_evaluation_run_episode endpoint.
+        DEPRECATED: Use `workflow_evaluation_run_episode` instead.
+
+        Make a POST request to the /dynamic_evaluation_run/{run_id}/episode endpoint.
 
         :param run_id: The run ID to use for the dynamic evaluation run.
         :param task_name: The name of the task to use for the dynamic evaluation run.
-        :param datapoint_name: The name of the datapoint to use for the dynamic evaluation run.
-                    Deprecated: use `task_name` instead.
         :param tags: A dictionary of tags to add to the dynamic evaluation run.
         :return: A `DynamicEvaluationRunEpisodeResponse` instance ({"episode_id": str}).
+        """
+
+    def workflow_evaluation_run(
+        self,
+        *,
+        variants: Dict[str, str],
+        tags: Optional[Dict[str, str]] = None,
+        project_name: Optional[str] = None,
+        display_name: Optional[str] = None,
+    ) -> WorkflowEvaluationRunResponse:
+        """
+        Make a POST request to the /workflow_evaluation_run endpoint.
+
+        :param variants: A dictionary of variant names to variant values.
+        :param tags: A dictionary of tags to add to the workflow evaluation run.
+        :param project_name: The name of the project to use for the workflow evaluation run.
+        :param display_name: The display name of the workflow evaluation run.
+        :return: A `WorkflowEvaluationRunResponse` instance ({"run_id": str}).
+        """
+
+    def workflow_evaluation_run_episode(
+        self,
+        *,
+        run_id: str | UUID | uuid_utils.UUID,
+        task_name: Optional[str] = None,
+        tags: Optional[Dict[str, str]] = None,
+    ) -> WorkflowEvaluationRunEpisodeResponse:
+        """
+        Make a POST request to the /workflow_evaluation_run/{run_id}/episode endpoint.
+
+        :param run_id: The run ID to use for the workflow evaluation run.
+        :param task_name: The name of the task to use for the workflow evaluation run.
+        :param tags: A dictionary of tags to add to the workflow evaluation run.
+        :return: A `WorkflowEvaluationRunEpisodeResponse` instance ({"episode_id": str}).
+        """
+
+    def create_datapoints(
+        self,
+        *,
+        dataset_name: str,
+        datapoints: Sequence[Union[ChatDatapointInsert, JsonDatapointInsert]],
+    ) -> List[UUID]:
+        """
+        Make a POST request to the /datasets/{dataset_name}/datapoints endpoint.
+
+        :param dataset_name: The name of the dataset to insert the datapoints into.
+        :param datapoints: A list of datapoints to insert.
         """
 
     def bulk_insert_datapoints(
         self,
         *,
         dataset_name: str,
-        datapoints: List[Union[ChatDatapointInsert, JsonDatapointInsert]],
+        datapoints: Sequence[Union[ChatDatapointInsert, JsonDatapointInsert]],
     ) -> List[UUID]:
         """
+        DEPRECATED: Use `create_datapoints` instead.
+
         Make a POST request to the /datasets/{dataset_name}/datapoints/bulk endpoint.
 
         :param dataset_name: The name of the dataset to insert the datapoints into.
@@ -616,7 +773,7 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         *,
         function_name: str,
         variant_name: Optional[str] = None,
-        filters: Optional[InferenceFilterTreeNode] = None,
+        filters: Optional[InferenceFilter] = None,
         output_source: str = "inference",
         order_by: Optional[List[OrderBy]] = None,
         limit: Optional[int] = None,
@@ -713,6 +870,28 @@ class TensorZeroGateway(BaseTensorZeroGateway):
         """
         ...
 
+    def experimental_run_evaluation(
+        self,
+        *,
+        evaluation_name: str,
+        dataset_name: str,
+        variant_name: str,
+        concurrency: int = 1,
+        inference_cache: str = "on",
+    ) -> EvaluationJobHandler:
+        """
+        Run an evaluation for a specific variant on a dataset.
+        This function is only available in EmbeddedGateway mode.
+
+        :param evaluation_name: The name of the evaluation to run
+        :param dataset_name: The name of the dataset to use for evaluation
+        :param variant_name: The name of the variant to evaluate
+        :param concurrency: The number of concurrent evaluations to run
+        :param inference_cache: Cache configuration for inference requests ("on", "off", "read_only", or "write_only")
+        :return: An EvaluationJobHandler for iterating over evaluation results
+        """
+        ...
+
     def close(self) -> None:
         """
         Close the connection to the TensorZero gateway.
@@ -728,13 +907,6 @@ class TensorZeroGateway(BaseTensorZeroGateway):
 
 @final
 class AsyncTensorZeroGateway(BaseTensorZeroGateway):
-    def __init__(self, base_url: str, *, timeout: Optional[float] = None) -> None:
-        """
-        Initialize the TensorZero client.
-
-        :param base_url: The base URL of the TensorZero gateway. Example: "http://localhost:3000"
-        """
-
     @classmethod
     def build_http(
         cls,
@@ -743,6 +915,7 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         timeout: Optional[float] = None,
         verbose_errors: bool = False,
         async_setup: bool = True,
+        api_key: Optional[str] = None,
     ) -> Union[Awaitable["AsyncTensorZeroGateway"], "AsyncTensorZeroGateway"]:
         """
         Initialize the TensorZero client, using the HTTP gateway.
@@ -750,6 +923,7 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         :param timeout: The timeout for the HTTP client in seconds. If not provided, no timeout will be set.
         :param verbose_errors: If true, the client will increase the detail in errors (increasing the risk of leaking sensitive information).
         :param async_setup (Optional): If True, this method will return a `Future` that resolves to an `AsyncTensorZeroGateway` instance. Otherwise, it will block and return an `AsyncTensorZeroGateway` directly.
+        :param api_key: The API key to use for authentication with the TensorZero Gateway. If not provided, the client will attempt to read from the TENSORZERO_API_KEY environment variable.
         :return: An `AsyncTensorZeroGateway` instance configured to use the HTTP gateway.
         """
 
@@ -787,9 +961,8 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         output_schema: Optional[Dict[str, Any]] = None,
         allowed_tools: Optional[List[str]] = None,
         additional_tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[
-            Union[Literal["auto", "required", "off"], Dict[Literal["specific"], str]]
-        ] = None,
+        provider_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[Literal["auto", "required", "off"], Dict[Literal["specific"], str]]] = None,
         parallel_tool_calls: Optional[bool] = None,
         internal: Optional[bool] = None,
         tags: Optional[Dict[str, str]] = None,
@@ -797,7 +970,9 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         cache_options: Optional[Dict[str, Any]] = None,
         extra_body: Optional[List[ExtraBody | Dict[str, Any]]] = None,
         extra_headers: Optional[List[Dict[str, Any]]] = None,
+        otlp_traces_extra_headers: Optional[Dict[str, str]] = None,
         include_original_response: Optional[bool] = None,
+        internal_dynamic_variant_config: Optional[Dict[str, Any]] = None,
     ) -> Union[InferenceResponse, AsyncIterator[InferenceChunk]]:
         """
         Make a POST request to the /inference endpoint.
@@ -822,12 +997,14 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
                               The list of names should be a subset of the tools configured for the function.
                               Tools provided at inference time in `additional_tools` (if any) are always available.
         :param additional_tools: A list of additional tools to use for the request. Each element should look like {"name": str, "parameters": valid JSON Schema, "description": str}
+        :param provider_tools: A list of provider-specific tools to use for the request. Structure matches provider requirements.
         :param tool_choice: If set, overrides the tool choice strategy for the request.
                             It should be one of: "auto", "required", "off", or {"specific": str}. The last option pins the request to a specific tool name.
         :param parallel_tool_calls: If true, the request will allow for multiple tool calls in a single inference request.
         :param tags: If set, adds tags to the inference request.
         :param extra_body: If set, injects extra fields into the provider request body.
         :param extra_headers: If set, injects extra headers into the provider request.
+        :param otlp_traces_extra_headers: If set, adds custom headers to OTLP trace exports. Headers will be automatically prefixed with "tensorzero-otlp-traces-extra-header-".
         :param include_original_response: If set, add an `original_response` field to the response, containing the raw string response from the model.
         :return: If stream is false, returns an InferenceResponse.
                  If stream is true, returns an async iterator that yields InferenceChunks as they come in.
@@ -869,6 +1046,8 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         display_name: Optional[str] = None,
     ) -> DynamicEvaluationRunResponse:
         """
+        DEPRECATED: Use `workflow_evaluation_run` instead.
+
         Make a POST request to the /dynamic_evaluation_run endpoint.
 
         :param variants: A dictionary of variant names to variant values.
@@ -883,27 +1062,75 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         *,
         run_id: str | UUID | uuid_utils.UUID,
         task_name: Optional[str] = None,
-        datapoint_name: Optional[str] = None,
         tags: Optional[Dict[str, str]] = None,
     ) -> DynamicEvaluationRunEpisodeResponse:
         """
-        Make a POST request to the /dynamic_evaluation_run_episode endpoint.
+        DEPRECATED: Use `workflow_evaluation_run_episode` instead.
+
+        Make a POST request to the /dynamic_evaluation_run/{run_id}/episode endpoint.
 
         :param run_id: The run ID to use for the dynamic evaluation run.
         :param task_name: The name of the task to use for the dynamic evaluation run.
-        :param datapoint_name: The name of the datapoint to use for the dynamic evaluation run.
-                    Deprecated: use `task_name` instead.
         :param tags: A dictionary of tags to add to the dynamic evaluation run.
         :return: A `DynamicEvaluationRunEpisodeResponse` instance ({"episode_id": str}).
+        """
+
+    async def workflow_evaluation_run(  # type: ignore[override]
+        self,
+        *,
+        variants: Dict[str, str],
+        tags: Optional[Dict[str, str]] = None,
+        project_name: Optional[str] = None,
+        display_name: Optional[str] = None,
+    ) -> WorkflowEvaluationRunResponse:
+        """
+        Make a POST request to the /workflow_evaluation_run endpoint.
+
+        :param variants: A dictionary of variant names to variant values.
+        :param tags: A dictionary of tags to add to the workflow evaluation run.
+        :param project_name: The name of the project to use for the workflow evaluation run.
+        :param display_name: The display name of the workflow evaluation run.
+        :return: A `WorkflowEvaluationRunResponse` instance ({"run_id": str}).
+        """
+
+    async def workflow_evaluation_run_episode(  # type: ignore[override]
+        self,
+        *,
+        run_id: str | UUID | uuid_utils.UUID,
+        task_name: Optional[str] = None,
+        tags: Optional[Dict[str, str]] = None,
+    ) -> WorkflowEvaluationRunEpisodeResponse:
+        """
+        Make a POST request to the /workflow_evaluation_run/{run_id}/episode endpoint.
+
+        :param run_id: The run ID to use for the workflow evaluation run.
+        :param task_name: The name of the task to use for the workflow evaluation run.
+        :param tags: A dictionary of tags to add to the workflow evaluation run.
+        :return: A `WorkflowEvaluationRunEpisodeResponse` instance ({"episode_id": str}).
+        """
+
+    async def create_datapoints(
+        self,
+        *,
+        dataset_name: str,
+        datapoints: Sequence[Union[ChatDatapointInsert, JsonDatapointInsert]],
+    ) -> List[UUID]:
+        """
+        Make a POST request to the /datasets/{dataset_name}/datapoints endpoint.
+
+        :param dataset_name: The name of the dataset to insert the datapoints into.
+        :param datapoints: A list of datapoints to insert.
         """
 
     async def bulk_insert_datapoints(
         self,
         *,
         dataset_name: str,
-        datapoints: List[Union[ChatDatapointInsert, JsonDatapointInsert]],
+        datapoints: Sequence[Union[ChatDatapointInsert, JsonDatapointInsert]],
     ) -> List[UUID]:
         """
+        DEPRECATED: Use `create_datapoints` instead.
+
         Make a POST request to the /datasets/{dataset_name}/datapoints/bulk endpoint.
 
         :param dataset_name: The name of the dataset to insert the datapoints into.
@@ -960,7 +1187,7 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         *,
         function_name: str,
         variant_name: Optional[str] = None,
-        filters: Optional[InferenceFilterTreeNode] = None,
+        filters: Optional[InferenceFilter] = None,
         output_source: str = "inference",
         order_by: Optional[List[OrderBy]] = None,
         limit: Optional[int] = None,
@@ -1057,6 +1284,28 @@ class AsyncTensorZeroGateway(BaseTensorZeroGateway):
         """
         ...
 
+    async def experimental_run_evaluation(
+        self,
+        *,
+        evaluation_name: str,
+        dataset_name: str,
+        variant_name: str,
+        concurrency: int = 1,
+        inference_cache: str = "on",
+    ) -> AsyncEvaluationJobHandler:
+        """
+        Run an evaluation for a specific variant on a dataset.
+        This function is only available in EmbeddedGateway mode.
+
+        :param evaluation_name: The name of the evaluation to run
+        :param dataset_name: The name of the dataset to use for evaluation
+        :param variant_name: The name of the variant to evaluate
+        :param concurrency: The number of concurrent evaluations to run
+        :param inference_cache: Cache configuration for inference requests ("on", "off", "read_only", or "write_only")
+        :return: An AsyncEvaluationJobHandler for iterating over evaluation results
+        """
+        ...
+
     async def close(self) -> None:
         """
         Close the connection to the TensorZero gateway.
@@ -1085,6 +1334,7 @@ class LocalHttpGateway(object):
     def close(self) -> None: ...
 
 __all__ = [
+    "AsyncEvaluationJobHandler",
     "AsyncTensorZeroGateway",
     "BaseTensorZeroGateway",
     "BestOfNSamplingConfig",
@@ -1094,6 +1344,7 @@ __all__ = [
     "Datapoint",
     "DICLOptimizationConfig",
     "DICLConfig",
+    "EvaluationJobHandler",
     "FunctionConfigChat",
     "FunctionConfigJson",
     "FunctionsConfig",

@@ -6,26 +6,25 @@ use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use super::{make_embedded_gateway, make_http_gateway, use_mock_inference_provider};
+use super::use_mock_inference_provider;
 use tensorzero::{
     ClientInferenceParams, ClientInput, ClientInputMessage, ClientInputMessageContent,
-    InferenceOutput, InferenceOutputSource, LaunchOptimizationWorkflowParams, RenderedSample, Role,
+    DynamicToolParams, InferenceOutput, InferenceOutputSource, LaunchOptimizationWorkflowParams,
+    RenderedSample, Role, System,
 };
 use tensorzero_core::{
     config::{Config, ConfigFileGlob, UninitializedVariantConfig},
-    db::clickhouse::{
-        test_helpers::{
-            get_clickhouse, select_chat_inference_clickhouse, select_json_inference_clickhouse,
-            select_model_inferences_clickhouse, CLICKHOUSE_URL,
-        },
-        ClickhouseFormat,
+    db::clickhouse::test_helpers::{
+        get_clickhouse, select_chat_inference_clickhouse, select_json_inference_clickhouse,
+        select_model_inferences_clickhouse, CLICKHOUSE_URL,
     },
     http::TensorzeroHttpClient,
     inference::types::{
-        ContentBlock, ContentBlockChatOutput, ContentBlockChunk, JsonInferenceOutput, ModelInput,
-        RequestMessage, StoredInput, StoredInputMessage, StoredInputMessageContent, Text, TextKind,
-        Usage,
+        Arguments, ContentBlockChatOutput, ContentBlockChunk, JsonInferenceOutput, ModelInput,
+        ResolvedContentBlock, ResolvedRequestMessage, StoredContentBlock, StoredInput,
+        StoredInputMessage, StoredInputMessageContent, StoredRequestMessage, Text, TextKind, Usage,
     },
+    model_table::ProviderTypeDefaultCredentials,
     optimization::{
         dicl::UninitializedDiclOptimizationConfig, JobHandle, OptimizationJobInfo, Optimizer,
         OptimizerOutput, UninitializedOptimizerConfig, UninitializedOptimizerInfo,
@@ -88,7 +87,10 @@ pub async fn test_dicl_optimization_chat() {
         }),
     };
 
-    let optimizer_info = uninitialized_optimizer_info.load().await.unwrap();
+    let optimizer_info = uninitialized_optimizer_info
+        .load(&ProviderTypeDefaultCredentials::default())
+        .await
+        .unwrap();
     let client = TensorzeroHttpClient::new().unwrap();
     let test_examples = get_pinocchio_examples(false);
     let val_examples = None; // No validation examples needed for this test
@@ -128,7 +130,14 @@ pub async fn test_dicl_optimization_chat() {
 
     let mut status;
     loop {
-        status = job_handle.poll(&client, &credentials).await.unwrap();
+        status = job_handle
+            .poll(
+                &client,
+                &credentials,
+                &ProviderTypeDefaultCredentials::default(),
+            )
+            .await
+            .unwrap();
         println!("Status: `{status:?}` Handle: `{job_handle}`");
         if matches!(status, OptimizationJobInfo::Completed { .. }) {
             break;
@@ -165,9 +174,9 @@ pub async fn test_dicl_optimization_chat() {
     };
 
     // Validate that the returned config matches our input
-    assert_eq!(dicl_config.embedding_model.as_ref(), embedding_model);
+    assert_eq!(&dicl_config.embedding_model, &embedding_model);
     assert_eq!(dicl_config.k, k);
-    assert_eq!(dicl_config.model.as_ref(), model);
+    assert_eq!(&dicl_config.model, &model);
 
     // Test DICL variant inference by creating a temporary config
     let (config_path, _temp_dir) = create_dicl_test_files(
@@ -193,7 +202,10 @@ pub async fn test_dicl_optimization_chat() {
 
     // Test inference with the DICL variant using Pinocchio pattern
     let input = ClientInput {
-        system: Some(serde_json::json!({"assistant_name": "Pinocchio"})),
+        system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+            "assistant_name".to_string(),
+            "Pinocchio".into(),
+        )])))),
         messages: vec![ClientInputMessage {
             role: Role::User,
             content: vec![ClientInputMessageContent::Text(TextKind::Text {
@@ -355,7 +367,10 @@ pub async fn test_dicl_optimization_json() {
         }),
     };
 
-    let optimizer_info = uninitialized_optimizer_info.load().await.unwrap();
+    let optimizer_info = uninitialized_optimizer_info
+        .load(&ProviderTypeDefaultCredentials::default())
+        .await
+        .unwrap();
 
     let client = TensorzeroHttpClient::new().unwrap();
     let test_examples = get_pinocchio_examples(true);
@@ -396,7 +411,14 @@ pub async fn test_dicl_optimization_json() {
 
     let mut status;
     loop {
-        status = job_handle.poll(&client, &credentials).await.unwrap();
+        status = job_handle
+            .poll(
+                &client,
+                &credentials,
+                &ProviderTypeDefaultCredentials::default(),
+            )
+            .await
+            .unwrap();
         println!("Status: `{status:?}` Handle: `{job_handle}`");
         if matches!(status, OptimizationJobInfo::Completed { .. }) {
             break;
@@ -433,9 +455,9 @@ pub async fn test_dicl_optimization_json() {
     };
 
     // Validate that the returned config matches our input
-    assert_eq!(dicl_config.embedding_model.as_ref(), embedding_model);
+    assert_eq!(&dicl_config.embedding_model, &embedding_model);
     assert_eq!(dicl_config.k, k, "k value should match input");
-    assert_eq!(dicl_config.model.as_ref(), model);
+    assert_eq!(&dicl_config.model, &model);
 
     // Test DICL variant inference by creating a temporary config
     let (config_path, _temp_dir) = create_dicl_test_files(
@@ -461,7 +483,10 @@ pub async fn test_dicl_optimization_json() {
 
     // Test inference with the DICL variant using Pinocchio pattern
     let input = ClientInput {
-        system: Some(serde_json::json!({"assistant_name": "Pinocchio"})),
+        system: Some(System::Template(Arguments(serde_json::Map::from_iter([(
+            "assistant_name".to_string(),
+            "Pinocchio".into(),
+        )])))),
         messages: vec![ClientInputMessage {
             role: Role::User,
             content: vec![ClientInputMessageContent::Text(TextKind::Text {
@@ -621,6 +646,7 @@ fn create_inference_params(
         extra_body: Default::default(),
         extra_headers: Default::default(),
         internal_dynamic_variant_config: None,
+        otlp_traces_extra_headers: Default::default(),
     }
 }
 
@@ -795,7 +821,7 @@ async fn validate_inference_clickhouse(
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "Who was the author of the Harry Potter series?"}]
+                "content": [{"type": "text", "text": "Who was the author of the Harry Potter series?"}]
             }
         ]
     });
@@ -873,9 +899,10 @@ async fn validate_model_inference_clickhouse(
             .unwrap()
             .as_str()
             .unwrap();
-        let input_messages: Vec<RequestMessage> = serde_json::from_str(input_messages).unwrap();
+        let input_messages: Vec<StoredRequestMessage> =
+            serde_json::from_str(input_messages).unwrap();
         let output = model_inference.get("output").unwrap().as_str().unwrap();
-        let output: Vec<ContentBlock> = serde_json::from_str(output).unwrap();
+        let output: Vec<StoredContentBlock> = serde_json::from_str(output).unwrap();
 
         match model_name {
             name if name == expected_model => {
@@ -906,7 +933,7 @@ async fn validate_model_inference_clickhouse(
                 assert_eq!(output.len(), 1);
 
                 match &output[0] {
-                    ContentBlock::Text(text) => {
+                    StoredContentBlock::Text(text) => {
                         assert!(text.text.to_lowercase().contains("nose"));
                     }
                     _ => {
@@ -1019,7 +1046,7 @@ async fn validate_model_inference_clickhouse(
 #[allow(clippy::allow_attributes, dead_code)] // False positive
 pub async fn test_dicl_workflow_with_embedded_client() {
     // Create embedded gateway client
-    let client = make_embedded_gateway().await;
+    let client = tensorzero::test_helpers::make_embedded_gateway().await;
     run_dicl_workflow_with_client(&client).await;
 }
 
@@ -1027,7 +1054,7 @@ pub async fn test_dicl_workflow_with_embedded_client() {
 #[allow(clippy::allow_attributes, dead_code)] // False positive
 pub async fn test_dicl_workflow_with_http_client() {
     // Create HTTP gateway client
-    let client = make_http_gateway().await;
+    let client = tensorzero::test_helpers::make_http_gateway().await;
     run_dicl_workflow_with_client(&client).await;
 }
 
@@ -1044,7 +1071,6 @@ pub async fn run_dicl_workflow_with_client(client: &tensorzero::Client) {
         limit: Some(10),
         offset: None,
         val_fraction: None,
-        format: ClickhouseFormat::JsonEachRow,
         // We always mock the client tests since this is tested above
         optimizer_config: UninitializedOptimizerInfo {
             inner: UninitializedOptimizerConfig::Dicl(UninitializedDiclOptimizationConfig {
@@ -1155,27 +1181,29 @@ fn create_pinocchio_example(
         function_name: "basic_test".to_string(),
         input: ModelInput {
             system: system.as_ref().map(std::string::ToString::to_string),
-            messages: vec![RequestMessage {
+            messages: vec![ResolvedRequestMessage {
                 role: Role::User,
-                content: vec![ContentBlock::Text(Text {
+                content: vec![ResolvedContentBlock::Text(Text {
                     text: question.to_string(),
                 })],
             }],
         },
         stored_input: StoredInput {
-            system: system.clone(),
+            system: system
+                .as_ref()
+                .map(|s| System::Template(Arguments(s.as_object().unwrap().to_owned()))),
             messages: vec![StoredInputMessage {
                 role: Role::User,
-                content: vec![StoredInputMessageContent::Text {
-                    value: json!(question),
-                }],
+                content: vec![StoredInputMessageContent::Text(Text {
+                    text: question.to_string(),
+                })],
             }],
         },
         output: Some(output),
         stored_output: Some(stored_output),
         episode_id: Some(Uuid::now_v7()),
         inference_id: Some(Uuid::now_v7()),
-        tool_params: None,
+        tool_params: DynamicToolParams::default(),
         output_schema: if is_json_function {
             Some(json!({
                 "type": "object",

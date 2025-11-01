@@ -3,12 +3,16 @@ import type {
   FunctionConfig,
   JsonInferenceOutput,
   JsonValue,
+  StoredInputMessageContent,
+  StoredInputMessage,
+  StoredInput,
+  StoragePath as BackendStoragePath,
+  StorageKind as BackendStorageKind,
 } from "tensorzero-node";
 
 /**
- * JSON types.
+ * JSON types
  */
-
 export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   z.union([
     z.string(),
@@ -23,53 +27,45 @@ export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
 export const roleSchema = z.enum(["user", "assistant"]);
 export type Role = z.infer<typeof roleSchema>;
 
-export const textInputSchema = z.object({
+export const legacyTextSchema = z.object({
   type: z.literal("text"),
-  value: z.any(), // Value type from Rust maps to any in TS
+  // TODO: get rid of this type completely, we should not run queries in the UI...
+  value: JsonValueSchema.optional(),
+  text: z.string().optional(),
 });
-export type TextInput = z.infer<typeof textInputSchema>;
+export type LegacyTextInput = z.infer<typeof legacyTextSchema>;
 
-export const templateInputSchema = z.object({
+export const templateSchema = z.object({
   type: z.literal("template"),
   name: z.string(),
   arguments: z.record(JsonValueSchema.optional()),
 });
-export type TemplateInput = z.infer<typeof templateInputSchema>;
+export type Template = z.infer<typeof templateSchema>;
 
 // The three display text types below handle the scenario
 // where the function 1) does not use schemas
-export const displayUnstructuredTextInputSchema = z.object({
-  type: z.literal("unstructured_text"),
+export const displayTextInputSchema = z.object({
+  type: z.literal("text"),
   text: z.string(),
 });
-export type DisplayUnstructuredTextInput = z.infer<
-  typeof displayUnstructuredTextInputSchema
->;
+export type DisplayTextInput = z.infer<typeof displayTextInputSchema>;
 
-// 2) uses schemas
-export const displayStructuredTextInputSchema = z.object({
-  type: z.literal("structured_text"),
-  arguments: z.any(),
-});
-export type DisplayStructuredTextInput = z.infer<
-  typeof displayStructuredTextInputSchema
->;
-
-// 3) is missing from the config so we don't know
-export const displayMissingFunctionTextInputSchema = z.object({
-  type: z.literal("missing_function_text"),
-  value: z.any(),
-});
-export type DisplayMissingFunctionTextInput = z.infer<
-  typeof displayMissingFunctionTextInputSchema
->;
-
+// 2) uses templates
 export const displayTemplateSchema = z.object({
   type: z.literal("template"),
   name: z.string(),
   arguments: z.record(JsonValueSchema.optional()),
 });
 export type DisplayTemplate = z.infer<typeof displayTemplateSchema>;
+
+// 3) is missing from the config so we don't know
+export const displayMissingFunctionTextInputSchema = z.object({
+  type: z.literal("missing_function_text"),
+  value: z.string(),
+});
+export type DisplayMissingFunctionTextInput = z.infer<
+  typeof displayMissingFunctionTextInputSchema
+>;
 
 export const modelInferenceTextInputSchema = z.object({
   type: z.literal("text"),
@@ -87,19 +83,11 @@ export type RawTextInput = z.infer<typeof rawTextInputSchema>;
 
 export const thoughtContentSchema = z.object({
   type: z.literal("thought"),
-  text: z
-    .string()
-    .nullish()
-    .transform((val) => val ?? null),
-  signature: z
-    .string()
-    .nullish()
-    .transform((val) => val ?? null),
-  _internal_provider_type: z
-    .string()
-    .nullish()
-    .transform((val) => val ?? null),
+  text: z.string().nullable(),
+  signature: z.string().optional(),
+  _internal_provider_type: z.string().optional(),
 });
+export type ThoughtContent = z.infer<typeof thoughtContentSchema>;
 
 export const unknownSchema = z.object({
   type: z.literal("unknown"),
@@ -143,13 +131,13 @@ export const toolResultContentSchema = z
 export type ToolResultContent = z.infer<typeof toolResultContentSchema>;
 
 export const base64FileSchema = z.object({
-  url: z.string().url().nullable(),
+  url: z.string().url().nullish(),
   mime_type: z.string(),
 });
 export type Base64File = z.infer<typeof base64FileSchema>;
 
 export const resolvedBase64FileSchema = z.object({
-  dataUrl: z
+  data: z
     .string()
     .url()
     .refine((url) => url.startsWith("data:"), {
@@ -163,10 +151,10 @@ export const storageKindSchema = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("s3_compatible"),
-      bucket_name: z.string(),
-      region: z.string().nullable(),
-      endpoint: z.string().nullable(),
-      allow_http: z.boolean().nullable(),
+      bucket_name: z.string().nullish(),
+      region: z.string().nullish(),
+      endpoint: z.string().nullish(),
+      allow_http: z.boolean().nullish(),
     })
     .strict(),
   z
@@ -224,8 +212,8 @@ export type ResolvedImageContentError = z.infer<
 
 // Types for input to TensorZero
 export const inputMessageContentSchema = z.discriminatedUnion("type", [
-  textInputSchema,
-  templateInputSchema,
+  legacyTextSchema,
+  templateSchema,
   toolCallContentSchema,
   toolResultContentSchema,
   imageContentSchema,
@@ -254,8 +242,7 @@ export type ModelInferenceInputMessageContent = z.infer<
 >;
 
 export const displayInputMessageContentSchema = z.discriminatedUnion("type", [
-  displayUnstructuredTextInputSchema,
-  displayStructuredTextInputSchema,
+  displayTextInputSchema,
   displayTemplateSchema,
   displayMissingFunctionTextInputSchema,
   toolCallContentSchema,
@@ -291,7 +278,7 @@ export type ModelInferenceInputMessage = z.infer<
 
 export const displayModelInferenceInputMessageContentSchema =
   z.discriminatedUnion("type", [
-    displayUnstructuredTextInputSchema,
+    displayTextInputSchema,
     toolCallContentSchema,
     toolResultContentSchema,
     resolvedFileContentSchema,
@@ -353,8 +340,9 @@ export const contentBlockOutputSchema = z.discriminatedUnion("type", [
 ]);
 
 export const jsonInferenceOutputSchema = z.object({
+  // These fields are explicitly nullable, not undefined.
   raw: z.string().nullable(),
-  parsed: JsonValueSchema,
+  parsed: JsonValueSchema.nullable(),
 }) satisfies z.ZodType<JsonInferenceOutput>;
 
 export const toolCallOutputSchema = z
@@ -443,74 +431,96 @@ export const CountSchema = z.object({
 export type Count = z.infer<typeof CountSchema>;
 
 /**
- * Converts the display input message content to the input message content.
- * This is useful for the case where we've edited a datapoint and need to convert
- * the display form back into something we can write to ClickHouse.
+ * Converts frontend StorageKind to backend StorageKind.
+ * Handles differences in nullish vs optional fields.
  */
-
-function displayInputMessageContentToInputMessageContent(
-  content: DisplayInputMessageContent,
-): InputMessageContent {
-  switch (content.type) {
-    case "unstructured_text":
-      return { type: "text", value: content.text };
-    case "structured_text":
-      return { type: "text", value: content.arguments };
-    case "missing_function_text":
-      return { type: "text", value: content.value };
-    case "tool_call":
-      return content;
-    case "tool_result":
-      return content;
-    case "file":
-      return {
-        ...content,
-        file: {
-          url: content.file.dataUrl,
-          mime_type: content.file.mime_type,
-        },
-        type: "file",
-      };
-    case "file_error":
-      return {
-        ...content,
-        type: "file",
-      };
-    case "raw_text":
-      return content;
-    case "thought":
-      return content;
-    case "unknown":
-      return content;
-    case "template":
-      return content;
+function storageKindToBackendStorageKind(
+  kind: StorageKind,
+): BackendStorageKind {
+  if (kind.type === "s3_compatible") {
+    return {
+      type: "s3_compatible",
+      bucket_name: kind.bucket_name ?? null,
+      region: kind.region ?? null,
+      endpoint: kind.endpoint ?? null,
+      allow_http: kind.allow_http ?? null,
+    };
   }
+  return kind;
 }
 
 /**
- * Converts the display input message to the input message.
- * This is useful for the case where we've edited a datapoint and need to convert
- * the display form back into something we can write to ClickHouse.
+ * Converts frontend StoragePath to backend StoragePath.
  */
-function displayInputMessageToInputMessage(
-  message: DisplayInputMessage,
-): InputMessage {
+function storagePathToBackendStoragePath(
+  path: StoragePath,
+): BackendStoragePath {
   return {
-    role: message.role,
-    content: message.content.map(
-      displayInputMessageContentToInputMessageContent,
-    ),
+    kind: storageKindToBackendStorageKind(path.kind),
+    path: path.path,
   };
 }
 
 /**
- * Converts the display input to the input.
+ * Converts the display input message content to the stored input message content.
  * This is useful for the case where we've edited a datapoint and need to convert
  * the display form back into something we can write to ClickHouse.
  */
-export function displayInputToInput(displayInput: DisplayInput): Input {
+function displayInputMessageContentToStoredInputMessageContent(
+  content: DisplayInputMessageContent,
+): StoredInputMessageContent {
+  switch (content.type) {
+    case "text":
+      return { type: "text", text: content.text };
+    case "missing_function_text":
+      return { type: "text", text: content.value };
+    case "file":
+      return {
+        type: "file",
+        mime_type: content.file.mime_type,
+        storage_path: storagePathToBackendStoragePath(content.storage_path),
+      };
+    case "file_error":
+      return {
+        type: "file",
+        source_url: content.file.url ?? undefined,
+        mime_type: content.file.mime_type,
+        storage_path: storagePathToBackendStoragePath(content.storage_path),
+      };
+    case "template":
+    case "tool_call":
+    case "tool_result":
+    case "raw_text":
+    case "thought":
+    case "unknown":
+      // These types are already compatible with StoredInputMessageContent
+      return content;
+  }
+}
+
+function displayInputMessageToStoredInputMessage(
+  message: DisplayInputMessage,
+): StoredInputMessage {
+  return {
+    role: message.role,
+    content: message.content.map(
+      displayInputMessageContentToStoredInputMessageContent,
+    ),
+  };
+}
+/**
+ * Converts DisplayInput to StoredInput before we save the datapoints. This is mostly to handle:
+ * 1. DisplayInput has { type: "text", "text": "..." } which matches StoredInput's { type: "text", "text": "..." } format
+ * 2. missing_function_text and file_error are frontend-only types, and we convert them back to text and file types for storage.
+ * 3. StorageKind currently has a null / undefined mismatch, so we convert everything to undefined before going to the backend.
+ */
+export function displayInputToStoredInput(
+  displayInput: DisplayInput,
+): StoredInput {
   return {
     system: displayInput.system,
-    messages: displayInput.messages.map(displayInputMessageToInputMessage),
+    messages: displayInput.messages.map(
+      displayInputMessageToStoredInputMessage,
+    ),
   };
 }

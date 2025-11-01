@@ -9,11 +9,15 @@ use crate::error::{Error, ErrorDetails};
 /// `DynamicRunEpisodeByRunIdView` materialized view.
 /// It also adds the `DynamicEvaluationRunByProjectName` table and the
 /// `DynamicEvaluationRunByProjectNameView` materialized view.
-/// These support consumption of dynamic evaluations indexed by run id and project name.
+/// These support consumption of workflow evaluations (formerly "dynamic evaluations") indexed by run id and project name.
 /// The `DynamicRunEpisodeByRunId` table contains the same data as the
 /// `DynamicEvaluationRunEpisode` table with different indexing.
 /// The `DynamicEvaluationRunByProjectName` table contains the same data as the
 /// `DynamicEvaluationRun` table with different indexing.
+///
+/// IMPORTANT: These tables use "DynamicEvaluation" in their names for historical reasons.
+/// Externally, this feature is now called "Workflow Evaluations" (renamed from "Dynamic Evaluations").
+/// The table names remain unchanged to avoid complex data migrations.
 pub struct Migration0026<'a> {
     pub clickhouse: &'a ClickHouseConnectionInfo,
 }
@@ -88,7 +92,7 @@ impl Migration for Migration0026<'_> {
                     episode_id_uint UInt128, -- UUID encoded as a UInt128
                     variant_pins Map(String, String),
                     tags Map(String, String),
-                    datapoint_name Nullable(String),
+                    datapoint_name Nullable(String), -- externally: task_name (TODO: rename in a future migration)
                     is_deleted Bool DEFAULT false,
                     updated_at DateTime64(6, 'UTC') DEFAULT now()
                 ) ENGINE = {table_engine_name}

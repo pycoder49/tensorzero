@@ -5,7 +5,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "~/components/ui/dialog";
-import { Loader2, ChevronDown, ChevronUp } from "lucide-react";
+import { Loader2, ChevronDown, ChevronUp, RefreshCw } from "lucide-react";
 import { Button } from "~/components/ui/button";
 import { Separator } from "~/components/ui/separator";
 import type { ParsedInferenceRow } from "~/utils/clickhouse/inference";
@@ -15,23 +15,32 @@ import { Output } from "~/components/inference/Output";
 import type { InferenceResponse } from "~/utils/tensorzero";
 import { Card, CardContent } from "~/components/ui/card";
 import type { VariantResponseInfo } from "~/routes/api/tensorzero/inference.utils";
+import { Link } from "react-router";
+import { toInferenceUrl } from "~/utils/urls";
 
 interface ResponseColumnProps {
   title: string;
   response: VariantResponseInfo | null;
   errorMessage?: string | null;
-  children?: React.ReactNode;
+  inferenceId?: string | null;
+  onClose?: () => void;
+  actions?: React.ReactNode;
+  refreshButton?: React.ReactNode;
 }
 
 function ResponseColumn({
   title,
   response,
   errorMessage,
-  children,
+  inferenceId,
+  onClose,
+  actions,
+  refreshButton,
 }: ResponseColumnProps) {
   return (
-    <div className="flex flex-1 flex-col">
-      <div className="mb-2 flex items-center justify-between">
+    <div className="relative flex flex-1 flex-col">
+      {refreshButton}
+      <div className="mb-2">
         <h3 className="text-sm font-semibold">{title}</h3>
       </div>
       {errorMessage ? (
@@ -54,6 +63,21 @@ function ResponseColumn({
               </div>
             )}
 
+            {inferenceId && (
+              <div className="mt-2 text-xs">
+                Inference ID:{" "}
+                <Link
+                  to={toInferenceUrl(inferenceId)}
+                  className="font-mono text-xs text-blue-600 hover:text-blue-800 hover:underline"
+                  onClick={onClose}
+                >
+                  {inferenceId}
+                </Link>
+              </div>
+            )}
+
+            <div className="mt-4">{actions}</div>
+
             <div className="mt-4 grid grid-cols-2 justify-end gap-4">
               {response.usage && (
                 <div>
@@ -66,7 +90,6 @@ function ResponseColumn({
                   </p>
                 </div>
               )}
-              <div className="flex justify-end">{children}</div>
             </div>
           </>
         )
@@ -90,6 +113,7 @@ interface VariantResponseModalProps {
   variantResponse: VariantResponseInfo | null;
   rawResponse: InferenceResponse | null;
   children?: React.ReactNode;
+  onRefresh?: (() => void) | null;
 }
 
 export function VariantResponseModal({
@@ -104,6 +128,7 @@ export function VariantResponseModal({
   variantResponse,
   rawResponse,
   children,
+  onRefresh,
 }: VariantResponseModalProps) {
   const [showRawResponse, setShowRawResponse] = useState(false);
 
@@ -118,6 +143,19 @@ export function VariantResponseModal({
     source === "inference"
       ? (item as ParsedInferenceRow).variant_name
       : undefined;
+
+  const refreshButton = onRefresh && (
+    <Button
+      aria-label="Refresh variant response"
+      variant="ghost"
+      size="iconSm"
+      className="absolute top-1 right-1 z-5 h-6 w-6 cursor-pointer text-xs opacity-25 transition-opacity hover:opacity-100"
+      onClick={onRefresh}
+      disabled={isLoading}
+    >
+      {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw />}
+    </Button>
+  );
 
   useEffect(() => {
     // reset when modal opens or closes
@@ -177,9 +215,11 @@ export function VariantResponseModal({
                   title="New"
                   response={variantResponse}
                   errorMessage={error}
-                >
-                  {children}
-                </ResponseColumn>
+                  inferenceId={rawResponse?.inference_id}
+                  onClose={onClose}
+                  refreshButton={refreshButton}
+                  actions={children}
+                />
               </div>
 
               <Separator className="my-4" />

@@ -1,5 +1,19 @@
-use serde::{Deserialize, Deserializer};
+use serde::de::IntoDeserializer;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::collections::HashMap;
+
+/// Serializes a value as a JSON string (for "doubly-serialized" fields).
+/// This is the inverse of `deserialize_json_string`.
+pub fn serialize_json_string<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    let json_str = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(&json_str)
+}
 
 /// Deserializes a "doubly-serialized" field of a struct.
 /// If you have a struct like this:
@@ -221,6 +235,32 @@ where
     }
 }
 
+/// Deserializes an `Option<Option<T>>`, distinguishing between an omitted field (`None`),
+/// an explicit JSON `null` (`Some(None)`), and a concrete value (`Some(Some(T))`).
+///
+/// This is useful for API structs where we need to distinguish between an omitted field, JSON null, and a concrete value.
+/// Use it like this:
+/// ```ignore
+/// #[derive(Deserialize)]
+/// struct ParamsStruct {
+///     #[serde(default, deserialize_with = "deserialize_double_option")]
+///     maybe_null_field: Option<Option<String>>,
+/// }
+/// ```
+pub fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        Ok(Some(None))
+    } else {
+        let inner = T::deserialize(value.into_deserializer()).map_err(serde::de::Error::custom)?;
+        Ok(Some(Some(inner)))
+    }
+}
+
 /// Deserializes a defaulted "maybe-doubly-serialized" field of a struct.
 /// If you have a struct like this:
 /// ```ignore
@@ -379,6 +419,42 @@ where
         }
         Helper::Number(n) => Ok(Some(n)),
         Helper::Null => Ok(None),
+    }
+}
+
+/// Serializes an optional value, returning an empty string if the value is None.
+/// This is useful for ClickHouse compatibility where empty strings represent null for certain fields.
+pub fn serialize_none_as_empty_string<S, T>(
+    value: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Serialize,
+{
+    match value {
+        Some(v) => v.serialize(serializer),
+        None => serializer.serialize_str(""),
+    }
+}
+
+/// Serializes an optional HashMap, returning an empty map if the value is None.
+/// This is useful for ClickHouse compatibility where empty maps represent null for map fields.
+pub fn serialize_none_as_empty_map<S, K, V>(
+    value: &Option<HashMap<K, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    K: Serialize,
+    V: Serialize,
+{
+    match value {
+        Some(map) => map.serialize(serializer),
+        None => {
+            let map = serializer.serialize_map(Some(0))?;
+            map.end()
+        }
     }
 }
 
@@ -681,5 +757,140 @@ mod tests {
         let json = r#"{"inner": ""}"#;
         let result: TestDefaultedOuter = serde_json::from_str(json).unwrap();
         assert_eq!(result.inner, TestStruct::default());
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestDoubleOptionStruct<T: for<'a> Deserialize<'a>> {
+        #[serde(default, deserialize_with = "deserialize_double_option")]
+        maybe_null_field: Option<Option<T>>,
+    }
+
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    struct TestDoubleOptionStructInnerStruct {
+        inner_field: i32,
+    }
+
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    struct TestDoubleOptionStructInnerOptionStruct {
+        #[serde(default)]
+        inner_option_field: Option<i32>,
+    }
+
+    #[test]
+    fn test_deserialize_double_option_for_omitted_field() {
+        let json = r"{}";
+        let result: TestDoubleOptionStruct<String> = serde_json::from_str(json).unwrap();
+        assert_eq!(result.maybe_null_field, None);
+    }
+
+    #[test]
+    fn test_deserialize_double_option_for_null_field() {
+        let json = r#"{"maybe_null_field": null}"#;
+        let result: TestDoubleOptionStruct<String> = serde_json::from_str(json).unwrap();
+        assert_eq!(result.maybe_null_field, Some(None));
+    }
+
+    #[test]
+    fn test_deserialize_double_option_for_concrete_value() {
+        let json = r#"{"maybe_null_field": "test"}"#;
+        let result: TestDoubleOptionStruct<String> = serde_json::from_str(json).unwrap();
+        assert_eq!(result.maybe_null_field, Some(Some("test".to_string())));
+    }
+
+    #[test]
+    fn test_deserialize_double_option_for_nested_struct_with_null() {
+        let json = r#"{"maybe_null_field": null}"#;
+        let result: TestDoubleOptionStruct<TestDoubleOptionStructInnerStruct> =
+            serde_json::from_str(json).unwrap();
+        assert_eq!(result.maybe_null_field, Some(None));
+    }
+
+    #[test]
+    fn test_deserialize_double_option_for_nested_struct() {
+        let json = r#"{"maybe_null_field": {"inner_field": 123}}"#;
+        let result: TestDoubleOptionStruct<TestDoubleOptionStructInnerStruct> =
+            serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.maybe_null_field,
+            Some(Some(TestDoubleOptionStructInnerStruct { inner_field: 123 }))
+        );
+    }
+
+    #[test]
+    fn test_deserialize_double_option_does_not_affect_inner_option() {
+        let json = r#"{"maybe_null_field": {"inner_option_field": null}}"#;
+        let result: TestDoubleOptionStruct<TestDoubleOptionStructInnerOptionStruct> =
+            serde_json::from_str(json).unwrap();
+        assert_eq!(
+            result.maybe_null_field,
+            Some(Some(TestDoubleOptionStructInnerOptionStruct {
+                inner_option_field: None
+            }))
+        );
+    }
+
+    #[derive(Debug, Serialize, PartialEq)]
+    struct TestSerializeNoneAsEmptyString {
+        #[serde(serialize_with = "serialize_none_as_empty_string")]
+        field: Option<TestStruct>,
+    }
+
+    #[test]
+    fn test_serialize_none_as_empty_string_with_some() {
+        let obj = TestSerializeNoneAsEmptyString {
+            field: Some(TestStruct {
+                foo: 1,
+                bar: "test".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&obj).unwrap();
+        assert_eq!(json, r#"{"field":{"foo":1,"bar":"test"}}"#);
+    }
+
+    #[test]
+    fn test_serialize_none_as_empty_string_with_none() {
+        let obj = TestSerializeNoneAsEmptyString { field: None };
+        let json = serde_json::to_string(&obj).unwrap();
+        assert_eq!(json, r#"{"field":""}"#);
+    }
+
+    // Tests for serialize_none_as_empty_map
+    #[derive(Debug, Serialize, PartialEq)]
+    struct TestSerializeNoneAsEmptyMap {
+        #[serde(serialize_with = "serialize_none_as_empty_map")]
+        field: Option<HashMap<String, String>>,
+    }
+
+    #[test]
+    fn test_serialize_none_as_empty_map_with_some() {
+        let mut map = HashMap::new();
+        map.insert("key1".to_string(), "value1".to_string());
+        map.insert("key2".to_string(), "value2".to_string());
+
+        let obj = TestSerializeNoneAsEmptyMap { field: Some(map) };
+        let json = serde_json::to_string(&obj).unwrap();
+
+        // Parse back to verify it's a valid map with the right contents
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let field_map = parsed["field"].as_object().unwrap();
+        assert_eq!(field_map.len(), 2);
+        assert_eq!(field_map["key1"], "value1");
+        assert_eq!(field_map["key2"], "value2");
+    }
+
+    #[test]
+    fn test_serialize_none_as_empty_map_with_none() {
+        let obj = TestSerializeNoneAsEmptyMap { field: None };
+        let json = serde_json::to_string(&obj).unwrap();
+        assert_eq!(json, r#"{"field":{}}"#);
+    }
+
+    #[test]
+    fn test_serialize_none_as_empty_map_with_empty_map() {
+        let obj = TestSerializeNoneAsEmptyMap {
+            field: Some(HashMap::new()),
+        };
+        let json = serde_json::to_string(&obj).unwrap();
+        assert_eq!(json, r#"{"field":{}}"#);
     }
 }

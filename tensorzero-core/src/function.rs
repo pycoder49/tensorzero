@@ -1,5 +1,7 @@
 use crate::config::SchemaData;
+#[cfg(feature = "pyo3")]
 use crate::error::IMPOSSIBLE_ERROR_MESSAGE;
+use crate::experimentation::ExperimentationConfig;
 #[cfg(feature = "pyo3")]
 use crate::inference::types::pyo3_helpers::serialize_to_dict;
 #[cfg(feature = "pyo3")]
@@ -15,9 +17,8 @@ use pyo3::prelude::*;
 use pyo3::IntoPyObjectExt;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::instrument;
 use uuid::Uuid;
@@ -27,12 +28,14 @@ use crate::endpoints::inference::InferenceParams;
 use crate::error::{Error, ErrorDetails};
 use crate::inference::types::{
     ChatInferenceResult, ContentBlockOutput, InferenceResult, Input, InputMessageContent,
-    JsonInferenceResult, ModelInferenceResponseWithMetadata, Role, TextKind,
+    JsonInferenceResult, ModelInferenceResponseWithMetadata, Role, System,
 };
 use crate::jsonschema_util::{JsonSchemaRef, StaticJSONSchema};
 use crate::minijinja_util::TemplateConfig;
 use crate::model::ModelTable;
-use crate::tool::{DynamicToolParams, StaticToolConfig, ToolCallConfig, ToolChoice};
+use crate::tool::{
+    DynamicToolParams, StaticToolConfig, ToolCallConfig, ToolCallConfigDatabaseInsert, ToolChoice,
+};
 use crate::variant::{InferenceConfig, JsonMode, Variant, VariantInfo};
 
 #[derive(Debug, Serialize)]
@@ -56,7 +59,7 @@ pub struct FunctionConfigJsonPyClass {
     pub inner: Arc<FunctionConfig>,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "pyo3", pyclass)]
 pub enum FunctionConfigType {
     Chat,
@@ -75,6 +78,13 @@ impl FunctionConfig {
         match self {
             FunctionConfig::Chat(_) => "ChatInference",
             FunctionConfig::Json(_) => "JsonInference",
+        }
+    }
+
+    pub fn experimentation(&self) -> &ExperimentationConfig {
+        match self {
+            FunctionConfig::Chat(config) => &config.experimentation,
+            FunctionConfig::Json(config) => &config.experimentation,
         }
     }
 }
@@ -221,6 +231,7 @@ pub struct FunctionConfigChat {
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: Option<bool>,
     pub description: Option<String>,
+    pub experimentation: ExperimentationConfig,
     // Holds all template names (e.g. 'user', 'my_custom_template'
     // which can be invoked through a `{"type": "template", "name": "..."}` input block)
     // This is used to perform early rejection of a template invocation,
@@ -247,8 +258,10 @@ pub struct FunctionConfigJson {
     pub output_schema: StaticJSONSchema, // schema is mandatory for JSON functions
     pub implicit_tool_call_config: ToolCallConfig,
     pub description: Option<String>,
+    pub experimentation: ExperimentationConfig,
+    // See `FunctionConfigChat.all_explicit_template_names`.
     #[serde(skip)]
-    pub all_template_names: HashSet<String>,
+    pub all_explicit_template_names: HashSet<String>,
 }
 
 impl FunctionConfig {
@@ -290,7 +303,11 @@ impl FunctionConfig {
                 )?;
             }
             FunctionConfig::Json(params) => {
-                validate_all_text_input(&params.schemas, input, &params.all_template_names)?;
+                validate_all_text_input(
+                    &params.schemas,
+                    input,
+                    &params.all_explicit_template_names,
+                )?;
             }
         }
         Ok(())
@@ -343,13 +360,60 @@ impl FunctionConfig {
         }
     }
 
+    /// Convert DynamicToolParams to ToolCallConfigDatabaseInsert using prepare_tool_config
+    /// This properly merges static and dynamic tools according to function configuration
+    pub fn dynamic_tool_params_to_database_insert(
+        &self,
+        dynamic_params: DynamicToolParams,
+        static_tools: &HashMap<String, Arc<StaticToolConfig>>,
+    ) -> Result<Option<ToolCallConfigDatabaseInsert>, Error> {
+        let tool_config = self.prepare_tool_config(dynamic_params, static_tools)?;
+        Ok(tool_config.map(std::convert::Into::into))
+    }
+
+    /// Convert ToolCallConfigDatabaseInsert back to DynamicToolParams by subtracting static tools
+    /// Static tools (from function config) become allowed_tools, additional tools remain as additional_tools
+    pub fn database_insert_to_dynamic_tool_params(
+        &self,
+        db_insert: ToolCallConfigDatabaseInsert,
+    ) -> DynamicToolParams {
+        // Get static tool names from function config
+        let static_tool_names: HashSet<&str> = match self {
+            FunctionConfig::Chat(c) => c.tools.iter().map(std::string::String::as_str).collect(),
+            FunctionConfig::Json(_) => HashSet::new(),
+        };
+
+        // Partition tools into static (allowed) and dynamic (additional)
+        let (static_tools, additional_tools): (Vec<_>, Vec<_>) = db_insert
+            .tools_available
+            .into_iter()
+            .partition(|tool| static_tool_names.contains(tool.name.as_str()));
+
+        DynamicToolParams {
+            allowed_tools: if static_tools.is_empty() {
+                None
+            } else {
+                Some(static_tools.into_iter().map(|t| t.name).collect())
+            },
+            additional_tools: if additional_tools.is_empty() {
+                None
+            } else {
+                Some(additional_tools)
+            },
+            tool_choice: Some(db_insert.tool_choice),
+            parallel_tool_calls: db_insert.parallel_tool_calls,
+            // TODO(#4271): store and restore the provider_tools from DB
+            provider_tools: None,
+        }
+    }
+
     #[instrument(skip_all, fields(inference_id))]
-    pub async fn prepare_response<'request>(
+    pub async fn prepare_response(
         &self,
         inference_id: Uuid,
         content_blocks: Vec<ContentBlockOutput>,
         model_inference_results: Vec<ModelInferenceResponseWithMetadata>,
-        inference_config: &'request InferenceConfig<'request>,
+        inference_config: &InferenceConfig,
         inference_params: InferenceParams,
         original_response: Option<String>,
     ) -> Result<InferenceResult, Error> {
@@ -359,7 +423,7 @@ impl FunctionConfig {
                     inference_id,
                     content_blocks,
                     model_inference_results,
-                    inference_config.tool_config,
+                    inference_config.tool_config.as_deref(),
                     inference_params,
                     original_response,
                 )
@@ -423,22 +487,38 @@ impl FunctionConfig {
 
     pub fn system_schema(&self) -> Option<&StaticJSONSchema> {
         match self {
-            FunctionConfig::Chat(params) => params.schemas.get_implicit_system_schema(),
-            FunctionConfig::Json(params) => params.schemas.get_implicit_system_schema(),
+            FunctionConfig::Chat(params) => params
+                .schemas
+                .get_implicit_system_schema()
+                .map(|s| &s.schema),
+            FunctionConfig::Json(params) => params
+                .schemas
+                .get_implicit_system_schema()
+                .map(|s| &s.schema),
         }
     }
 
     pub fn user_schema(&self) -> Option<&StaticJSONSchema> {
         match self {
-            FunctionConfig::Chat(params) => params.schemas.get_implicit_user_schema(),
-            FunctionConfig::Json(params) => params.schemas.get_implicit_user_schema(),
+            FunctionConfig::Chat(params) => {
+                params.schemas.get_implicit_user_schema().map(|s| &s.schema)
+            }
+            FunctionConfig::Json(params) => {
+                params.schemas.get_implicit_user_schema().map(|s| &s.schema)
+            }
         }
     }
 
     pub fn assistant_schema(&self) -> Option<&StaticJSONSchema> {
         match self {
-            FunctionConfig::Chat(params) => params.schemas.get_implicit_assistant_schema(),
-            FunctionConfig::Json(params) => params.schemas.get_implicit_assistant_schema(),
+            FunctionConfig::Chat(params) => params
+                .schemas
+                .get_implicit_assistant_schema()
+                .map(|s| &s.schema),
+            FunctionConfig::Json(params) => params
+                .schemas
+                .get_implicit_assistant_schema()
+                .map(|s| &s.schema),
         }
     }
 
@@ -453,9 +533,9 @@ impl FunctionConfig {
     // which may call an async GCP SDK function to fetch credentials from the environment.
     #[instrument(skip_all, fields(function_name = %function_name))]
     pub async fn validate(
-        &self,
+        self: &Arc<Self>,
         static_tools: &HashMap<String, Arc<StaticToolConfig>>,
-        models: &mut ModelTable,
+        models: &ModelTable,
         embedding_models: &EmbeddingModelTable,
         templates: &TemplateConfig<'_>,
         function_name: &str,
@@ -472,7 +552,7 @@ impl FunctionConfig {
             }
             variant
                 .validate(
-                    self,
+                    Arc::clone(self),
                     models,
                     embedding_models,
                     templates,
@@ -481,7 +561,7 @@ impl FunctionConfig {
                 )
                 .await?;
         }
-        match self {
+        match self.as_ref() {
             FunctionConfig::Chat(params) => {
                 for tool in &params.tools {
                     static_tools.get(tool).ok_or_else(|| Error::new(ErrorDetails::Config {
@@ -542,13 +622,19 @@ fn validate_all_text_input(
 ) -> Result<(), Error> {
     match (input.system.as_ref(), schemas.get_implicit_system_schema()) {
         // If there is any system message passed we validate it
-        (Some(system), _) => validate_single_message(
-            system,
-            schemas.get_implicit_system_schema(),
-            "system",
-            all_templates_names,
-            None,
-        ),
+        (Some(system), _) => {
+            let system_value = match system {
+                System::Text(text) => Cow::Owned(Value::String(text.clone())),
+                System::Template(arguments) => Cow::Owned(Value::Object(arguments.0.clone())),
+            };
+            validate_single_message(
+                &system_value,
+                schemas.get_implicit_system_schema().map(|s| &s.schema),
+                "system",
+                all_templates_names,
+                None,
+            )
+        }
         // If there is no system message and no schema we accept
         (None, None) => Ok(()),
         // If no system message is passed and we have a schema we fail
@@ -559,32 +645,26 @@ fn validate_all_text_input(
     for (index, message) in input.messages.iter().enumerate() {
         for block in &message.content {
             match block {
-                InputMessageContent::Text(kind) => {
-                    let content = match kind {
-                        TextKind::Arguments { arguments } => {
-                            Cow::Owned(Value::Object(arguments.clone()))
-                        }
-                        TextKind::Text { text } => Cow::Owned(Value::String(text.clone())),
-                        TextKind::LegacyValue { value } => Cow::Borrowed(value),
-                    };
+                InputMessageContent::Text(text) => {
+                    let content = Cow::Owned(Value::String(text.text.clone()));
                     let schema = match &message.role {
                         Role::Assistant => schemas.get_implicit_assistant_schema(),
                         Role::User => schemas.get_implicit_user_schema(),
                     };
                     validate_single_message(
                         &content,
-                        schema,
+                        schema.map(|s| &s.schema),
                         message.role.implicit_template_name(),
                         all_templates_names,
                         Some(index),
                     )?;
                 }
                 InputMessageContent::Template(template) => {
-                    // TODO - figure out a way to avoid this clone
-                    let value = Value::Object(template.arguments.clone());
+                    // TODO: figure out a way to avoid this clone
+                    let value = Value::Object(template.arguments.0.clone());
                     validate_single_message(
                         &value,
-                        schemas.get_named_schema(&template.name),
+                        schemas.get_named_schema(&template.name).map(|s| &s.schema),
                         &template.name,
                         all_templates_names,
                         Some(index),
@@ -626,128 +706,32 @@ fn validate_single_message(
     Ok(())
 }
 
-/// Sample a variant from the function based on variant weights (uniform random selection)
-/// This function pops the sampled variant from the candidate variants map.
-/// NOTE: We use a BTreeMap to ensure that the variants are sorted by their names and the
-/// sampling choices are deterministic given an episode ID.
-pub fn sample_variant(
-    candidate_variants: &mut BTreeMap<String, Arc<VariantInfo>>,
-    function_name: &str,
-    episode_id: &Uuid,
-) -> Result<(String, Arc<VariantInfo>), Error> {
-    if candidate_variants.is_empty() {
-        return Err(Error::new(ErrorDetails::InvalidFunctionVariants {
-            message: format!("Function `{function_name}` has no variants"),
-        }));
-    }
-    // Compute the total weight of variants present in variant_names
-    let total_weight = candidate_variants
-        .values()
-        .map(|variant| variant.inner.weight().unwrap_or(0.0))
-        .sum::<f64>();
-
-    // If the total weight is non-positive, perform uniform sampling
-    // NOTE: We enforce non-negative weights at the config parsing stage,
-    //       but there's a chance we pin a weight-zero variant in the config.
-    //       This check also ensures that we catch any regressions we might introduce in the future.
-    if total_weight <= 0. {
-        // Perform uniform sampling if total weight is non-positive
-        let random_index = (get_uniform_value(function_name, episode_id)
-            * candidate_variants.len() as f64)
-            .floor() as usize;
-        let Some(sampled_variant_name) = candidate_variants.keys().nth(random_index).cloned()
-        else {
-            return Err(Error::new(ErrorDetails::InvalidFunctionVariants {
-                message: format!(
-                    "Invalid index {random_index} for function `{function_name}` with {} variants. {IMPOSSIBLE_ERROR_MESSAGE}",
-                    candidate_variants.len()
-                ),
-            }));
-        };
-        return candidate_variants.remove_entry(&sampled_variant_name).ok_or_else(|| {
-            Error::new(ErrorDetails::InvalidFunctionVariants {
-                message: format!(
-                    "Function `{function_name}` has no variant for the sampled variant `{sampled_variant_name}`. {IMPOSSIBLE_ERROR_MESSAGE}"
-                )
-            })
-        });
-    }
-
-    // Sample a random threshold between 0 and the total weight
-    let random_threshold = get_uniform_value(function_name, episode_id) * total_weight;
-
-    // Iterate over the variants to find the one that corresponds to the sampled threshold
-    let variant_to_remove = {
-        let mut cumulative_weight = 0.0;
-        candidate_variants
-            .iter()
-            .find(|(_, variant)| {
-                cumulative_weight += variant.inner.weight().unwrap_or(0.0);
-                cumulative_weight > random_threshold
-            })
-            .map(|(name, _)| name.clone()) // Clone the key
-    };
-
-    if let Some(variant_name) = variant_to_remove {
-        return candidate_variants.remove_entry(&variant_name).ok_or_else(|| {
-            Error::new(ErrorDetails::InvalidFunctionVariants {
-                message: format!(
-                    "Function `{function_name}` has no variant for the sampled variant `{variant_name}`. {IMPOSSIBLE_ERROR_MESSAGE}"
-                )
-            })
-        });
-    }
-
-    // If we didn't find a variant (which should only happen due to rare numerical precision issues),
-    // pop an arbitrary variant as a fallback
-    candidate_variants.pop_first().ok_or_else(|| {
-        Error::new(ErrorDetails::InvalidFunctionVariants {
-            message: format!(
-                "Function `{function_name}` has no variants. {IMPOSSIBLE_ERROR_MESSAGE}"
-            ),
-        })
-    })
-}
-
-/// Implements a uniform distribution over the interval [0, 1) using a hash function.
-/// This function is deterministic but should have good statistical properties.
-fn get_uniform_value(function_name: &str, episode_id: &Uuid) -> f64 {
-    let mut hasher = Sha256::new();
-    hasher.update(function_name.as_bytes());
-    hasher.update(episode_id.as_bytes());
-    let hash_value = hasher.finalize();
-    let truncated_hash =
-        u32::from_be_bytes([hash_value[0], hash_value[1], hash_value[2], hash_value[3]]);
-    truncated_hash as f64 / u32::MAX as f64
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::config::ErrorContext;
-    use crate::endpoints::inference::InferenceIds;
-    use crate::inference::types::FinishReason;
-    use crate::inference::types::InputMessage;
-    use crate::inference::types::Latency;
-    use crate::inference::types::RequestMessagesOrBatch;
-    use crate::inference::types::Text;
-    use crate::inference::types::Thought;
-    use crate::inference::types::Usage;
-    use crate::jsonschema_util::DynamicJSONSchema;
-    use crate::minijinja_util::TemplateConfig;
-    use crate::tool::ToolCall;
-
-    use crate::variant::chat_completion::UninitializedChatCompletionConfig;
-    use crate::variant::VariantConfig;
-
     use super::*;
-    use crate::config::path::ResolvedTomlPath;
-    use crate::config::UninitializedSchemas;
     use serde_json::json;
     use std::io::Write;
     use std::time::Duration;
     use std::time::Instant;
     use tempfile::NamedTempFile;
     use tracing_test::traced_test;
+
+    use crate::config::path::ResolvedTomlPath;
+    use crate::config::UninitializedSchemas;
+    use crate::endpoints::inference::InferenceIds;
+    use crate::inference::types::Arguments;
+    use crate::inference::types::FinishReason;
+    use crate::inference::types::InputMessage;
+    use crate::inference::types::Latency;
+    use crate::inference::types::RawText;
+    use crate::inference::types::RequestMessagesOrBatch;
+    use crate::inference::types::Template;
+    use crate::inference::types::Text;
+    use crate::inference::types::Thought;
+    use crate::inference::types::Usage;
+    use crate::jsonschema_util::DynamicJSONSchema;
+    use crate::minijinja_util::TemplateConfig;
+    use crate::tool::ToolCall;
 
     fn create_test_schema() -> StaticJSONSchema {
         let schema = r#"
@@ -793,7 +777,7 @@ mod tests {
         ];
 
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -806,16 +790,19 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
         let input = Input {
-            system: Some(json!("system name")),
+            system: Some(System::Text("system name".to_string())),
             messages,
         };
 
@@ -843,7 +830,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -880,7 +867,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -905,7 +892,12 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!({ "name": "system name" })),
+            system: Some(System::Template(Arguments(
+                json!({ "name": "system name" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))),
             messages,
         };
 
@@ -942,7 +934,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
         let validation_result = function_config.validate_input(&input);
@@ -959,8 +951,12 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "user".to_string(),
+                    arguments: Arguments(serde_json::Map::from_iter([(
+                        "name".to_string(),
+                        "user name".into(),
+                    )])),
                 })],
             },
             InputMessage {
@@ -969,7 +965,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1006,7 +1002,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
         let validation_result = function_config.validate_input(&input);
@@ -1027,16 +1023,19 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1075,14 +1074,14 @@ mod tests {
             },
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::RawText {
+                content: vec![InputMessageContent::RawText(RawText {
                     value: "raw text".to_string(),
-                }],
+                })],
             },
         ];
 
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1100,23 +1099,35 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "user".to_string(),
+                    arguments: Arguments(serde_json::Map::from_iter([(
+                        "name".to_string(),
+                        "user name".into(),
+                    )])),
                 })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
 
         let input = Input {
-            system: Some(json!({ "name": "system name" })),
+            system: Some(System::Template(Arguments(
+                json!({ "name": "system name" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))),
             messages,
         };
 
@@ -1146,26 +1157,31 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::RawText {
+                content: vec![InputMessageContent::RawText(RawText {
                     value: "user content".to_string(),
-                }],
+                })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::RawText {
+                content: vec![InputMessageContent::RawText(RawText {
                     value: "assistant content".to_string(),
-                }],
+                })],
             },
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::RawText {
+                content: vec![InputMessageContent::RawText(RawText {
                     value: "raw text".to_string(),
-                }],
+                })],
             },
         ];
 
         let input = Input {
-            system: Some(json!({ "name": "system name" })),
+            system: Some(System::Template(Arguments(
+                json!({ "name": "system name" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))),
             messages,
         };
 
@@ -1198,14 +1214,14 @@ mod tests {
             },
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::RawText {
+                content: vec![InputMessageContent::RawText(RawText {
                     value: "raw text".to_string(),
-                }],
+                })],
             },
         ];
 
         let input = Input {
-            system: Some(Value::String("system content".to_string())),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1231,30 +1247,40 @@ mod tests {
             InputMessage {
                 role: Role::User,
                 content: vec![
-                    InputMessageContent::Text(TextKind::Arguments {
-                        arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                    InputMessageContent::Template(Template {
+                        name: "user".to_string(),
+                        arguments: Arguments(serde_json::Map::from_iter([(
+                            "name".to_string(),
+                            "user name".into(),
+                        )])),
                     }),
-                    InputMessageContent::Text(TextKind::Arguments {
-                        arguments: json!({ "name": "extra content" })
-                            .as_object()
-                            .unwrap()
-                            .clone(),
+                    InputMessageContent::Template(Template {
+                        name: "user".to_string(),
+                        arguments: Arguments(
+                            json!({ "name": "extra content" })
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
                     }),
                 ],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
 
         let input = Input {
-            system: Some(Value::String("system content".to_string())),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1271,7 +1297,8 @@ mod tests {
             output_schema: StaticJSONSchema::from_value(json!({})).unwrap(),
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Json(tool_config);
 
@@ -1286,14 +1313,14 @@ mod tests {
             },
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::RawText {
+                content: vec![InputMessageContent::RawText(RawText {
                     value: "raw text".to_string(),
-                }],
+                })],
             },
         ];
 
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1302,23 +1329,30 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "user".to_string(),
+                    arguments: Arguments(serde_json::Map::from_iter([(
+                        "name".to_string(),
+                        "user name".into(),
+                    )])),
                 })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
 
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1350,7 +1384,8 @@ mod tests {
             output_schema: StaticJSONSchema::from_value(output_schema).unwrap(),
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Json(tool_config);
 
@@ -1366,7 +1401,7 @@ mod tests {
         ];
 
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1393,7 +1428,12 @@ mod tests {
         ];
 
         let input = Input {
-            system: Some(json!({ "name": "system name" })),
+            system: Some(System::Template(Arguments(
+                json!({ "name": "system name" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))),
             messages,
         };
 
@@ -1419,7 +1459,8 @@ mod tests {
             output_schema: StaticJSONSchema::from_value(output_schema).unwrap(),
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Json(tool_config);
 
@@ -1435,7 +1476,7 @@ mod tests {
         ];
 
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1453,8 +1494,12 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "user".to_string(),
+                    arguments: Arguments(serde_json::Map::from_iter([(
+                        "name".to_string(),
+                        "user name".into(),
+                    )])),
                 })],
             },
             InputMessage {
@@ -1463,7 +1508,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1489,7 +1534,8 @@ mod tests {
             output_schema: StaticJSONSchema::from_value(output_schema).unwrap(),
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Json(tool_config);
 
@@ -1504,7 +1550,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1526,16 +1572,19 @@ mod tests {
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1563,7 +1612,8 @@ mod tests {
             output_schema: StaticJSONSchema::from_value(output_schema).unwrap(),
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Json(tool_config);
 
@@ -1578,7 +1628,7 @@ mod tests {
             },
         ];
         let input = Input {
-            system: Some(json!("system content")),
+            system: Some(System::Text("system content".to_string())),
             messages,
         };
 
@@ -1596,23 +1646,35 @@ mod tests {
         let messages = vec![
             InputMessage {
                 role: Role::User,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "user name" }).as_object().unwrap().clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "user".to_string(),
+                    arguments: Arguments(serde_json::Map::from_iter([(
+                        "name".to_string(),
+                        "user name".into(),
+                    )])),
                 })],
             },
             InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Arguments {
-                    arguments: json!({ "name": "assistant name" })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                content: vec![InputMessageContent::Template(Template {
+                    name: "assistant".to_string(),
+                    arguments: Arguments(
+                        json!({ "name": "assistant name" })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
                 })],
             },
         ];
 
         let input = Input {
-            system: Some(json!({ "name": "system name" })),
+            system: Some(System::Template(Arguments(
+                json!({ "name": "system name" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))),
             messages,
         };
 
@@ -1623,128 +1685,6 @@ mod tests {
     ///
     /// NOTE: If this test fails, it might be due to sampling. Please run it again to check if the
     ///       issue persists.
-    #[test]
-    fn test_sample_variant() {
-        // Helper function to create a HashMap of variant names to their weights
-        fn create_variants(variant_weights: &[(&str, f64)]) -> BTreeMap<String, Arc<VariantInfo>> {
-            variant_weights
-                .iter()
-                .map(|&(name, weight)| {
-                    (
-                        name.to_string(),
-                        Arc::new(VariantInfo {
-                            inner: VariantConfig::ChatCompletion(
-                                UninitializedChatCompletionConfig {
-                                    weight: Some(weight),
-                                    model: "model-name".into(),
-                                    ..Default::default()
-                                }
-                                .load(&SchemaData::default(), &ErrorContext::new_test())
-                                .unwrap(),
-                            ),
-                            timeouts: Default::default(),
-                        }),
-                    )
-                })
-                .collect()
-        }
-
-        // Helper function to test the distribution of variant weights by sampling them many times
-        // and checking if the observed distribution is close to the expected distribution
-        fn test_variant_distribution(
-            variants: &BTreeMap<String, Arc<VariantInfo>>,
-            sample_size: usize,
-            tolerance: f64,
-        ) {
-            let total_weight: f64 = variants
-                .values()
-                .map(|v| v.inner.weight().unwrap_or(0.0))
-                .sum();
-            let mut counts: HashMap<String, usize> = HashMap::new();
-
-            for _ in 0..sample_size {
-                let mut variants = variants.clone();
-                let (variant_name, _) =
-                    sample_variant(&mut variants, "test_function", &Uuid::now_v7()).unwrap();
-                *counts.entry(variant_name.to_string()).or_insert(0) += 1;
-            }
-
-            for (variant_name, variant) in variants {
-                let expected_prob = variant.inner.weight().unwrap_or(0.0) / total_weight;
-                let actual_prob =
-                    *counts.get(variant_name).unwrap_or(&0) as f64 / sample_size as f64;
-                let diff = (expected_prob - actual_prob).abs();
-
-                assert!(
-                    diff <= tolerance,
-                    "Probability for variant {variant_name} is outside the acceptable range"
-                );
-            }
-        }
-
-        // Test case 1: Equal weights
-        let variants = create_variants(&[("A", 1.0), ("B", 1.0), ("C", 1.0)]);
-        test_variant_distribution(&variants, 10_000, 0.02);
-
-        // Test case 2: Unequal weights
-        let variants = create_variants(&[("X", 1.0), ("Y", 2.0), ("Z", 3.0)]);
-        test_variant_distribution(&variants, 10_000, 0.02);
-
-        // Test case 3: Extreme weights
-        let variants = create_variants(&[("Rare", 0.01), ("Common", 0.99)]);
-        test_variant_distribution(&variants, 10_000, 0.005);
-
-        // Test case 4: Single weights
-        let variants = create_variants(&[("Solo", 1.0)]);
-        test_variant_distribution(&variants, 10_000, 0.0);
-
-        // Test case 5: All zero weights
-        let variants = create_variants(&[("A", 0.0), ("B", 0.0), ("C", 0.0)]);
-        let sample_size = 10_000;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-
-        for _ in 0..sample_size {
-            let mut variants = variants.clone();
-            let (variant_name, _) =
-                sample_variant(&mut variants, "test_function", &Uuid::now_v7()).unwrap();
-            *counts.entry(variant_name.to_string()).or_insert(0) += 1;
-        }
-
-        // Check if all variants are sampled approximately equally
-        let expected_count = sample_size / variants.len();
-        let tolerance = (expected_count as f64 * 0.1) as usize; // 10% tolerance
-
-        for (variant_name, count) in counts {
-            assert!(
-                (count as i32 - expected_count as i32).abs() <= tolerance as i32,
-                "Variant {variant_name} was not sampled uniformly. Expected {expected_count} +/- {tolerance}, got {count}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_get_uniform_value() {
-        // Test with function name and episode ID
-        let episode_id = Uuid::now_v7();
-        let value1 = get_uniform_value("test_function", &episode_id);
-        let value2 = get_uniform_value("test_function", &episode_id);
-
-        // Values should be the same due to deterministic input
-        assert_eq!(value1, value2);
-        assert!((0.0..1.0).contains(&value1));
-        assert!((0.0..1.0).contains(&value2));
-
-        // Test with different function names
-        let value3 = get_uniform_value("another_function", &episode_id);
-        assert_ne!(value1, value3);
-        assert!((0.0..1.0).contains(&value3));
-
-        // Test with different episode IDs
-        let value4 = get_uniform_value("test_function", &Uuid::now_v7());
-        assert_ne!(value1, value4);
-        assert_ne!(value3, value4);
-        assert!((0.0..1.0).contains(&value4));
-    }
 
     #[test]
     fn test_description_getter() {
@@ -1757,6 +1697,7 @@ mod tests {
             parallel_tool_calls: None,
             description: Some("A chat function description".to_string()),
             all_explicit_templates_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Chat(chat_config);
         assert_eq!(
@@ -1773,7 +1714,8 @@ mod tests {
             output_schema,
             implicit_tool_call_config,
             description: Some("A JSON function description".to_string()),
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Json(json_config);
         assert_eq!(
@@ -1790,6 +1732,7 @@ mod tests {
             parallel_tool_calls: None,
             description: None,
             all_explicit_templates_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         };
         let function_config = FunctionConfig::Chat(chat_config);
         assert_eq!(function_config.description(), None);
@@ -1823,7 +1766,8 @@ mod tests {
             output_schema,
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         });
         let raw_request = "raw_request".to_string();
 
@@ -1852,19 +1796,20 @@ mod tests {
             latency,
             cached: false,
         };
-        let templates = TemplateConfig::default();
+        let templates = Arc::new(TemplateConfig::default());
         let inference_config = InferenceConfig {
             ids: InferenceIds {
                 inference_id: Uuid::now_v7(),
                 episode_id: Uuid::now_v7(),
             },
             tool_config: None,
-            function_name: "",
-            variant_name: "",
-            templates: &templates,
+            function_name: "".into(),
+            variant_name: "".into(),
+            templates: templates.clone(),
             dynamic_output_schema: None,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            fetch_and_encode_input_files_before_inference: false,
             extra_cache_key: None,
         };
         let response = function_config
@@ -2170,12 +2115,13 @@ mod tests {
                 episode_id: Uuid::now_v7(),
             },
             tool_config: None,
-            function_name: "",
-            variant_name: "",
-            templates: &templates,
-            dynamic_output_schema: Some(&dynamic_output_schema),
+            function_name: "".into(),
+            variant_name: "".into(),
+            templates: templates.clone(),
+            dynamic_output_schema: Some(Arc::new(dynamic_output_schema)),
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            fetch_and_encode_input_files_before_inference: false,
             extra_cache_key: None,
         };
         // Test with a correct content block
@@ -2388,7 +2334,8 @@ mod tests {
             output_schema,
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         });
         let inference_id = Uuid::now_v7();
         let content_blocks = vec![r#"{"answer": "42"}"#.to_string().into()];
@@ -2438,6 +2385,191 @@ mod tests {
         }
     }
 
+    mod database_insert_to_dynamic_tool_params_tests {
+        use super::*;
+        use crate::tool::{Tool, ToolCallConfigDatabaseInsert};
+
+        fn create_test_tool(name: &str, strict: bool) -> Tool {
+            Tool {
+                name: name.to_string(),
+                description: format!("Description for {name}"),
+                parameters: json!({"type": "object", "properties": {"input": {"type": "string"}}}),
+                strict,
+            }
+        }
+
+        fn create_chat_function(tool_names: Vec<&str>) -> FunctionConfig {
+            FunctionConfig::Chat(FunctionConfigChat {
+                variants: HashMap::new(),
+                schemas: SchemaData::default(),
+                tools: tool_names.into_iter().map(String::from).collect(),
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: Some(true),
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn test_tool_partitioning() {
+            // Test 1: Only static tools (all match function config)
+            let function_config = create_chat_function(vec!["tool1", "tool2"]);
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![
+                    create_test_tool("tool1", false),
+                    create_test_tool("tool2", true),
+                ],
+                tool_choice: ToolChoice::Required,
+                parallel_tool_calls: Some(false),
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+            assert_eq!(
+                result.allowed_tools,
+                Some(vec!["tool1".to_string(), "tool2".to_string()])
+            );
+            assert_eq!(result.additional_tools, None);
+
+            // Test 2: Only dynamic tools (none match function config)
+            let function_config = create_chat_function(vec!["static1"]);
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![
+                    create_test_tool("dynamic1", false),
+                    create_test_tool("dynamic2", true),
+                ],
+                tool_choice: ToolChoice::None,
+                parallel_tool_calls: Some(true),
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+            assert_eq!(result.allowed_tools, None);
+            assert_eq!(result.additional_tools.as_ref().unwrap().len(), 2);
+            assert_eq!(
+                result.additional_tools.as_ref().unwrap()[0].name,
+                "dynamic1"
+            );
+            assert_eq!(
+                result.additional_tools.as_ref().unwrap()[1].name,
+                "dynamic2"
+            );
+
+            // Test 3: Mixed static and dynamic tools
+            let function_config = create_chat_function(vec!["a", "b"]);
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![
+                    create_test_tool("a", false),
+                    create_test_tool("x", true),
+                    create_test_tool("b", false),
+                    create_test_tool("y", true),
+                ],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: None,
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+            assert_eq!(
+                result.allowed_tools,
+                Some(vec!["a".to_string(), "b".to_string()])
+            );
+            let additional = result.additional_tools.unwrap();
+            assert_eq!(additional.len(), 2);
+            assert_eq!(additional[0].name, "x");
+            assert_eq!(additional[1].name, "y");
+            assert!(additional[0].strict);
+            assert!(additional[1].strict);
+
+            // Test 4: Empty tools list
+            let function_config = create_chat_function(vec!["tool1"]);
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![],
+                tool_choice: ToolChoice::None,
+                parallel_tool_calls: None,
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+            assert_eq!(result.allowed_tools, None);
+            assert_eq!(result.additional_tools, None);
+
+            // Test 5: Chat function with no tools in config
+            let function_config = create_chat_function(vec![]);
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![
+                    create_test_tool("tool1", false),
+                    create_test_tool("tool2", true),
+                ],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: None,
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+            assert_eq!(result.allowed_tools, None);
+            assert_eq!(result.additional_tools.as_ref().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn test_field_preservation() {
+            let function_config = create_chat_function(vec!["tool1"]);
+
+            // Test tool_choice variants
+            for choice in [
+                ToolChoice::None,
+                ToolChoice::Auto,
+                ToolChoice::Required,
+                ToolChoice::Specific("tool1".to_string()),
+            ] {
+                let db_insert = ToolCallConfigDatabaseInsert {
+                    tools_available: vec![create_test_tool("tool1", false)],
+                    tool_choice: choice.clone(),
+                    parallel_tool_calls: None,
+                };
+                let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+                assert_eq!(result.tool_choice, Some(choice));
+            }
+
+            // Test parallel_tool_calls variants
+            for ptc in [None, Some(true), Some(false)] {
+                let db_insert = ToolCallConfigDatabaseInsert {
+                    tools_available: vec![create_test_tool("tool1", false)],
+                    tool_choice: ToolChoice::Auto,
+                    parallel_tool_calls: ptc,
+                };
+                let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+                assert_eq!(result.parallel_tool_calls, ptc);
+            }
+
+            // Test provider_tools is always None (lossy conversion)
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![create_test_tool("tool1", false)],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: None,
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+            assert_eq!(result.provider_tools, None);
+        }
+
+        #[test]
+        fn test_tool_metadata_preservation() {
+            let function_config = create_chat_function(vec![]);
+            let tool = Tool {
+                name: "test_tool".to_string(),
+                description: "A detailed description".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"param1": {"type": "string"}, "param2": {"type": "number"}},
+                    "required": ["param1"]
+                }),
+                strict: true,
+            };
+
+            let db_insert = ToolCallConfigDatabaseInsert {
+                tools_available: vec![tool.clone()],
+                tool_choice: ToolChoice::Auto,
+                parallel_tool_calls: Some(false),
+            };
+            let result = function_config.database_insert_to_dynamic_tool_params(db_insert);
+
+            let result_tool = &result.additional_tools.unwrap()[0];
+            assert_eq!(result_tool.name, tool.name);
+            assert_eq!(result_tool.description, tool.description);
+            assert_eq!(result_tool.parameters, tool.parameters);
+            assert_eq!(result_tool.strict, tool.strict);
+        }
+    }
+
     #[test]
     fn test_get_json_output_from_content_blocks() {
         // Case 1: Text followed by ToolCall
@@ -2466,11 +2598,13 @@ mod tests {
             ContentBlockOutput::Thought(Thought {
                 text: Some("thinking...".to_string()),
                 signature: None,
+                summary: None,
                 provider_type: None,
             }),
             ContentBlockOutput::Thought(Thought {
                 text: Some("still thinking".to_string()),
                 signature: Some("sig".to_string()),
+                summary: None,
                 provider_type: None,
             }),
         ];
@@ -2485,6 +2619,7 @@ mod tests {
             ContentBlockOutput::Thought(Thought {
                 text: Some("first thought".to_string()),
                 signature: None,
+                summary: None,
                 provider_type: None,
             }),
             ContentBlockOutput::Text(Text {
@@ -2493,6 +2628,7 @@ mod tests {
             ContentBlockOutput::Thought(Thought {
                 text: Some("second thought".to_string()),
                 signature: Some("sig2".to_string()),
+                summary: None,
                 provider_type: None,
             }),
             ContentBlockOutput::ToolCall(ToolCall {
@@ -2545,6 +2681,7 @@ mod tests {
             ContentBlockOutput::Thought(Thought {
                 text: Some("final thought".to_string()),
                 signature: None,
+                summary: None,
                 provider_type: None,
             }),
         ];

@@ -10,7 +10,7 @@ use tensorzero_core::{
     error::Error,
     inference::types::{
         extra_body::UnfilteredInferenceExtraBody, extra_headers::UnfilteredInferenceExtraHeaders,
-        Input, InputMessage, InputMessageContent,
+        Input, InputMessage,
     },
     tool::DynamicToolParams,
 };
@@ -85,6 +85,13 @@ pub struct ClientInferenceParams {
     #[ts(skip)]
     pub extra_headers: UnfilteredInferenceExtraHeaders,
     pub internal_dynamic_variant_config: Option<UninitializedVariantInfo>,
+    /// OTLP trace headers to attach to the HTTP request to the TensorZero Gateway.
+    /// These headers will be prefixed with `tensorzero-otlp-traces-extra-header-` and
+    /// forwarded to the OTLP exporter. This field is not serialized into the request body.
+    #[serde(skip)]
+    #[serde(default)]
+    #[ts(skip)]
+    pub otlp_traces_extra_headers: HashMap<String, String>,
 }
 
 impl TryFrom<ClientInferenceParams> for Params {
@@ -94,7 +101,7 @@ impl TryFrom<ClientInferenceParams> for Params {
         for message in this.input.messages {
             let mut content = Vec::with_capacity(message.content.len());
             for input_content in message.content {
-                content.push(InputMessageContent::try_from(input_content)?);
+                content.push(input_content.to_input_message_content(&message.role)?);
             }
             messages.push(InputMessage {
                 role: message.role,
@@ -156,6 +163,7 @@ fn assert_params_match(client_params: ClientInferenceParams) {
         extra_body,
         extra_headers,
         internal_dynamic_variant_config,
+        otlp_traces_extra_headers: _,
     } = client_params;
     let _ = Params {
         function_name,

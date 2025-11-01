@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::sync::OnceLock;
 
 use futures::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
@@ -25,12 +24,11 @@ use crate::inference::types::{
     ProviderInferenceResponse,
 };
 use crate::inference::types::{ContentBlockOutput, ProviderInferenceResponseArgs};
-use crate::model::{
-    build_creds_caching_default, Credential, CredentialLocation, EndpointLocation, ModelProvider,
-};
+use crate::model::{Credential, EndpointLocation, ModelProvider};
 use crate::providers::helpers::{
     inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
+use crate::providers::openai::OpenAIMessagesConfig;
 
 use super::openai::{
     handle_openai_error, prepare_openai_messages, prepare_openai_tools, stream_openai,
@@ -83,21 +81,12 @@ impl AzureEndpoint {
     }
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<AzureCredentials> = OnceLock::new();
-
 impl AzureProvider {
     pub fn new(
         deployment_id: String,
         endpoint_location: EndpointLocation,
-        api_key_location: Option<CredentialLocation>,
+        credentials: AzureCredentials,
     ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-
         let endpoint = match endpoint_location {
             EndpointLocation::Static(url_str) => {
                 let url = Url::parse(&url_str).map_err(|e| {
@@ -142,6 +131,10 @@ pub enum AzureCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    WithFallback {
+        default: Box<AzureCredentials>,
+        fallback: Box<AzureCredentials>,
+    },
 }
 
 impl TryFrom<Credential> for AzureCredentials {
@@ -152,6 +145,10 @@ impl TryFrom<Credential> for AzureCredentials {
             Credential::Static(key) => Ok(AzureCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(AzureCredentials::Dynamic(key_name)),
             Credential::Missing => Ok(AzureCredentials::None),
+            Credential::WithFallback { default, fallback } => Ok(AzureCredentials::WithFallback {
+                default: Box::new((*default).try_into()?),
+                fallback: Box::new((*fallback).try_into()?),
+            }),
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for Azure provider".to_string(),
             })),
@@ -180,12 +177,18 @@ impl AzureCredentials {
                 message: "No credentials are set".to_string(),
             }
             .into()),
+            AzureCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
+            }
         }
     }
-}
-
-fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("AZURE_OPENAI_API_KEY".to_string())
 }
 
 impl InferenceProvider for AzureProvider {
@@ -195,19 +198,21 @@ impl InferenceProvider for AzureProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         api_key: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(AzureRequest::new(request)?).map_err(|e| {
-            Error::new(ErrorDetails::Serialization {
-                message: format!(
-                    "Error serializing Azure request: {}",
-                    DisplayOrDebugGateway::new(e)
-                ),
-            })
-        })?;
+        let request_body =
+            serde_json::to_value(AzureRequest::new(request).await?).map_err(|e| {
+                Error::new(ErrorDetails::Serialization {
+                    message: format!(
+                        "Error serializing Azure request: {}",
+                        DisplayOrDebugGateway::new(e)
+                    ),
+                })
+            })?;
         let endpoint = self.endpoint.get_endpoint(api_key)?;
         let request_url = get_azure_chat_url(&endpoint, &self.deployment_id)?;
         let start_time = Instant::now();
@@ -288,19 +293,21 @@ impl InferenceProvider for AzureProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(AzureRequest::new(request)?).map_err(|e| {
-            Error::new(ErrorDetails::Serialization {
-                message: format!(
-                    "Error serializing Azure request: {}",
-                    DisplayOrDebugGateway::new(e)
-                ),
-            })
-        })?;
+        let request_body =
+            serde_json::to_value(AzureRequest::new(request).await?).map_err(|e| {
+                Error::new(ErrorDetails::Serialization {
+                    message: format!(
+                        "Error serializing Azure request: {}",
+                        DisplayOrDebugGateway::new(e)
+                    ),
+                })
+            })?;
         let endpoint = self.endpoint.get_endpoint(dynamic_api_keys)?;
         let request_url = get_azure_chat_url(&endpoint, &self.deployment_id)?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
@@ -586,7 +593,7 @@ struct AzureRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u32>,
     stream: bool,
@@ -599,14 +606,22 @@ struct AzureRequest<'a> {
 }
 
 impl<'a> AzureRequest<'a> {
-    pub fn new(request: &'a ModelInferenceRequest<'_>) -> Result<AzureRequest<'a>, Error> {
+    pub async fn new(request: &'a ModelInferenceRequest<'_>) -> Result<AzureRequest<'a>, Error> {
         let response_format = AzureResponseFormat::new(request.json_mode, request.output_schema);
         let messages = prepare_openai_messages(
-            request.system.as_deref().map(SystemOrDeveloper::System),
+            request
+                .system
+                .as_deref()
+                .map(|m| SystemOrDeveloper::System(Cow::Borrowed(m))),
             &request.messages,
-            Some(&request.json_mode),
-            PROVIDER_TYPE,
-        )?;
+            OpenAIMessagesConfig {
+                json_mode: Some(&request.json_mode),
+                provider_type: PROVIDER_TYPE,
+                fetch_and_encode_input_files_before_inference: request
+                    .fetch_and_encode_input_files_before_inference,
+            },
+        )
+        .await?;
         let (tools, tool_choice, _) = prepare_openai_tools(request);
         Ok(AzureRequest {
             messages,
@@ -615,7 +630,7 @@ impl<'a> AzureRequest<'a> {
             stop: request.borrow_stop_sequences(),
             presence_penalty: request.presence_penalty,
             frequency_penalty: request.frequency_penalty,
-            max_tokens: request.max_tokens,
+            max_completion_tokens: request.max_tokens,
             stream: request.stream,
             response_format,
             seed: request.seed,
@@ -772,8 +787,8 @@ mod tests {
     };
     use crate::providers::test_helpers::{WEATHER_TOOL, WEATHER_TOOL_CONFIG};
 
-    #[test]
-    fn test_azure_request_new() {
+    #[tokio::test]
+    async fn test_azure_request_new() {
         let request_with_tools = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
             messages: vec![RequestMessage {
@@ -796,11 +811,11 @@ mod tests {
             ..Default::default()
         };
 
-        let azure_request = AzureRequest::new(&request_with_tools).unwrap();
+        let azure_request = AzureRequest::new(&request_with_tools).await.unwrap();
 
         assert_eq!(azure_request.messages.len(), 1);
         assert_eq!(azure_request.temperature, Some(0.5));
-        assert_eq!(azure_request.max_tokens, Some(100));
+        assert_eq!(azure_request.max_completion_tokens, Some(100));
         assert!(!azure_request.stream);
         assert_eq!(azure_request.seed, Some(69));
         assert_eq!(azure_request.response_format, None);
@@ -842,11 +857,11 @@ mod tests {
             ..Default::default()
         };
 
-        let azure_request = AzureRequest::new(&request_with_tools).unwrap();
+        let azure_request = AzureRequest::new(&request_with_tools).await.unwrap();
 
         assert_eq!(azure_request.messages.len(), 2);
         assert_eq!(azure_request.temperature, Some(0.5));
-        assert_eq!(azure_request.max_tokens, Some(100));
+        assert_eq!(azure_request.max_completion_tokens, Some(100));
         assert_eq!(azure_request.top_p, Some(0.9));
         assert_eq!(azure_request.presence_penalty, Some(0.1));
         assert_eq!(azure_request.frequency_penalty, Some(0.2));
@@ -945,8 +960,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_azure_response_with_metadata_try_into() {
+    #[tokio::test]
+    async fn test_azure_response_with_metadata_try_into() {
         let valid_response = OpenAIResponse {
             choices: vec![OpenAIResponseChoice {
                 index: 0,
@@ -960,7 +975,6 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -990,7 +1004,7 @@ mod tests {
             latency: Latency::NonStreaming {
                 response_time: Duration::from_secs(0),
             },
-            raw_request: serde_json::to_string(&AzureRequest::new(&generic_request).unwrap())
+            raw_request: serde_json::to_string(&AzureRequest::new(&generic_request).await.unwrap())
                 .unwrap(),
             generic_request: &generic_request,
         };
@@ -1020,15 +1034,15 @@ mod tests {
         let provider = SKIP_CREDENTIAL_VALIDATION
             .scope((), async {
                 AzureProvider::new(
-                    "gpt-35-turbo".to_string(),
+                    "gpt-4.1-mini".to_string(),
                     EndpointLocation::Static("https://test.openai.azure.com".to_string()),
-                    None,
+                    AzureCredentials::None,
                 )
             })
             .await
             .unwrap();
 
-        assert_eq!(provider.deployment_id(), "gpt-35-turbo");
+        assert_eq!(provider.deployment_id(), "gpt-4.1-mini");
         match provider.endpoint {
             AzureEndpoint::Static(url) => {
                 assert_eq!(url.as_str(), "https://test.openai.azure.com/");
@@ -1043,15 +1057,15 @@ mod tests {
         let provider = SKIP_CREDENTIAL_VALIDATION
             .scope((), async {
                 AzureProvider::new(
-                    "gpt-35-turbo".to_string(),
+                    "gpt-4.1-mini".to_string(),
                     EndpointLocation::Dynamic("azure_endpoint".to_string()),
-                    None,
+                    AzureCredentials::None,
                 )
             })
             .await
             .unwrap();
 
-        assert_eq!(provider.deployment_id(), "gpt-35-turbo");
+        assert_eq!(provider.deployment_id(), "gpt-4.1-mini");
         match provider.endpoint {
             AzureEndpoint::Dynamic(key) => {
                 assert_eq!(key, "azure_endpoint");

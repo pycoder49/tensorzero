@@ -2,26 +2,38 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
-use tensorzero::{File, Input, InputMessage, InputMessageContent, Role};
+use tensorzero::test_helpers::make_embedded_gateway_with_config;
+use tensorzero::{
+    ClientInferenceParams, ClientInput, ClientInputMessage, ClientInputMessageContent,
+    ContentBlockChunk, File, InferenceOutput, InferenceResponse, InferenceResponseChunk, Input,
+    InputMessage, InputMessageContent, Role, Unknown, UrlFile,
+};
 use tensorzero_core::cache::{CacheEnabledMode, CacheOptions};
-use tensorzero_core::config::ProviderTypesConfig;
-use tensorzero_core::config::TimeoutsConfig;
+use tensorzero_core::config::provider_types::ProviderTypesConfig;
+use tensorzero_core::db::postgres::PostgresConnectionInfo;
 use tensorzero_core::embeddings::{
-    Embedding, EmbeddingEncodingFormat, EmbeddingModelConfig, EmbeddingProvider,
-    EmbeddingProviderConfig, EmbeddingRequest, UninitializedEmbeddingProviderConfig,
+    Embedding, EmbeddingEncodingFormat, EmbeddingModelConfig, EmbeddingProviderConfig,
+    EmbeddingRequest, UninitializedEmbeddingProviderConfig,
 };
 use tensorzero_core::endpoints::batch_inference::StartBatchInferenceParams;
 use tensorzero_core::endpoints::inference::{InferenceClients, InferenceCredentials};
 use tensorzero_core::http::TensorzeroHttpClient;
-use tensorzero_core::inference::types::{Latency, ModelInferenceRequestJsonMode, TextKind};
+use tensorzero_core::inference::types::{
+    ContentBlockChatOutput, Latency, ModelInferenceRequestJsonMode, Text, TextKind,
+};
+use tensorzero_core::model_table::ProviderTypeDefaultCredentials;
+use tensorzero_core::rate_limiting::ScopeInfo;
+use tensorzero_core::tool::{ProviderTool, ProviderToolScope, ToolCallInput};
+use url::Url;
 use uuid::Uuid;
 
 use crate::common::get_gateway_endpoint;
 use crate::providers::common::{
-    make_embedded_gateway_with_config, E2ETestProvider, E2ETestProviders, EmbeddingTestProvider,
-    FERRIS_PNG,
+    E2ETestProvider, E2ETestProviders, EmbeddingTestProvider, ModelTestProvider,
+    DEEPSEEK_PAPER_PDF, FERRIS_PNG,
 };
 use tensorzero_core::db::clickhouse::test_helpers::{
     get_clickhouse, select_batch_model_inference_clickhouse, select_chat_inference_clickhouse,
@@ -76,15 +88,31 @@ async fn get_providers() -> E2ETestProviders {
             model_provider_name: "openai".into(),
             credentials: HashMap::new(),
         },
+        E2ETestProvider {
+            supports_batch_inference: false,
+            variant_name: "openai-responses".to_string(),
+            model_name: "responses-gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
     ];
 
-    let inference_params_providers = vec![E2ETestProvider {
-        supports_batch_inference: true,
-        variant_name: "openai".to_string(),
-        model_name: "gpt-4o-mini-2024-07-18".into(),
-        model_provider_name: "openai".into(),
-        credentials: credentials.clone(),
-    }];
+    let inference_params_providers = vec![
+        E2ETestProvider {
+            supports_batch_inference: true,
+            variant_name: "openai".to_string(),
+            model_name: "gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: credentials.clone(),
+        },
+        E2ETestProvider {
+            supports_batch_inference: false,
+            variant_name: "openai-responses".to_string(),
+            model_name: "responses-gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
+    ];
 
     let inference_params_dynamic_providers = vec![E2ETestProvider {
         supports_batch_inference: true,
@@ -94,13 +122,22 @@ async fn get_providers() -> E2ETestProviders {
         credentials,
     }];
 
-    let image_providers = vec![E2ETestProvider {
-        supports_batch_inference: true,
-        variant_name: "openai".to_string(),
-        model_name: "openai::gpt-4o-mini-2024-07-18".into(),
-        model_provider_name: "openai".into(),
-        credentials: HashMap::new(),
-    }];
+    let image_providers = vec![
+        E2ETestProvider {
+            supports_batch_inference: true,
+            variant_name: "openai".to_string(),
+            model_name: "openai::gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
+        E2ETestProvider {
+            supports_batch_inference: false,
+            variant_name: "openai-responses".to_string(),
+            model_name: "responses-gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
+    ];
 
     let json_providers = vec![
         E2ETestProvider {
@@ -138,6 +175,20 @@ async fn get_providers() -> E2ETestProviders {
             model_provider_name: "openai".into(),
             credentials: HashMap::new(),
         },
+        E2ETestProvider {
+            supports_batch_inference: false,
+            variant_name: "openai-responses".to_string(),
+            model_name: "responses-gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
+        E2ETestProvider {
+            supports_batch_inference: false,
+            variant_name: "openai-responses-strict".to_string(),
+            model_name: "responses-gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
     ];
 
     let json_mode_off_providers = vec![
@@ -155,6 +206,13 @@ async fn get_providers() -> E2ETestProviders {
             model_provider_name: "openai".into(),
             credentials: HashMap::new(),
         },
+        E2ETestProvider {
+            supports_batch_inference: true,
+            variant_name: "openai-responses_json_mode_off".to_string(),
+            model_name: "responses-gpt-4o-mini-2024-07-18".into(),
+            model_provider_name: "openai".into(),
+            credentials: HashMap::new(),
+        },
     ];
 
     let shorthand_providers = vec![E2ETestProvider {
@@ -169,6 +227,31 @@ async fn get_providers() -> E2ETestProviders {
         model_name: "text-embedding-3-small".into(),
     }];
 
+    let provider_type_default_credentials_providers = vec![E2ETestProvider {
+        supports_batch_inference: true,
+        variant_name: "openai".to_string(),
+        model_name: "gpt-4o-mini-2024-07-18".into(),
+        model_provider_name: "openai".into(),
+        credentials: HashMap::new(),
+    }];
+
+    let provider_type_default_credentials_shorthand_providers = vec![E2ETestProvider {
+        supports_batch_inference: true,
+        variant_name: "openai-shorthand".to_string(),
+        model_name: "openai::gpt-4o-mini-2024-07-18".into(),
+        model_provider_name: "openai".into(),
+        credentials: HashMap::new(),
+    }];
+
+    let credential_fallbacks = vec![ModelTestProvider {
+        provider_type: "openai".to_string(),
+        model_info: HashMap::from([(
+            "model_name".to_string(),
+            "gpt-4o-mini-2024-07-18".to_string(),
+        )]),
+        use_modal_headers: false,
+    }];
+
     E2ETestProviders {
         simple_inference: standard_providers.clone(),
         extra_body_inference: extra_body_providers,
@@ -177,6 +260,9 @@ async fn get_providers() -> E2ETestProviders {
         embeddings: embedding_providers,
         inference_params_inference: inference_params_providers,
         inference_params_dynamic_credentials: inference_params_dynamic_providers,
+        provider_type_default_credentials: provider_type_default_credentials_providers,
+        provider_type_default_credentials_shorthand:
+            provider_type_default_credentials_shorthand_providers,
         tool_use_inference: standard_providers.clone(),
         tool_multi_turn_inference: standard_providers.clone(),
         dynamic_tool_use_inference: standard_providers.clone(),
@@ -187,6 +273,7 @@ async fn get_providers() -> E2ETestProviders {
         pdf_inference: image_providers.clone(),
 
         shorthand_inference: shorthand_providers.clone(),
+        credential_fallbacks,
     }
 }
 
@@ -425,7 +512,7 @@ async fn test_default_function_model_name_shorthand() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the capital of Japan?"}]
+                "content": [{"type": "text", "text": "What is the capital of Japan?"}]
             }
         ]
     });
@@ -539,7 +626,7 @@ async fn test_default_function_model_name_non_shorthand() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the capital of Japan?"}]
+                "content": [{"type": "text", "text": "What is the capital of Japan?"}]
             }
         ]
     });
@@ -775,7 +862,7 @@ async fn test_chat_function_json_override_with_mode(json_mode: ModelInferenceReq
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the capital of Japan (possibly as JSON)?"}]
+                "content": [{"type": "text", "text": "What is the capital of Japan (possibly as JSON)?"}]
             }
         ]
     });
@@ -914,7 +1001,7 @@ async fn test_o4_mini_inference() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the capital of Japan?"}]
+                "content": [{"type": "text", "text": "What is the capital of Japan?"}]
             }
         ]
     });
@@ -1032,7 +1119,7 @@ async fn test_o3_mini_inference_with_reasoning_effort() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the capital of Japan?"}]
+                "content": [{"type": "text", "text": "What is the capital of Japan?"}]
             }
         ]
     });
@@ -1103,6 +1190,7 @@ async fn test_embedding_request() {
             .load(
                 &ProviderTypesConfig::default(),
                 Arc::from("good".to_string()),
+                &ProviderTypeDefaultCredentials::default(),
             )
             .await
             .unwrap();
@@ -1111,20 +1199,20 @@ async fn test_embedding_request() {
         EmbeddingProviderConfig::OpenAI(_)
     ));
 
-    // Inject randomness into the model name to ensure that the first request
+    // Inject randomness into the model request to ensure that the first request
     // is a cache miss
-    let model_name = format!("my-embedding-{}", Uuid::now_v7());
+    let model_name = "my_embedding".to_string();
 
     let model_config = EmbeddingModelConfig {
         routing: vec![model_name.as_str().into()],
         providers: [(model_name.as_str().into(), provider_config)]
             .into_iter()
             .collect(),
-        timeouts: TimeoutsConfig::default(),
+        timeout_ms: None,
     };
 
     let request = EmbeddingRequest {
-        input: "This is a test input".to_string().into(),
+        input: format!("This is a test input: {}", Uuid::now_v7()).into(),
         dimensions: None,
         encoding_format: EmbeddingEncodingFormat::Float,
     };
@@ -1134,12 +1222,20 @@ async fn test_embedding_request() {
             &request,
             &model_name,
             &InferenceClients {
-                http_client: &TensorzeroHttpClient::new().unwrap(),
-                credentials: &api_keys,
-                clickhouse_connection_info: &clickhouse,
-                cache_options: &CacheOptions {
+                http_client: TensorzeroHttpClient::new().unwrap(),
+                clickhouse_connection_info: clickhouse.clone(),
+                postgres_connection_info: PostgresConnectionInfo::Disabled,
+                credentials: Arc::new(api_keys.clone()),
+                cache_options: CacheOptions {
                     max_age_s: None,
                     enabled: CacheEnabledMode::On,
+                },
+                tags: Arc::new(Default::default()),
+                rate_limiting_config: Arc::new(Default::default()),
+                otlp_config: Default::default(),
+                deferred_tasks: tokio_util::task::TaskTracker::new(),
+                scope_info: ScopeInfo {
+                    tags: Arc::new(HashMap::new()),
                 },
             },
         )
@@ -1189,14 +1285,18 @@ async fn test_embedding_request() {
         !parsed_raw_request.is_null(),
         "Parsed raw request should not be null"
     );
-    // Hardcoded since the input is 5 tokens
-    assert_eq!(response.usage.input_tokens, 5);
+    // The randomness affects the exact number of tokens, so we just check that it's at least 20
+    assert!(
+        response.usage.input_tokens >= 20,
+        "Unexpected input tokens: {}",
+        response.usage.input_tokens
+    );
     assert_eq!(response.usage.output_tokens, 0);
     match response.latency {
         Latency::NonStreaming { response_time } => {
             assert!(
-                response_time.as_millis() > 10,
-                "Response time should be greater than 10ms: {}",
+                response_time.as_millis() > 100,
+                "Response time should be greater than 100ms: {}",
                 response_time.as_millis()
             );
         }
@@ -1210,12 +1310,20 @@ async fn test_embedding_request() {
             &request,
             &model_name,
             &InferenceClients {
-                http_client: &TensorzeroHttpClient::new().unwrap(),
-                credentials: &api_keys,
-                clickhouse_connection_info: &clickhouse,
-                cache_options: &CacheOptions {
+                http_client: TensorzeroHttpClient::new().unwrap(),
+                clickhouse_connection_info: clickhouse.clone(),
+                postgres_connection_info: PostgresConnectionInfo::Disabled,
+                credentials: Arc::new(api_keys.clone()),
+                cache_options: CacheOptions {
                     max_age_s: None,
                     enabled: CacheEnabledMode::On,
+                },
+                tags: Arc::new(Default::default()),
+                rate_limiting_config: Arc::new(Default::default()),
+                otlp_config: Default::default(),
+                deferred_tasks: tokio_util::task::TaskTracker::new(),
+                scope_info: ScopeInfo {
+                    tags: Arc::new(HashMap::new()),
                 },
             },
         )
@@ -1223,12 +1331,17 @@ async fn test_embedding_request() {
         .unwrap();
     assert!(cached_response.cached);
     assert_eq!(response.embeddings, cached_response.embeddings);
-    assert_eq!(cached_response.usage.input_tokens, 5);
+    assert!(
+        cached_response.usage.input_tokens >= 20,
+        "Unexpected input tokens: {}",
+        cached_response.usage.input_tokens
+    );
     assert_eq!(cached_response.usage.output_tokens, 0);
 }
 
 #[tokio::test]
 async fn test_embedding_sanity_check() {
+    let clickhouse = get_clickhouse().await;
     let provider_config_serialized = r#"
     type = "openai"
     model_name = "text-embedding-3-small"
@@ -1239,6 +1352,7 @@ async fn test_embedding_sanity_check() {
             .load(
                 &ProviderTypesConfig::default(),
                 Arc::from("good".to_string()),
+                &ProviderTypeDefaultCredentials::default(),
             )
             .await
             .unwrap();
@@ -1268,12 +1382,29 @@ async fn test_embedding_sanity_check() {
     };
     let request_info = (&provider_config).into();
     let api_keys = InferenceCredentials::default();
+    let clients = InferenceClients {
+        http_client: client.clone(),
+        clickhouse_connection_info: clickhouse.clone(),
+        postgres_connection_info: PostgresConnectionInfo::Disabled,
+        credentials: Arc::new(api_keys),
+        cache_options: CacheOptions {
+            max_age_s: None,
+            enabled: CacheEnabledMode::On,
+        },
+        tags: Arc::new(Default::default()),
+        rate_limiting_config: Arc::new(Default::default()),
+        otlp_config: Default::default(),
+        deferred_tasks: tokio_util::task::TaskTracker::new(),
+        scope_info: ScopeInfo {
+            tags: Arc::new(HashMap::new()),
+        },
+    };
 
     // Compute all 3 embeddings concurrently
     let (response_a, response_b, response_c) = tokio::join!(
-        provider_config.embed(&embedding_request_a, &client, &api_keys, &request_info),
-        provider_config.embed(&embedding_request_b, &client, &api_keys, &request_info),
-        provider_config.embed(&embedding_request_c, &client, &api_keys, &request_info)
+        provider_config.embed(&embedding_request_a, &clients, &request_info),
+        provider_config.embed(&embedding_request_b, &clients, &request_info),
+        provider_config.embed(&embedding_request_c, &clients, &request_info)
     );
 
     // Unwrap the results
@@ -1457,7 +1588,7 @@ async fn test_content_block_text_field() {
         "messages": [
             {
                 "role": "user",
-                "content": [{"type": "text", "value": "What is the capital of Japan?"}]
+                "content": [{"type": "text", "text": "What is the capital of Japan?"}]
             }
         ]
     });
@@ -1799,7 +1930,7 @@ pub async fn test_start_batch_inference_write_file() {
         temp_dir.path().to_string_lossy()
     );
 
-    let client = make_embedded_gateway_with_config(&config).await;
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(&config).await;
 
     let episode_id = Uuid::now_v7();
 
@@ -1812,11 +1943,11 @@ pub async fn test_start_batch_inference_write_file() {
                 system: None,
                 messages: vec![InputMessage {
                     role: Role::User,
-                    content: vec![InputMessageContent::Text(TextKind::Text { text: "Tell me about this image".to_string() }),
-                    InputMessageContent::File(File::Url {
+                    content: vec![InputMessageContent::Text(Text { text: "Tell me about this image".to_string() }),
+                    InputMessageContent::File(File::Url(UrlFile {
                         url: "https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png".parse().unwrap(),
                         mime_type: None,
-                    })],
+                    }))],
                 }],
             }],
             tags: Some(vec![Some([("foo".to_string(), "bar".to_string()), ("test_type".to_string(), "batch_image_object_store".to_string())].into_iter().collect() )]),
@@ -1874,13 +2005,11 @@ pub async fn test_start_batch_inference_write_file() {
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "value": "Tell me about this image"},
+                    {"type": "text", "text": "Tell me about this image"},
                     {
                         "type": "file",
-                        "file": {
-                            "url": "https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png",
-                            "mime_type": "image/png",
-                        },
+                        "source_url": "https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png",
+                        "mime_type": "image/png",
                         "storage_path": {
                             "kind": {"type": "filesystem", "path": temp_dir.path().to_string_lossy()},
                             "path": file_path
@@ -1895,4 +2024,1068 @@ pub async fn test_start_batch_inference_write_file() {
     // Check that the file exists on the filesystem
     let result = std::fs::read(temp_dir.path().join(file_path)).unwrap();
     assert_eq!(result, FERRIS_PNG);
+}
+
+#[tokio::test]
+async fn test_forward_image_url() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+    [object_storage]
+    type = "filesystem"
+    path = "{}"
+
+    [gateway]
+    fetch_and_encode_input_files_before_inference = false
+    "#,
+        temp_dir.path().to_string_lossy()
+    );
+
+    let client = make_embedded_gateway_with_config(&config).await;
+
+    let response = client.inference(ClientInferenceParams {
+        model_name: Some("openai::gpt-4o-mini".to_string()),
+        input: ClientInput {
+            messages: vec![ClientInputMessage {
+                role: Role::User,
+                content: vec![ClientInputMessageContent::Text(TextKind::Text { text: "Describe the contents of the image".to_string() }),
+                ClientInputMessageContent::File(File::Url(UrlFile {
+                    url: Url::parse("https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png").unwrap(),
+                    mime_type: Some(mime::IMAGE_PNG)
+                })),
+                ],
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    }).await.unwrap();
+
+    let InferenceOutput::NonStreaming(response) = response else {
+        panic!("Expected non-streaming inference response");
+    };
+
+    // Sleep for 1 second to allow writing to ClickHouse
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let clickhouse = get_clickhouse().await;
+
+    let model_inference = select_model_inference_clickhouse(&clickhouse, response.inference_id())
+        .await
+        .unwrap();
+
+    let raw_request = model_inference
+        .get("raw_request")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(raw_request, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Describe the contents of the image\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://raw.githubusercontent.com/tensorzero/tensorzero/ff3e17bbd3e32f483b027cf81b54404788c90dc1/tensorzero-internal/tests/e2e/providers/ferris.png\"}}]}],\"model\":\"gpt-4o-mini\",\"stream\":false}");
+
+    let file_path =
+        "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png";
+
+    // Check that the file exists on the filesystem
+    let result = std::fs::read(temp_dir.path().join(file_path)).unwrap();
+    assert_eq!(result, FERRIS_PNG);
+
+    println!("Got response: {response:#?}");
+
+    let InferenceResponse::Chat(response) = response else {
+        panic!("Expected chat inference response");
+    };
+    let text_block = &response.content[0];
+    let ContentBlockChatOutput::Text(text) = text_block else {
+        panic!("Expected text content block");
+    };
+    assert!(
+        text.text.to_lowercase().contains("cartoon")
+            || text.text.to_lowercase().contains("crab")
+            || text.text.to_lowercase().contains("animal"),
+        "Content should contain 'cartoon' or 'crab' or 'animal': {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_forward_file_url() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+    [object_storage]
+    type = "filesystem"
+    path = "{}"
+
+    [gateway]
+    fetch_and_encode_input_files_before_inference = false
+    "#,
+        temp_dir.path().to_string_lossy()
+    );
+
+    let client = make_embedded_gateway_with_config(&config).await;
+
+    let response = client.inference(ClientInferenceParams {
+        model_name: Some("openai::gpt-4o-mini".to_string()),
+        input: ClientInput {
+            messages: vec![ClientInputMessage {
+                role: Role::User,
+                content: vec![ClientInputMessageContent::Text(TextKind::Text { text: "Describe the contents of the PDF".to_string() }),
+                ClientInputMessageContent::File(File::Url(UrlFile {
+                    url: Url::parse("https://raw.githubusercontent.com/tensorzero/tensorzero/ac37477d56deaf6e0585a394eda68fd4f9390cab/tensorzero-core/tests/e2e/providers/deepseek_paper.pdf").unwrap(),
+                    mime_type: Some(mime::APPLICATION_PDF)
+                })),
+                ],
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    }).await.unwrap();
+
+    let InferenceOutput::NonStreaming(response) = response else {
+        panic!("Expected non-streaming inference response");
+    };
+
+    // Sleep for 1 second to allow writing to ClickHouse
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let clickhouse = get_clickhouse().await;
+
+    let model_inference = select_model_inference_clickhouse(&clickhouse, response.inference_id())
+        .await
+        .unwrap();
+
+    let raw_request = model_inference
+        .get("raw_request")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    // OpenAI currently doesn't support forwarding file urls, so we should base64 encode the file data
+    assert_eq!(raw_request, "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Describe the contents of the PDF\"},{\"type\":\"file\",\"file\":{\"file_data\":\"data:application/pdf;base64,<TENSORZERO_FILE_0>\",\"filename\":\"input.pdf\"}}]}],\"model\":\"gpt-4o-mini\",\"stream\":false}");
+
+    let file_path =
+        "observability/files/3e127d9a726f6be0fd81d73ccea97d96ec99419f59650e01d49183cd3be999ef.pdf";
+
+    // Check that the file exists on the filesystem
+    let result = std::fs::read(temp_dir.path().join(file_path)).unwrap();
+    assert_eq!(result, DEEPSEEK_PAPER_PDF);
+
+    println!("Got response: {response:#?}");
+
+    let InferenceResponse::Chat(response) = response else {
+        panic!("Expected chat inference response");
+    };
+    let text_block = &response.content[0];
+    let ContentBlockChatOutput::Text(text) = text_block else {
+        panic!("Expected text content block");
+    };
+    assert!(
+        text.text.to_lowercase().contains("deepseek"),
+        "Content should contain 'deepseek': {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_responses_api_reasoning() {
+    let payload = json!({
+        "function_name": "openai_responses_gpt5",
+        "variant_name": "openai",
+        "input":
+            {
+               "messages": [
+                {
+                    "role": "user",
+                    "content": "How many letters are in the word potato?"
+                }
+            ]},
+        "extra_body": [
+            {
+                "variant_name": "openai",
+                "pointer": "/reasoning",
+                "value": {
+                    "effort": "low",
+                    "summary": "auto"
+                }
+            }
+        ]
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    let response_json = response.json::<Value>().await.unwrap();
+    println!("API response: {response_json}");
+
+    let content_blocks = response_json.get("content").unwrap().as_array().unwrap();
+    let has_thought = content_blocks
+        .iter()
+        .any(|block| block.get("type").unwrap().as_str().unwrap() == "thought");
+    assert!(
+        has_thought,
+        "Missing thought block in output: {content_blocks:?}"
+    );
+
+    let encrypted_thought = content_blocks.iter().find(|block| {
+        block.get("type").unwrap().as_str().unwrap() == "thought"
+            && block.get("signature").unwrap().as_str().is_some()
+    });
+    assert!(
+        encrypted_thought.is_some(),
+        "Missing encrypted thought block in output: {content_blocks:?}"
+    );
+    let encrypted_thought = encrypted_thought.unwrap();
+
+    assert_eq!(
+        encrypted_thought.get("text").unwrap(),
+        &Value::Null,
+        "Text should be null in encrypted thought: {encrypted_thought:?}"
+    );
+    let summary = encrypted_thought
+        .get("summary")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(
+        !summary.is_empty(),
+        "Missing summary in encrypted thought: {encrypted_thought:?}"
+    );
+    for item in summary {
+        assert_eq!(item.get("type").unwrap().as_str().unwrap(), "summary_text");
+        let summary_text = item.get("text").unwrap().as_str().unwrap();
+        assert!(
+            !summary_text.is_empty(),
+            "Missing summary text in item: {item:?}"
+        );
+    }
+
+    let payload = json!({
+        "function_name": "openai_responses_gpt5",
+        "variant_name": "openai",
+        "input":
+            {
+               "messages": [
+                {
+                    "role": "user",
+                    "content": "How many letters are in the word potato?"
+                },
+                {
+                    "role": "assistant",
+                    "content": content_blocks,
+                },
+                {
+                    "role": "user",
+                    "content": "What were you thinking about during your last response?"
+                }
+            ]},
+        "extra_body": [
+            {
+                "variant_name": "openai",
+                "pointer": "/reasoning",
+                "value": {
+                    "effort": "low",
+                    "summary": "auto"
+                }
+            }
+        ]
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let response_json = response.json::<Value>().await.unwrap();
+    println!("New API response: {response_json}");
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_responses_api_invalid_thought() {
+    let payload = json!({
+        "function_name": "openai_responses_gpt5",
+        "variant_name": "openai",
+        "input":
+            {
+               "messages": [
+                {
+                    "role": "user",
+                    "content": "How many letters are in the word potato?"
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thought",
+                            "signature": "My fake signature",
+                            "summary": [
+                                {
+                                    "type": "summary_text",
+                                    "text": "I thought about responding to the next message with the word 'potato'"
+                                }
+                            ]
+                        },
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": "What time is it?"
+                }
+            ]},
+        "extra_body": [
+            {
+                "variant_name": "openai",
+                "pointer": "/reasoning",
+                "value": {
+                    "effort": "low",
+                    "summary": "auto"
+                }
+            }
+        ]
+    });
+
+    let response = Client::new()
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let response_text = response.text().await.unwrap();
+    println!("API response: {response_text}");
+    assert!(response_text.contains("could not be verified"));
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+const WEB_SEARCH_PROMPT: &str = "Tell me some good news that happened today from around the world. Don't ask me any questions, and provide markdown citations in the form [text](url)";
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn test_openai_built_in_websearch() {
+    // Create a config with the custom credential location
+    let config = r#"
+
+gateway.debug = true
+[models."test-model"]
+routing = ["test-provider"]
+
+[models."test-model".providers.test-provider]
+type = "openai"
+model_name = "gpt-5-nano"
+provider_tools = [{type = "web_search"}]
+api_type = "responses"
+
+[functions.basic_test]
+type = "chat"
+
+[functions.basic_test.variants.default]
+type = "chat_completion"
+model = "test-model"
+"#;
+
+    // Create an embedded gateway with this config
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(config).await;
+
+    // Make a simple inference request to verify it works
+    let episode_id = Uuid::now_v7();
+    let result = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![ClientInputMessage {
+                    role: Role::User,
+                    content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                        text: WEB_SEARCH_PROMPT.to_string(),
+                    })],
+                }],
+            },
+            stream: Some(false),
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the inference succeeded
+    let response = result.unwrap();
+    println!("response: {response:?}");
+
+    // Extract the chat response
+    let InferenceOutput::NonStreaming(response) = response else {
+        panic!("Expected non-streaming inference response");
+    };
+
+    let InferenceResponse::Chat(chat_response) = response else {
+        panic!("Expected chat inference response");
+    };
+
+    // Assert that we have at least one Unknown content block with type "web_search_call"
+    let web_search_blocks: Vec<_> = chat_response
+        .content
+        .iter()
+        .filter(|block| {
+            if let ContentBlockChatOutput::Unknown { data, .. } = block {
+                data.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "web_search_call")
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    assert!(
+        !web_search_blocks.is_empty(),
+        "Expected at least one Unknown content block with type 'web_search_call', but found none. Content blocks: {:#?}",
+        chat_response.content
+    );
+
+    // Assert that we have exactly one Text content block
+    let text_blocks: Vec<_> = chat_response
+        .content
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlockChatOutput::Text(text) = block {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        text_blocks.len(),
+        1,
+        "Expected exactly one Text content block, but found {}. Content blocks: {:#?}",
+        text_blocks.len(),
+        chat_response.content
+    );
+
+    // Assert that the text block contains citations (markdown links)
+    let text_content = &text_blocks[0].text;
+    assert!(
+        text_content.contains("]("),
+        "Expected text content to contain citations in markdown format [text](url), but found none. Text: {text_content}",
+    );
+
+    // Round-trip test: Convert output content blocks back to input and make another inference
+    let assistant_content: Vec<ClientInputMessageContent> = chat_response
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlockChatOutput::Text(text) => ClientInputMessageContent::Text(TextKind::Text {
+                text: text.text.clone(),
+            }),
+            ContentBlockChatOutput::ToolCall(tool_call) => {
+                ClientInputMessageContent::ToolCall(ToolCallInput {
+                    id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    arguments: tool_call.arguments.clone(),
+                    raw_name: None,
+                    raw_arguments: None,
+                })
+            }
+            ContentBlockChatOutput::Thought(thought) => {
+                ClientInputMessageContent::Thought(thought.clone())
+            }
+            ContentBlockChatOutput::Unknown {
+                data,
+                model_provider_name,
+            } => ClientInputMessageContent::Unknown(Unknown {
+                data: data.clone(),
+                model_provider_name: model_provider_name.clone(),
+            }),
+        })
+        .collect();
+
+    // Make a second inference with the assistant's response and a new user question
+    let result2 = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![
+                    ClientInputMessage {
+                        role: Role::User,
+                        content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                            text: WEB_SEARCH_PROMPT.to_string(),
+                        })],
+                    },
+                    ClientInputMessage {
+                        role: Role::Assistant,
+                        content: assistant_content,
+                    },
+                    ClientInputMessage {
+                        role: Role::User,
+                        content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                            text: "Can you summarize what you just told me in one sentence?"
+                                .to_string(),
+                        })],
+                    },
+                ],
+            },
+            stream: Some(false),
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the round-trip inference succeeded
+    let response2 = result2.unwrap();
+    println!("Round-trip response: {response2:?}");
+
+    let InferenceOutput::NonStreaming(response2) = response2 else {
+        panic!("Expected non-streaming inference response for round-trip");
+    };
+
+    let InferenceResponse::Chat(chat_response2) = response2 else {
+        panic!("Expected chat inference response for round-trip");
+    };
+
+    // Assert that the second response has at least one text block
+    let has_text = chat_response2
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlockChatOutput::Text(_)));
+    assert!(
+        has_text,
+        "Expected at least one text content block in round-trip response. Content blocks: {:#?}",
+        chat_response2.content
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn test_openai_built_in_websearch_streaming() {
+    // Create a config with the custom credential location
+    let config = r#"
+
+gateway.debug = true
+[models."test-model"]
+routing = ["test-provider"]
+
+[models."test-model".providers.test-provider]
+type = "openai"
+model_name = "gpt-5-nano"
+provider_tools = [{type = "web_search"}]
+api_type = "responses"
+
+[functions.basic_test]
+type = "chat"
+
+[functions.basic_test.variants.default]
+type = "chat_completion"
+model = "test-model"
+"#;
+
+    // Create an embedded gateway with this config
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(config).await;
+
+    // Make a streaming inference request
+    let episode_id = Uuid::now_v7();
+    let result = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![ClientInputMessage {
+                    role: Role::User,
+                    content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                        text: WEB_SEARCH_PROMPT.to_string(),
+                    })],
+                }],
+            },
+            stream: Some(true),
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the inference succeeded
+    let response = result.unwrap();
+    println!("response: {response:?}");
+
+    // Extract the streaming response
+    let InferenceOutput::Streaming(mut stream) = response else {
+        panic!("Expected streaming inference response");
+    };
+
+    // Collect all chunks
+    let mut chunks = vec![];
+    let mut inference_id: Option<Uuid> = None;
+    let mut full_text = String::new();
+    let mut unknown_chunks = vec![];
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.unwrap();
+
+        // Extract inference_id from the first chunk
+        if inference_id.is_none() {
+            if let InferenceResponseChunk::Chat(chat_chunk) = &chunk {
+                inference_id = Some(chat_chunk.inference_id);
+            }
+        }
+
+        // Collect text and unknown chunks
+        if let InferenceResponseChunk::Chat(chat_chunk) = &chunk {
+            for content_block in &chat_chunk.content {
+                match content_block {
+                    ContentBlockChunk::Text(text_chunk) => {
+                        full_text.push_str(&text_chunk.text);
+                    }
+                    ContentBlockChunk::Unknown { id, data, .. } => {
+                        unknown_chunks.push((id.clone(), data.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        chunks.push(chunk);
+    }
+
+    // Assert that we have multiple streaming chunks (indicates streaming is working)
+    assert!(
+        chunks.len() >= 3,
+        "Expected at least 3 streaming chunks, but got {}. Streaming may not be working properly.",
+        chunks.len()
+    );
+
+    // Assert that all chunks are Chat type
+    for chunk in &chunks {
+        assert!(
+            matches!(chunk, InferenceResponseChunk::Chat(_)),
+            "Expected all chunks to be Chat type, but found: {chunk:?}",
+        );
+    }
+
+    // Assert that the last chunk has usage information
+    if let Some(InferenceResponseChunk::Chat(last_chunk)) = chunks.last() {
+        assert!(
+            last_chunk.usage.is_some(),
+            "Expected the last chunk to have usage information, but it was None"
+        );
+    } else {
+        panic!("No chunks received");
+    }
+
+    // Assert that the last chunk has a finish_reason
+    if let Some(InferenceResponseChunk::Chat(last_chunk)) = chunks.last() {
+        assert!(
+            last_chunk.finish_reason.is_some(),
+            "Expected the last chunk to have a finish_reason, but it was None"
+        );
+    }
+
+    // Assert that we received Unknown chunks for web_search_call
+    assert!(
+        !unknown_chunks.is_empty(),
+        "Expected at least one Unknown chunk during streaming, but found none"
+    );
+
+    // Verify that at least one Unknown chunk contains web_search_call type
+    let has_web_search_chunk = unknown_chunks.iter().any(|(_, data)| {
+        data.get("type")
+            .and_then(|t| t.as_str())
+            .map(|t| t == "web_search_call")
+            .unwrap_or(false)
+    });
+    assert!(
+        has_web_search_chunk,
+        "Expected at least one Unknown chunk with type 'web_search_call', but found none. Unknown chunks: {unknown_chunks:#?}",
+    );
+
+    // Assert that the concatenated text contains citations (markdown links)
+    assert!(
+        full_text.contains("]("),
+        "Expected concatenated text to contain citations in markdown format [text](url), but found none. Text length: {}",
+        full_text.len()
+    );
+
+    // Sleep for 1 second to allow writing to ClickHouse
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let clickhouse = get_clickhouse().await;
+
+    let inference_id = inference_id.expect("Should have extracted inference_id from chunks");
+
+    // Fetch the model inference data from ClickHouse
+    let model_inference = select_model_inference_clickhouse(&clickhouse, inference_id)
+        .await
+        .unwrap();
+
+    let raw_response = model_inference
+        .get("raw_response")
+        .unwrap()
+        .as_str()
+        .unwrap();
+
+    // Assert that raw_response contains web_search_call (confirms web search was used)
+    assert!(
+        raw_response.contains("web_search_call"),
+        "Expected raw_response to contain 'web_search_call', but it was not found"
+    );
+
+    // Assert that raw_response contains response.completed event
+    assert!(
+        raw_response.contains("response.completed"),
+        "Expected raw_response to contain 'response.completed' event, but it was not found"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn test_openai_built_in_websearch_dynamic() {
+    // Create a config WITHOUT provider_tools in the model config
+    // We'll pass the provider_tools dynamically at inference time
+    let config = r#"
+
+gateway.debug = true
+[models."test-model"]
+routing = ["test-provider"]
+
+[models."test-model".providers.test-provider]
+type = "openai"
+model_name = "gpt-5-nano"
+api_type = "responses"
+
+[functions.basic_test]
+type = "chat"
+
+[functions.basic_test.variants.default]
+type = "chat_completion"
+model = "test-model"
+"#;
+
+    // Create an embedded gateway with this config
+    let client = tensorzero::test_helpers::make_embedded_gateway_with_config(config).await;
+
+    // Make a simple inference request with dynamic provider_tools
+    let episode_id = Uuid::now_v7();
+    let result = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![ClientInputMessage {
+                    role: Role::User,
+                    content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                        text: WEB_SEARCH_PROMPT.to_string(),
+                    })],
+                }],
+            },
+            stream: Some(false),
+            dynamic_tool_params: tensorzero_core::tool::DynamicToolParams {
+                allowed_tools: None,
+                additional_tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                provider_tools: Some(vec![
+                    ProviderTool {
+                        scope: ProviderToolScope::Unscoped,
+                        tool: json!({"type": "web_search"}),
+                    },
+                    // This should get filtered out
+                    ProviderTool {
+                        scope: ProviderToolScope::ModelProvider {
+                            model_name: "garbage".to_string(),
+                            model_provider_name: "model".to_string(),
+                        },
+                        tool: json!({"type": "garbage"}),
+                    },
+                ]),
+            },
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the inference succeeded
+    let response = result.unwrap();
+    println!("response: {response:?}");
+
+    // Extract the chat response
+    let InferenceOutput::NonStreaming(response) = response else {
+        panic!("Expected non-streaming inference response");
+    };
+
+    let InferenceResponse::Chat(chat_response) = response else {
+        panic!("Expected chat inference response");
+    };
+
+    // Assert that we have at least one Unknown content block with type "web_search_call"
+    let web_search_blocks: Vec<_> = chat_response
+        .content
+        .iter()
+        .filter(|block| {
+            if let ContentBlockChatOutput::Unknown { data, .. } = block {
+                data.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "web_search_call")
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    assert!(
+        !web_search_blocks.is_empty(),
+        "Expected at least one Unknown content block with type 'web_search_call', but found none. Content blocks: {:#?}",
+        chat_response.content
+    );
+
+    // Assert that we have exactly one Text content block
+    let text_blocks: Vec<_> = chat_response
+        .content
+        .iter()
+        .filter_map(|block| {
+            if let ContentBlockChatOutput::Text(text) = block {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        text_blocks.len(),
+        1,
+        "Expected exactly one Text content block, but found {}. Content blocks: {:#?}",
+        text_blocks.len(),
+        chat_response.content
+    );
+
+    // Assert that the text block contains citations (markdown links)
+    let text_content = &text_blocks[0].text;
+    assert!(
+        text_content.contains("]("),
+        "Expected text content to contain citations in markdown format [text](url), but found none. Text: {text_content}",
+    );
+
+    // Round-trip test: Convert output content blocks back to input and make another inference
+    let assistant_content: Vec<ClientInputMessageContent> = chat_response
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlockChatOutput::Text(text) => ClientInputMessageContent::Text(TextKind::Text {
+                text: text.text.clone(),
+            }),
+            ContentBlockChatOutput::ToolCall(tool_call) => {
+                ClientInputMessageContent::ToolCall(ToolCallInput {
+                    id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    arguments: tool_call.arguments.clone(),
+                    raw_name: None,
+                    raw_arguments: None,
+                })
+            }
+            ContentBlockChatOutput::Thought(thought) => {
+                ClientInputMessageContent::Thought(thought.clone())
+            }
+            ContentBlockChatOutput::Unknown {
+                data,
+                model_provider_name,
+            } => ClientInputMessageContent::Unknown(Unknown {
+                data: data.clone(),
+                model_provider_name: model_provider_name.clone(),
+            }),
+        })
+        .collect();
+
+    // Make a second inference with the assistant's response and a new user question
+    let result2 = client
+        .inference(ClientInferenceParams {
+            function_name: Some("basic_test".to_string()),
+            variant_name: Some("default".to_string()),
+            episode_id: Some(episode_id),
+            input: ClientInput {
+                system: None,
+                messages: vec![
+                    ClientInputMessage {
+                        role: Role::User,
+                        content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                            text: WEB_SEARCH_PROMPT.to_string(),
+                        })],
+                    },
+                    ClientInputMessage {
+                        role: Role::Assistant,
+                        content: assistant_content,
+                    },
+                    ClientInputMessage {
+                        role: Role::User,
+                        content: vec![ClientInputMessageContent::Text(TextKind::Text {
+                            text: "Can you summarize what you just told me in one sentence?"
+                                .to_string(),
+                        })],
+                    },
+                ],
+            },
+            stream: Some(false),
+            dynamic_tool_params: tensorzero_core::tool::DynamicToolParams {
+                allowed_tools: None,
+                additional_tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                provider_tools: Some(vec![ProviderTool {
+                    scope: ProviderToolScope::Unscoped,
+                    tool: json!({"type": "web_search"}),
+                }]),
+            },
+            ..Default::default()
+        })
+        .await;
+
+    // Assert the round-trip inference succeeded
+    let response2 = result2.unwrap();
+    println!("Round-trip response: {response2:?}");
+
+    let InferenceOutput::NonStreaming(response2) = response2 else {
+        panic!("Expected non-streaming inference response for round-trip");
+    };
+
+    let InferenceResponse::Chat(chat_response2) = response2 else {
+        panic!("Expected chat inference response for round-trip");
+    };
+
+    // Assert that the second response has at least one text block
+    let has_text = chat_response2
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlockChatOutput::Text(_)));
+    assert!(
+        has_text,
+        "Expected at least one text content block in round-trip response. Content blocks: {:#?}",
+        chat_response2.content
+    );
+}
+
+/// Tests using the shorthand form for the OpenAI Responses API.
+/// This works because gpt-5-codex is only available via the responses API,
+/// so the shorthand form "openai::responses::gpt-5-codex" correctly identifies
+/// both the provider (openai) and the API type (responses).
+#[tokio::test]
+async fn test_responses_api_shorthand() {
+    let client = Client::new();
+    let episode_id = Uuid::now_v7();
+
+    let payload = json!({
+        "model_name": "openai::responses::gpt-5-codex",
+        "episode_id": episode_id,
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the capital of France?"
+                }
+            ]},
+        "stream": false,
+    });
+
+    let response = client
+        .post(get_gateway_endpoint("/inference"))
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    // Check Response is OK, then fields in order
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_json = response.json::<Value>().await.unwrap();
+    let content_blocks = response_json.get("content").unwrap().as_array().unwrap();
+    println!("response: {response_json:#}");
+    assert!(!content_blocks.is_empty());
+
+    // Find the text block (there should be exactly one)
+    let text_blocks: Vec<&Value> = content_blocks
+        .iter()
+        .filter(|block| block.get("type").unwrap().as_str().unwrap() == "text")
+        .collect();
+    assert_eq!(text_blocks.len(), 1, "Should have exactly one text block");
+
+    let text_block = text_blocks.first().unwrap();
+    let content = text_block.get("text").unwrap().as_str().unwrap();
+    // Assert that Paris is in the content
+    assert!(content.contains("Paris"), "Content should mention Paris");
+    // Check that inference_id is here
+    let inference_id = response_json.get("inference_id").unwrap().as_str().unwrap();
+    let inference_id = Uuid::parse_str(inference_id).unwrap();
+
+    // Sleep for 1 second to allow time for data to be inserted into ClickHouse (trailing writes from API)
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Check ClickHouse
+    let clickhouse = get_clickhouse().await;
+
+    // First, check Inference table
+    let result = select_chat_inference_clickhouse(&clickhouse, inference_id)
+        .await
+        .unwrap();
+    let id = result.get("id").unwrap().as_str().unwrap();
+    let id_uuid = Uuid::parse_str(id).unwrap();
+    assert_eq!(id_uuid, inference_id);
+    let function_name = result.get("function_name").unwrap().as_str().unwrap();
+    assert_eq!(function_name, "tensorzero::default");
+    let input: Value =
+        serde_json::from_str(result.get("input").unwrap().as_str().unwrap()).unwrap();
+    let correct_input = json!({
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "What is the capital of France?"}]
+            }
+        ]
+    });
+    assert_eq!(input, correct_input);
+    let content_blocks = result.get("output").unwrap().as_str().unwrap();
+    // Check that content_blocks is a list of blocks with at least 1 block
+    let content_blocks: Vec<Value> = serde_json::from_str(content_blocks).unwrap();
+    assert!(!content_blocks.is_empty());
+
+    // Find the text block (there should be exactly one)
+    let text_blocks: Vec<&Value> = content_blocks
+        .iter()
+        .filter(|block| block.get("type").unwrap().as_str().unwrap() == "text")
+        .collect();
+    assert_eq!(text_blocks.len(), 1, "Should have exactly one text block");
+
+    let text_block = text_blocks.first().unwrap();
+    let clickhouse_content = text_block.get("text").unwrap().as_str().unwrap();
+    assert_eq!(clickhouse_content, content);
+    // Check that episode_id is here and correct
+    let retrieved_episode_id = result.get("episode_id").unwrap().as_str().unwrap();
+    let retrieved_episode_id = Uuid::parse_str(retrieved_episode_id).unwrap();
+    assert_eq!(retrieved_episode_id, episode_id);
+    // Check the variant name
+    let variant_name = result.get("variant_name").unwrap().as_str().unwrap();
+    assert_eq!(variant_name, "openai::responses::gpt-5-codex");
+    // Check the processing time
+    let processing_time_ms = result.get("processing_time_ms").unwrap().as_u64().unwrap();
+    assert!(processing_time_ms > 0);
+
+    // Check the ModelInference Table
+    let result = select_model_inference_clickhouse(&clickhouse, inference_id)
+        .await
+        .unwrap();
+    let inference_id_result = result.get("inference_id").unwrap().as_str().unwrap();
+    let inference_id_result = Uuid::parse_str(inference_id_result).unwrap();
+    assert_eq!(inference_id_result, inference_id);
+    let model_name = result.get("model_name").unwrap().as_str().unwrap();
+    assert_eq!(model_name, "openai::responses::gpt-5-codex");
+    let model_provider_name = result.get("model_provider_name").unwrap().as_str().unwrap();
+    assert_eq!(model_provider_name, "openai");
+    let raw_request = result.get("raw_request").unwrap().as_str().unwrap();
+    assert!(raw_request.to_lowercase().contains("france"));
+    // Check that raw_request is valid JSON
+    let _: Value = serde_json::from_str(raw_request).expect("raw_request should be valid JSON");
+    let input_tokens = result.get("input_tokens").unwrap().as_u64().unwrap();
+    assert!(input_tokens > 5);
+    let output_tokens = result.get("output_tokens").unwrap().as_u64().unwrap();
+    assert!(output_tokens > 5);
+    let response_time_ms = result.get("response_time_ms").unwrap().as_u64().unwrap();
+    assert!(response_time_ms > 0);
+    assert!(result.get("ttft_ms").unwrap().is_null());
+    let raw_response = result.get("raw_response").unwrap().as_str().unwrap();
+    let _raw_response_json: Value = serde_json::from_str(raw_response).unwrap();
 }

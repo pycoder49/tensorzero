@@ -1,45 +1,22 @@
 use chrono::{DateTime, Utc};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     fmt::{self, Display},
 };
-use uuid::Uuid;
 
+use crate::db::clickhouse::query_builder::parameters::add_parameter;
 use crate::{
     config::{Config, MetricConfigType},
-    db::clickhouse::ClickhouseFormat,
     error::{Error, ErrorDetails},
-    function::FunctionConfig,
-    inference::types::{ContentBlockChatOutput, JsonInferenceOutput, StoredInput},
-    serde_util::{deserialize_defaulted_string, deserialize_json_string},
-    stored_inference::{StoredChatInference, StoredInference, StoredJsonInference},
-    tool::ToolCallConfigDatabaseInsert,
 };
 
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
-#[cfg_attr(test, ts(export))]
-pub enum InferenceOutputSource {
-    Inference,
-    Demonstration,
-}
+mod datapoint_queries;
+pub(super) mod parameters;
+pub use datapoint_queries::DatapointFilter;
 
-impl TryFrom<&str> for InferenceOutputSource {
-    type Error = Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "inference" => Ok(InferenceOutputSource::Inference),
-            "demonstration" => Ok(InferenceOutputSource::Demonstration),
-            _ => Err(Error::new(ErrorDetails::InvalidInferenceOutputSource {
-                source_kind: value.to_string(),
-            })),
-        }
-    }
-}
+#[cfg(test)]
+pub mod test_util;
 
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -159,28 +136,34 @@ pub struct OrderBy {
 }
 
 #[derive(Hash, Eq, PartialEq, Debug)]
-struct JoinKey {
+pub struct JoinKey {
     table: MetricConfigType,
     metric_name: String,
     inference_column_name: &'static str,
 }
 
-struct JoinRegistry {
+pub struct JoinRegistry {
     // map key to join alias
     aliases: HashMap<JoinKey, String>,
     // The actual JOIN clauses that have been registered
     clauses: Vec<String>,
 }
 
+impl Default for JoinRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JoinRegistry {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             aliases: HashMap::new(),
             clauses: Vec::new(),
         }
     }
 
-    fn get_clauses(&self) -> &[String] {
+    pub fn get_clauses(&self) -> &[String] {
         &self.clauses
     }
 
@@ -190,7 +173,7 @@ impl JoinRegistry {
     /// we will also add the join clause to the registry.
     ///
     /// Returns the alias for the joined table.
-    fn get_or_insert(
+    pub(crate) fn get_or_insert(
         &mut self,
         key: JoinKey,
         params_map: &mut Vec<QueryParameter>,
@@ -211,7 +194,7 @@ impl JoinRegistry {
     }
 
     /// Inserts a join clause that is not part of the filter tree.
-    fn insert_unchecked(&mut self, clause: String) {
+    pub fn insert_unchecked(&mut self, clause: String) {
         self.clauses.push(clause);
     }
 
@@ -246,7 +229,7 @@ LEFT JOIN (
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(test, ts(export))]
-pub struct FloatMetricNode {
+pub struct FloatMetricFilter {
     pub metric_name: String,
     pub value: f64,
     pub comparison_operator: FloatComparisonOperator,
@@ -255,7 +238,7 @@ pub struct FloatMetricNode {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(test, ts(export))]
-pub struct BooleanMetricNode {
+pub struct BooleanMetricFilter {
     pub metric_name: String,
     pub value: bool,
 }
@@ -263,7 +246,7 @@ pub struct BooleanMetricNode {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(test, ts(export))]
-pub struct TagNode {
+pub struct TagFilter {
     pub key: String,
     pub value: String,
     pub comparison_operator: TagComparisonOperator,
@@ -272,7 +255,7 @@ pub struct TagNode {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[cfg_attr(test, ts(export))]
-pub struct TimeNode {
+pub struct TimeFilter {
     #[cfg_attr(test, ts(type = "Date"))]
     pub time: DateTime<Utc>,
     pub comparison_operator: TimeComparisonOperator,
@@ -282,23 +265,32 @@ pub struct TimeNode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(test, ts(export))]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum InferenceFilterTreeNode {
-    FloatMetric(FloatMetricNode),
-    BooleanMetric(BooleanMetricNode),
-    Tag(TagNode),
-    Time(TimeNode),
-    And {
-        children: Vec<InferenceFilterTreeNode>,
-    },
-    Or {
-        children: Vec<InferenceFilterTreeNode>,
-    },
-    Not {
-        child: Box<InferenceFilterTreeNode>,
-    },
+/// Filters for querying inferences.
+pub enum InferenceFilter {
+    /// Filter by the value of a float metric
+    FloatMetric(FloatMetricFilter),
+
+    /// Filter by the value of a boolean metric
+    BooleanMetric(BooleanMetricFilter),
+
+    /// Filter by tag key-value pair
+    Tag(TagFilter),
+
+    /// Filter by the timestamp of an inference.
+    Time(TimeFilter),
+
+    /// Logical AND of multiple filters
+    And { children: Vec<InferenceFilter> },
+
+    /// Logical OR of multiple filters
+    Or { children: Vec<InferenceFilter> },
+
+    /// Logical NOT of a filter
+    Not { child: Box<InferenceFilter> },
 }
 
-impl InferenceFilterTreeNode {
+// TODO(shuyangli): Extract inference filters into their own file.
+impl InferenceFilter {
     /// Converts the filter tree to a ClickHouse SQL string.
     ///
     /// The returned string will contain the filter condition that should be added to the WHERE clause.
@@ -311,16 +303,16 @@ impl InferenceFilterTreeNode {
     /// We may be able to do this more efficiently by using subqueries and CTEs.
     /// We're also doing a join per filter on metric. In principle if there is a subtree of the tree that uses the same joined table,
     /// we could push the condition down into the query before the join
-    fn to_clickhouse_sql(
+    pub fn to_clickhouse_sql(
         &self,
         config: &Config,
         params_map: &mut Vec<QueryParameter>,
-        _select_clauses: &mut BTreeSet<String>,
+        _select_clauses: &mut Vec<String>,
         joins: &mut JoinRegistry,
         param_idx_counter: &mut usize,
     ) -> Result<String, Error> {
         match self {
-            InferenceFilterTreeNode::FloatMetric(fm_node) => {
+            InferenceFilter::FloatMetric(fm_node) => {
                 let metric_config = config
                     .metrics
                     .get(fm_node.metric_name.as_str())
@@ -354,7 +346,7 @@ impl InferenceFilterTreeNode {
                     "{join_alias}.value {comparison_operator} {value_placeholder}"
                 ))
             }
-            InferenceFilterTreeNode::BooleanMetric(bm_node) => {
+            InferenceFilter::BooleanMetric(bm_node) => {
                 let metric_config = config.metrics.get(&bm_node.metric_name).ok_or_else(|| {
                     Error::new(ErrorDetails::InvalidMetricName {
                         metric_name: bm_node.metric_name.clone(),
@@ -381,7 +373,7 @@ impl InferenceFilterTreeNode {
                 // We handle this farther up the recursive tree
                 Ok(format!("{join_alias}.value = {value_placeholder}"))
             }
-            InferenceFilterTreeNode::Tag(TagNode {
+            InferenceFilter::Tag(TagFilter {
                 key,
                 value,
                 comparison_operator,
@@ -395,7 +387,7 @@ impl InferenceFilterTreeNode {
                     "i.tags[{key_placeholder}] {comparison_operator} {value_placeholder}"
                 ))
             }
-            InferenceFilterTreeNode::Time(TimeNode {
+            InferenceFilter::Time(TimeFilter {
                 time,
                 comparison_operator,
             }) => {
@@ -410,7 +402,7 @@ impl InferenceFilterTreeNode {
                     "i.timestamp {comparison_operator} parseDateTimeBestEffort({time_placeholder})"
                 ))
             }
-            InferenceFilterTreeNode::And { children } => {
+            InferenceFilter::And { children } => {
                 let child_sqls: Vec<String> = children
                     .iter()
                     .map(|child| {
@@ -431,7 +423,7 @@ impl InferenceFilterTreeNode {
                 let child_sqls_str = child_sqls.join(" AND ");
                 Ok(format!("({child_sqls_str})"))
             }
-            InferenceFilterTreeNode::Or { children } => {
+            InferenceFilter::Or { children } => {
                 let child_sqls: Vec<String> = children
                     .iter()
                     .map(|child| {
@@ -452,7 +444,7 @@ impl InferenceFilterTreeNode {
                 let child_sqls_str = child_sqls.join(" OR ");
                 Ok(format!("({child_sqls_str})"))
             }
-            InferenceFilterTreeNode::Not { child } => {
+            InferenceFilter::Not { child } => {
                 let child_sql = child.to_clickhouse_sql(
                     config,
                     params_map,
@@ -469,7 +461,7 @@ impl InferenceFilterTreeNode {
     }
 }
 
-fn generate_order_by_sql(
+pub fn generate_order_by_sql(
     order_by: Option<&[OrderBy]>,
     config: &Config,
     params_map: &mut Vec<QueryParameter>,
@@ -510,18 +502,6 @@ fn generate_order_by_sql(
     Ok(format!("\nORDER BY {joined_clauses}"))
 }
 
-#[derive(Debug, Clone)]
-pub struct ListInferencesParams<'a> {
-    pub function_name: &'a str,
-    pub variant_name: Option<&'a str>,
-    pub filters: Option<&'a InferenceFilterTreeNode>,
-    pub output_source: InferenceOutputSource,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
-    pub order_by: Option<&'a [OrderBy]>,
-    pub format: ClickhouseFormat,
-}
-
 /// Represents a parameter to be set for the ClickHouse query.
 /// The `name` is the internal name (e.g., "p0", "p1") used in `SET param_<name> = ...`
 /// and in the `{<name>:DataType}` placeholder.
@@ -532,149 +512,8 @@ pub struct QueryParameter {
     pub value: String,
 }
 
-/// Generates the ClickHouse query and a list of parameters to be set.
-/// The query string will contain placeholders like `{p0:String}`.
-/// The returned `Vec<QueryParameter>` contains the mapping from placeholder names (e.g., "p0")
-/// to their string values. The client executing the query is responsible for
-/// setting these parameters (e.g., via `SET param_p0 = 'value'` or `SET param_p1 = 123`).
-///
-/// Very important: if a field is missing (fails to join or similar) it will automatically fail the condition.
-/// This means that it will not be included in the result set unless the null field is in an OR
-/// where another element is true.
-///
-/// TODOs:
-/// - handle selecting the feedback values
-pub fn generate_list_inferences_sql(
-    config: &Config,
-    opts: &ListInferencesParams<'_>,
-) -> Result<(String, Vec<QueryParameter>), Error> {
-    let mut params_map: Vec<QueryParameter> = Vec::new();
-    let mut param_idx_counter = 0; // Counter for unique parameter names
-
-    let function_config = config.get_function(opts.function_name)?;
-    let function_name_param_placeholder = add_parameter(
-        opts.function_name,
-        ClickhouseType::String,
-        &mut params_map,
-        &mut param_idx_counter,
-    );
-    let mut select_clauses = get_select_clauses(&function_config, &function_name_param_placeholder);
-    let mut joins = JoinRegistry::new();
-    let mut where_clauses: Vec<String> = Vec::new();
-
-    let inference_table_name = function_config.table_name();
-
-    where_clauses.push(format!(
-        "i.function_name = {function_name_param_placeholder}"
-    ));
-
-    // Add `variant_name` filter
-    if let Some(variant_name) = opts.variant_name {
-        let variant_name_param_placeholder = add_parameter(
-            variant_name,
-            ClickhouseType::String,
-            &mut params_map,
-            &mut param_idx_counter,
-        );
-        where_clauses.push(format!("i.variant_name = {variant_name_param_placeholder}"));
-    }
-
-    // Handle OutputSource
-    match opts.output_source {
-        InferenceOutputSource::Inference => {
-            select_clauses.insert("i.output as output".to_string());
-        }
-        InferenceOutputSource::Demonstration => {
-            select_clauses.insert("demo_f.value AS output".to_string());
-            // [i.output] will produce an array in ClickHouse which will populate the dispreferred_outputs field
-            select_clauses.insert("[i.output] as dispreferred_outputs".to_string());
-
-            // NOTE: we may want to pre-filter this via subqueries or CTEs prior to the join for performance reasons
-            joins.insert_unchecked(
-                "\nJOIN \
-                 (SELECT \
-                    inference_id, \
-                    argMax(value, timestamp) as value \
-                  FROM DemonstrationFeedback \
-                  GROUP BY inference_id \
-                 ) AS demo_f ON i.id = demo_f.inference_id"
-                    .to_string(),
-            );
-        }
-    }
-
-    if let Some(filter_node) = opts.filters {
-        // Recursively builds the filter condition SQL statement for the WHERE clause
-        //  * adds the JOINed tables it needs
-        //  * adds metric columns to the SELECT clause for visibility and debugging
-        let filter_condition_sql = filter_node.to_clickhouse_sql(
-            config,
-            &mut params_map,
-            &mut select_clauses,
-            &mut joins,
-            &mut param_idx_counter,
-        )?;
-        where_clauses.push(filter_condition_sql);
-    }
-
-    let mut sql = format!(
-        r"
-SELECT
-    {select_clauses}
-FROM
-    {inference_table_name} AS i",
-        select_clauses = select_clauses.iter().join(",\n    "),
-        inference_table_name = inference_table_name,
-    );
-    // We generate the order by SQL before we add the joins so that the join registry is up to date with everything it needs.
-    // We don't actually add the order by SQL to the query until after we've added the joins.
-    let order_by_sql = generate_order_by_sql(
-        opts.order_by,
-        config,
-        &mut params_map,
-        &mut param_idx_counter,
-        &mut joins,
-    )?;
-
-    if !joins.get_clauses().is_empty() {
-        sql.push_str(&joins.get_clauses().join("\n"));
-    }
-
-    if !where_clauses.is_empty() {
-        sql.push_str("\nWHERE\n    ");
-        sql.push_str(&where_clauses.join(" AND "));
-    }
-    sql.push_str(order_by_sql.as_str());
-
-    if let Some(l) = opts.limit {
-        let limit_param_placeholder = add_parameter(
-            l,
-            ClickhouseType::UInt64,
-            &mut params_map,
-            &mut param_idx_counter,
-        );
-        sql.push_str(&format!("\nLIMIT {limit_param_placeholder}"));
-    }
-    if let Some(o) = opts.offset {
-        let offset_param_placeholder = add_parameter(
-            o,
-            ClickhouseType::UInt64,
-            &mut params_map,
-            &mut param_idx_counter,
-        );
-        sql.push_str(&format!("\nOFFSET {offset_param_placeholder}"));
-    }
-    match opts.format {
-        ClickhouseFormat::JsonEachRow => {
-            sql.push_str("\nFORMAT JSONEachRow");
-        }
-    }
-
-    Ok((sql, params_map))
-}
-
 #[derive(Debug, Clone, PartialEq)]
-enum ClickhouseType {
+pub enum ClickhouseType {
     String,
     Float64,
     Bool,
@@ -692,175 +531,24 @@ impl Display for ClickhouseType {
     }
 }
 
-/// Helper to add a parameter and return its SQL placeholder {name:CHType}
-/// The internal_name (e.g. p0, p1) is stored in params_map with its value.
-fn add_parameter<T: ToString>(
-    value: T,
-    ch_type: ClickhouseType,
-    params_map: &mut Vec<QueryParameter>,
-    counter: &mut usize,
-) -> String {
-    let internal_name = format!("p{}", *counter);
-    *counter += 1;
-    params_map.push(QueryParameter {
-        name: internal_name.clone(),
-        value: value.to_string(),
-    });
-    format!("{{{internal_name}:{ch_type}}}")
-}
-
-fn get_select_clauses(
-    function_config: &FunctionConfig,
-    function_name_param_placeholder: &str,
-) -> BTreeSet<String> {
-    let mut select_clauses = BTreeSet::from([
-        format!("{function_name_param_placeholder} as function_name"),
-        "i.input as input".to_string(),
-        "i.variant_name as variant_name".to_string(),
-        "i.episode_id as episode_id".to_string(),
-        "i.id as inference_id".to_string(),
-        "formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp".to_string(),
-        "i.tags as tags".to_string(),
-        // We don't select output here because it's handled separately based on the output_source
-    ]);
-    match function_config {
-        FunctionConfig::Json(_) => {
-            select_clauses.insert("i.output_schema as output_schema".to_string());
-            select_clauses.insert("'json' as type".to_string());
-        }
-        FunctionConfig::Chat(_) => {
-            select_clauses.insert("i.tool_params as tool_params".to_string());
-            select_clauses.insert("'chat' as type".to_string());
-        }
-    }
-    select_clauses
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct ClickHouseStoredChatInference {
-    pub function_name: String,
-    pub variant_name: String,
-    pub episode_id: Uuid,
-    pub inference_id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    #[serde(deserialize_with = "deserialize_json_string")]
-    pub input: StoredInput,
-    #[serde(deserialize_with = "deserialize_json_string")]
-    pub output: Vec<ContentBlockChatOutput>,
-    #[serde(default)]
-    pub dispreferred_outputs: Vec<String>,
-    #[serde(deserialize_with = "deserialize_defaulted_string")]
-    pub tool_params: ToolCallConfigDatabaseInsert,
-    pub tags: HashMap<String, String>,
-}
-
-impl TryFrom<ClickHouseStoredChatInference> for StoredChatInference {
-    type Error = Error;
-
-    fn try_from(value: ClickHouseStoredChatInference) -> Result<Self, Self::Error> {
-        let dispreferred_outputs = value
-            .dispreferred_outputs
-            .into_iter()
-            .map(|dispreferred_output| {
-                serde_json::from_str(&dispreferred_output).map_err(|e| {
-                    Error::new(ErrorDetails::ClickHouseDeserialization {
-                        message: format!("Failed to deserialize dispreferred output: {e}"),
-                    })
-                })
-            })
-            .collect::<Result<Vec<Vec<ContentBlockChatOutput>>, Error>>()?;
-
-        Ok(StoredChatInference {
-            function_name: value.function_name,
-            variant_name: value.variant_name,
-            input: value.input,
-            output: value.output,
-            dispreferred_outputs,
-            episode_id: value.episode_id,
-            inference_id: value.inference_id,
-            tool_params: value.tool_params,
-            tags: value.tags,
-            timestamp: value.timestamp,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct ClickHouseStoredJsonInference {
-    pub function_name: String,
-    pub variant_name: String,
-    pub episode_id: Uuid,
-    pub inference_id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    #[serde(deserialize_with = "deserialize_json_string")]
-    pub input: StoredInput,
-    #[serde(deserialize_with = "deserialize_json_string")]
-    pub output: JsonInferenceOutput,
-    #[serde(default)]
-    pub dispreferred_outputs: Vec<String>,
-    #[serde(deserialize_with = "deserialize_json_string")]
-    pub output_schema: Value,
-    pub tags: HashMap<String, String>,
-}
-
-impl TryFrom<ClickHouseStoredJsonInference> for StoredJsonInference {
-    type Error = Error;
-
-    fn try_from(value: ClickHouseStoredJsonInference) -> Result<Self, Self::Error> {
-        let dispreferred_outputs = value
-            .dispreferred_outputs
-            .into_iter()
-            .map(|dispreferred_output| {
-                serde_json::from_str(&dispreferred_output).map_err(|e| {
-                    Error::new(ErrorDetails::ClickHouseDeserialization {
-                        message: format!("Failed to deserialize dispreferred output: {e}"),
-                    })
-                })
-            })
-            .collect::<Result<Vec<JsonInferenceOutput>, Error>>()?;
-        Ok(StoredJsonInference {
-            function_name: value.function_name,
-            variant_name: value.variant_name,
-            input: value.input,
-            output: value.output,
-            dispreferred_outputs,
-            episode_id: value.episode_id,
-            inference_id: value.inference_id,
-            output_schema: value.output_schema,
-            tags: value.tags,
-            timestamp: value.timestamp,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum ClickHouseStoredInference {
-    Json(ClickHouseStoredJsonInference),
-    Chat(ClickHouseStoredChatInference),
-}
-
-impl TryFrom<ClickHouseStoredInference> for StoredInference {
-    type Error = Error;
-
-    fn try_from(value: ClickHouseStoredInference) -> Result<Self, Self::Error> {
-        Ok(match value {
-            ClickHouseStoredInference::Json(inference) => {
-                StoredInference::Json(inference.try_into()?)
-            }
-            ClickHouseStoredInference::Chat(inference) => {
-                StoredInference::Chat(inference.try_into()?)
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    // TODO(shuyangli): Cleanly separate tests for ListInferences SQL generation from the filter generation tests.
     use serde_json::json;
     use std::path::Path;
+    use uuid::Uuid;
 
-    use crate::inference::types::StoredInput;
+    use crate::db::clickhouse::inference_queries::generate_list_inferences_sql;
+    use crate::db::clickhouse::query_builder::test_util::assert_query_equals;
+    use crate::db::inferences::{
+        ClickHouseStoredInferenceWithDispreferredOutputs, InferenceOutputSource,
+        ListInferencesParams,
+    };
+    use crate::inference::types::{
+        ContentBlockChatOutput, JsonInferenceOutput, StoredInput, System,
+    };
+    use crate::stored_inference::StoredInferenceDatabase;
+    use crate::tool::ToolCallConfigDatabaseInsert;
     use crate::{config::ConfigFileGlob, inference::types::Text, tool::ToolChoice};
 
     use super::*;
@@ -880,14 +568,8 @@ mod tests {
     async fn test_simple_query_json_function() {
         let config = get_e2e_config().await;
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            function_name: Some("extract_entities"),
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -895,19 +577,20 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
     i.function_name = {p0:String}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![QueryParameter {
             name: "p0".to_string(),
             value: "extract_entities".to_string(),
@@ -919,14 +602,8 @@ FORMAT JSONEachRow";
     async fn test_simple_query_chat_function() {
         let config = get_e2e_config().await;
         let opts = ListInferencesParams {
-            function_name: "write_haiku",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            function_name: Some("write_haiku"),
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -934,19 +611,20 @@ SELECT
     'chat' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
+    '' as output_schema,
     i.tags as tags,
     i.tool_params as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     ChatInference AS i
 WHERE
     i.function_name = {p0:String}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![QueryParameter {
             name: "p0".to_string(),
             value: "write_haiku".to_string(),
@@ -957,20 +635,15 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simple_query_with_float_filters() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+        let filter_node = InferenceFilter::FloatMetric(FloatMetricFilter {
             metric_name: "jaccard_similarity".to_string(),
             value: 0.5,
             comparison_operator: FloatComparisonOperator::GreaterThan,
         });
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -978,13 +651,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -998,7 +672,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND j0.value > {p2:Float64}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1020,14 +694,8 @@ FORMAT JSONEachRow";
     async fn test_unknown_function_name() {
         let config = get_e2e_config().await;
         let opts = ListInferencesParams {
-            function_name: "unknown_function_name",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            function_name: Some("unknown_function_name"),
+            ..Default::default()
         };
         let result = generate_list_inferences_sql(&config, &opts);
         assert!(result.is_err());
@@ -1040,20 +708,15 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_unknown_metric_name() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+        let filter_node = InferenceFilter::FloatMetric(FloatMetricFilter {
             metric_name: "unknown_metric_name".to_string(),
             value: 0.5,
             comparison_operator: FloatComparisonOperator::GreaterThan,
         });
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let result = generate_list_inferences_sql(&config, &opts);
         assert!(result.is_err());
@@ -1067,36 +730,32 @@ FORMAT JSONEachRow";
     async fn test_demonstration_output_source() {
         let config = get_e2e_config().await;
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
-            filters: None,
+            function_name: Some("extract_entities"),
             output_source: InferenceOutputSource::Demonstration,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
 SELECT
     'json' as type,
-    [i.output] as dispreferred_outputs,
-    demo_f.value AS output,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    demo_f.value AS output,
+    [i.output] as dispreferred_outputs
 FROM
     JsonInference AS i
 JOIN (SELECT inference_id, argMax(value, timestamp) as value FROM DemonstrationFeedback GROUP BY inference_id ) AS demo_f ON i.id = demo_f.inference_id
 WHERE
     i.function_name = {p0:String}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![QueryParameter {
             name: "p0".to_string(),
             value: "extract_entities".to_string(),
@@ -1107,19 +766,14 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_boolean_metric_filter() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+        let filter_node = InferenceFilter::BooleanMetric(BooleanMetricFilter {
             metric_name: "task_success".to_string(),
             value: true,
         });
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1127,13 +781,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1147,7 +802,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND j0.value = {p2:Bool}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1168,19 +823,14 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_boolean_metric_filter_false() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+        let filter_node = InferenceFilter::BooleanMetric(BooleanMetricFilter {
             metric_name: "task_success".to_string(),
             value: false,
         });
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1188,13 +838,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1208,7 +859,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND j0.value = {p2:Bool}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1229,20 +880,20 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_and_filter_multiple_float_metrics() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "jaccard_similarity".to_string(),
                     value: 0.5,
                     comparison_operator: FloatComparisonOperator::GreaterThan,
                 }),
                 // We test that the join is not duplicated
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "jaccard_similarity".to_string(),
                     value: 0.8,
                     comparison_operator: FloatComparisonOperator::LessThan,
                 }),
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "brevity_score".to_string(),
                     value: 10.0,
                     comparison_operator: FloatComparisonOperator::LessThan,
@@ -1250,14 +901,9 @@ FORMAT JSONEachRow";
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1265,13 +911,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1294,7 +941,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND (COALESCE(j0.value > {p2:Float64}, 0) AND COALESCE(j0.value < {p3:Float64}, 0) AND COALESCE(j1.value < {p5:Float64}, 0))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1327,18 +974,18 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_or_filter_mixed_metrics() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::Or {
+        let filter_node = InferenceFilter::Or {
             children: vec![
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "jaccard_similarity".to_string(),
                     value: 0.8,
                     comparison_operator: FloatComparisonOperator::GreaterThanOrEqual,
                 }),
-                InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+                InferenceFilter::BooleanMetric(BooleanMetricFilter {
                     metric_name: "exact_match".to_string(),
                     value: true,
                 }),
-                InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+                InferenceFilter::BooleanMetric(BooleanMetricFilter {
                     // Episode-level metric
                     metric_name: "goal_achieved".to_string(),
                     value: true,
@@ -1346,14 +993,9 @@ FORMAT JSONEachRow";
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1361,13 +1003,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1399,7 +1042,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND (COALESCE(j0.value >= {p2:Float64}, 0) OR COALESCE(j1.value = {p4:Bool}, 0) OR COALESCE(j2.value = {p6:Bool}, 0))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1436,14 +1079,14 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_not_filter() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::Not {
-            child: Box::new(InferenceFilterTreeNode::Or {
+        let filter_node = InferenceFilter::Not {
+            child: Box::new(InferenceFilter::Or {
                 children: vec![
-                    InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+                    InferenceFilter::BooleanMetric(BooleanMetricFilter {
                         metric_name: "task_success".to_string(),
                         value: true,
                     }),
-                    InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+                    InferenceFilter::BooleanMetric(BooleanMetricFilter {
                         metric_name: "task_success".to_string(),
                         value: false,
                     }),
@@ -1451,14 +1094,9 @@ FORMAT JSONEachRow";
             }),
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1466,13 +1104,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1486,7 +1125,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND NOT (COALESCE((COALESCE(j0.value = {p2:Bool}, 0) OR COALESCE(j0.value = {p3:Bool}, 0)), 1))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1511,24 +1150,24 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_nested_complex_filter() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::Or {
+                InferenceFilter::Or {
                     children: vec![
-                        InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                        InferenceFilter::FloatMetric(FloatMetricFilter {
                             metric_name: "jaccard_similarity".to_string(),
                             value: 0.7,
                             comparison_operator: FloatComparisonOperator::GreaterThan,
                         }),
-                        InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                        InferenceFilter::FloatMetric(FloatMetricFilter {
                             metric_name: "brevity_score".to_string(),
                             value: 5.0,
                             comparison_operator: FloatComparisonOperator::LessThanOrEqual,
                         }),
                     ],
                 },
-                InferenceFilterTreeNode::Not {
-                    child: Box::new(InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+                InferenceFilter::Not {
+                    child: Box::new(InferenceFilter::BooleanMetric(BooleanMetricFilter {
                         metric_name: "task_success".to_string(),
                         value: false,
                     })),
@@ -1536,14 +1175,9 @@ FORMAT JSONEachRow";
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1551,13 +1185,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1589,34 +1224,34 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND (COALESCE((COALESCE(j0.value > {p2:Float64}, 0) OR COALESCE(j1.value <= {p4:Float64}, 0)), 0) AND COALESCE(NOT (COALESCE(j2.value = {p6:Bool}, 1)), 0))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         assert_eq!(params.len(), 7); // p0 (function) + 6 metric-related params
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_nested_complex_filter_with_time() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::Time(TimeNode {
+                InferenceFilter::Time(TimeFilter {
                     time: DateTime::from_timestamp(1609459200, 0).unwrap(), // 2021-01-01 00:00:00 UTC
                     comparison_operator: TimeComparisonOperator::GreaterThan,
                 }),
-                InferenceFilterTreeNode::Or {
+                InferenceFilter::Or {
                     children: vec![
-                        InferenceFilterTreeNode::Time(TimeNode {
+                        InferenceFilter::Time(TimeFilter {
                             time: DateTime::from_timestamp(1672531200, 0).unwrap(), // 2023-01-01 00:00:00 UTC
                             comparison_operator: TimeComparisonOperator::LessThan,
                         }),
-                        InferenceFilterTreeNode::And {
+                        InferenceFilter::And {
                             children: vec![
-                                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                                InferenceFilter::FloatMetric(FloatMetricFilter {
                                     metric_name: "jaccard_similarity".to_string(),
                                     value: 0.9,
                                     comparison_operator:
                                         FloatComparisonOperator::GreaterThanOrEqual,
                                 }),
-                                InferenceFilterTreeNode::Tag(TagNode {
+                                InferenceFilter::Tag(TagFilter {
                                     key: "priority".to_string(),
                                     value: "high".to_string(),
                                     comparison_operator: TagComparisonOperator::Equal,
@@ -1628,14 +1263,9 @@ FORMAT JSONEachRow";
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1643,13 +1273,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1663,7 +1294,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND (COALESCE(i.timestamp > parseDateTimeBestEffort({p1:String}), 0) AND COALESCE((COALESCE(i.timestamp < parseDateTimeBestEffort({p2:String}), 0) OR COALESCE((COALESCE(j0.value >= {p4:Float64}, 0) AND COALESCE(i.tags[{p5:String}] = {p6:String}, 0)), 0)), 0))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         assert_eq!(params.len(), 7); // p0 (function) + 6 filter-related params
     }
 
@@ -1671,14 +1302,10 @@ FORMAT JSONEachRow";
     async fn test_variant_name_filter() {
         let config = get_e2e_config().await;
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
+            function_name: Some("extract_entities"),
             variant_name: Some("v1"),
             filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1686,19 +1313,20 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
     i.function_name = {p0:String} AND i.variant_name = {p1:String}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1716,14 +1344,10 @@ FORMAT JSONEachRow";
     async fn test_limit_and_offset() {
         let config = get_e2e_config().await;
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
+            function_name: Some("extract_entities"),
             limit: Some(50),
             offset: Some(100),
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1731,13 +1355,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
@@ -1745,7 +1370,7 @@ WHERE
 LIMIT {p1:UInt64}
 OFFSET {p2:UInt64}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1776,20 +1401,15 @@ FORMAT JSONEachRow";
         ];
 
         for (op, expected_op_str) in operators {
-            let filter_node = InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+            let filter_node = InferenceFilter::FloatMetric(FloatMetricFilter {
                 metric_name: "jaccard_similarity".to_string(),
                 value: 0.5,
                 comparison_operator: op,
             });
             let opts = ListInferencesParams {
-                function_name: "extract_entities",
-                variant_name: None,
+                function_name: Some("extract_entities"),
                 filters: Some(&filter_node),
-                output_source: InferenceOutputSource::Inference,
-                limit: None,
-                offset: None,
-                order_by: None,
-                format: ClickhouseFormat::JsonEachRow,
+                ..Default::default()
             };
             let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
             let expected_sql = format!(
@@ -1798,13 +1418,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {{p0:String}} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -1819,7 +1440,7 @@ WHERE
     i.function_name = {{p0:String}} AND j0.value {expected_op_str} {{p2:Float64}}
 FORMAT JSONEachRow",
             );
-            assert_eq!(sql, expected_sql);
+            assert_query_equals(&sql, &expected_sql);
             let expected_params = vec![
                 QueryParameter {
                     name: "p0".to_string(),
@@ -1841,20 +1462,15 @@ FORMAT JSONEachRow",
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simple_tag_filter_equal() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::Tag(TagNode {
+        let filter_node = InferenceFilter::Tag(TagFilter {
             key: "environment".to_string(),
             value: "production".to_string(),
             comparison_operator: TagComparisonOperator::Equal,
         });
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1862,19 +1478,20 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
     i.function_name = {p0:String} AND i.tags[{p1:String}] = {p2:String}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1895,20 +1512,15 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tag_filter_not_equal() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::Tag(TagNode {
+        let filter_node = InferenceFilter::Tag(TagFilter {
             key: "version".to_string(),
             value: "v1.0".to_string(),
             comparison_operator: TagComparisonOperator::NotEqual,
         });
         let opts = ListInferencesParams {
-            function_name: "write_haiku",
-            variant_name: None,
+            function_name: Some("write_haiku"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1916,19 +1528,20 @@ SELECT
     'chat' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
+    '' as output_schema,
     i.tags as tags,
     i.tool_params as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     ChatInference AS i
 WHERE
     i.function_name = {p0:String} AND i.tags[{p1:String}] != {p2:String}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -1949,14 +1562,14 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tag_filters_in_and_condition() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::Tag(TagNode {
+                InferenceFilter::Tag(TagFilter {
                     key: "environment".to_string(),
                     value: "production".to_string(),
                     comparison_operator: TagComparisonOperator::Equal,
                 }),
-                InferenceFilterTreeNode::Tag(TagNode {
+                InferenceFilter::Tag(TagFilter {
                     key: "region".to_string(),
                     value: "us-west".to_string(),
                     comparison_operator: TagComparisonOperator::Equal,
@@ -1964,14 +1577,9 @@ FORMAT JSONEachRow";
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -1979,19 +1587,20 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
     i.function_name = {p0:String} AND (COALESCE(i.tags[{p1:String}] = {p2:String}, 0) AND COALESCE(i.tags[{p3:String}] = {p4:String}, 0))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -2020,14 +1629,14 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tag_and_metric_filters_combined() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::Tag(TagNode {
+                InferenceFilter::Tag(TagFilter {
                     key: "experiment".to_string(),
                     value: "A".to_string(),
                     comparison_operator: TagComparisonOperator::Equal,
                 }),
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "jaccard_similarity".to_string(),
                     value: 0.7,
                     comparison_operator: FloatComparisonOperator::GreaterThan,
@@ -2035,14 +1644,9 @@ FORMAT JSONEachRow";
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -2050,13 +1654,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -2070,7 +1675,7 @@ LEFT JOIN (
 WHERE
     i.function_name = {p0:String} AND (COALESCE(i.tags[{p1:String}] = {p2:String}, 0) AND COALESCE(j0.value > {p4:Float64}, 0))
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -2099,43 +1704,43 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_combined_variant_filter_and_metrics() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "jaccard_similarity".to_string(),
                     value: 0.6,
                     comparison_operator: FloatComparisonOperator::GreaterThan,
                 }),
-                InferenceFilterTreeNode::BooleanMetric(BooleanMetricNode {
+                InferenceFilter::BooleanMetric(BooleanMetricFilter {
                     metric_name: "exact_match".to_string(),
                     value: true,
                 }),
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
+            function_name: Some("extract_entities"),
             variant_name: Some("production"),
             filters: Some(&filter_node),
             output_source: InferenceOutputSource::Demonstration,
             limit: Some(25),
             offset: Some(50),
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
 SELECT
     'json' as type,
-    [i.output] as dispreferred_outputs,
-    demo_f.value AS output,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    demo_f.value AS output,
+    [i.output] as dispreferred_outputs
 FROM
     JsonInference AS i
 JOIN (SELECT inference_id, argMax(value, timestamp) as value FROM DemonstrationFeedback GROUP BY inference_id ) AS demo_f ON i.id = demo_f.inference_id
@@ -2162,7 +1767,7 @@ WHERE
 LIMIT {p6:UInt64}
 OFFSET {p7:UInt64}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
 
         let expected_params = vec![
             QueryParameter {
@@ -2204,19 +1809,14 @@ FORMAT JSONEachRow";
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simple_time_filter() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::Time(TimeNode {
+        let filter_node = InferenceFilter::Time(TimeFilter {
             time: DateTime::from_timestamp(1672531200, 0).unwrap(), // 2023-01-01 00:00:00 UTC
             comparison_operator: TimeComparisonOperator::GreaterThan,
         });
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -2224,19 +1824,20 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
     i.function_name = {p0:String} AND i.timestamp > parseDateTimeBestEffort({p1:String})
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -2263,19 +1864,14 @@ FORMAT JSONEachRow";
         ];
 
         for (op, expected_op_str) in operators {
-            let filter_node = InferenceFilterTreeNode::Time(TimeNode {
+            let filter_node = InferenceFilter::Time(TimeFilter {
                 time: DateTime::from_timestamp(1672531200, 0).unwrap(), // 2023-01-01 00:00:00 UTC
                 comparison_operator: op,
             });
             let opts = ListInferencesParams {
-                function_name: "write_haiku",
-                variant_name: None,
+                function_name: Some("write_haiku"),
                 filters: Some(&filter_node),
-                output_source: InferenceOutputSource::Inference,
-                limit: None,
-                offset: None,
-                order_by: None,
-                format: ClickhouseFormat::JsonEachRow,
+                ..Default::default()
             };
             let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
             let expected_sql = format!(
@@ -2284,20 +1880,21 @@ SELECT
     'chat' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
+    '' as output_schema,
     i.tags as tags,
     i.tool_params as tool_params,
     i.variant_name as variant_name,
-    {{p0:String}} as function_name
+    i.output as output
 FROM
     ChatInference AS i
 WHERE
     i.function_name = {{p0:String}} AND i.timestamp {expected_op_str} parseDateTimeBestEffort({{p1:String}})
 FORMAT JSONEachRow",
             );
-            assert_eq!(sql, expected_sql);
+            assert_query_equals(&sql, &expected_sql);
             let expected_params = vec![
                 QueryParameter {
                     name: "p0".to_string(),
@@ -2315,18 +1912,18 @@ FORMAT JSONEachRow",
     #[tokio::test(flavor = "multi_thread")]
     async fn test_time_filter_combined_with_other_filters() {
         let config = get_e2e_config().await;
-        let filter_node = InferenceFilterTreeNode::And {
+        let filter_node = InferenceFilter::And {
             children: vec![
-                InferenceFilterTreeNode::Time(TimeNode {
+                InferenceFilter::Time(TimeFilter {
                     time: DateTime::from_timestamp(1672531200, 0).unwrap(), // 2023-01-01 00:00:00 UTC
                     comparison_operator: TimeComparisonOperator::GreaterThanOrEqual,
                 }),
-                InferenceFilterTreeNode::Tag(TagNode {
+                InferenceFilter::Tag(TagFilter {
                     key: "environment".to_string(),
                     value: "production".to_string(),
                     comparison_operator: TagComparisonOperator::Equal,
                 }),
-                InferenceFilterTreeNode::FloatMetric(FloatMetricNode {
+                InferenceFilter::FloatMetric(FloatMetricFilter {
                     metric_name: "jaccard_similarity".to_string(),
                     value: 0.8,
                     comparison_operator: FloatComparisonOperator::GreaterThan,
@@ -2334,14 +1931,10 @@ FORMAT JSONEachRow",
             ],
         };
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
+            function_name: Some("extract_entities"),
             filters: Some(&filter_node),
-            output_source: InferenceOutputSource::Inference,
             limit: Some(10),
-            offset: None,
-            order_by: None,
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         let expected_sql = r"
@@ -2349,13 +1942,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -2370,7 +1964,7 @@ WHERE
     i.function_name = {p0:String} AND (COALESCE(i.timestamp >= parseDateTimeBestEffort({p1:String}), 0) AND COALESCE(i.tags[{p2:String}] = {p3:String}, 0) AND COALESCE(j0.value > {p5:Float64}, 0))
 LIMIT {p6:UInt64}
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
         let expected_params = vec![
             QueryParameter {
                 name: "p0".to_string(),
@@ -2421,8 +2015,9 @@ FORMAT JSONEachRow";
                 "timestamp": "2023-01-01T00:00:00Z"
             }
         "#;
-        let inference: ClickHouseStoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Chat(chat_inference) = inference.try_into().unwrap() else {
+        let inference: ClickHouseStoredInferenceWithDispreferredOutputs =
+            serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Chat(chat_inference) = inference.try_into().unwrap() else {
             panic!("Expected a chat inference");
         };
         assert_eq!(chat_inference.function_name, "test_function");
@@ -2430,7 +2025,7 @@ FORMAT JSONEachRow";
         assert_eq!(
             chat_inference.input,
             StoredInput {
-                system: Some(json!("you are a helpful assistant")),
+                system: Some(System::Text("you are a helpful assistant".to_string())),
                 messages: vec![],
             }
         );
@@ -2463,8 +2058,8 @@ FORMAT JSONEachRow";
             "timestamp": "2023-01-01T00:00:00Z"
         }
     "#;
-        let inference: StoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Chat(chat_inference) = inference else {
+        let inference: StoredInferenceDatabase = serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Chat(chat_inference) = inference else {
             panic!("Expected a chat inference");
         };
         assert_eq!(chat_inference.function_name, "test_function");
@@ -2472,7 +2067,7 @@ FORMAT JSONEachRow";
         assert_eq!(
             chat_inference.input,
             StoredInput {
-                system: Some(json!("you are a helpful assistant")),
+                system: Some(System::Text("you are a helpful assistant".to_string())),
                 messages: vec![],
             }
         );
@@ -2509,8 +2104,9 @@ FORMAT JSONEachRow";
                 "timestamp": "2023-01-01T00:00:00Z"
             }
         "#;
-        let inference: ClickHouseStoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Chat(chat_inference) = inference.try_into().unwrap() else {
+        let inference: ClickHouseStoredInferenceWithDispreferredOutputs =
+            serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Chat(chat_inference) = inference.try_into().unwrap() else {
             panic!("Expected a chat inference");
         };
         assert_eq!(
@@ -2541,8 +2137,8 @@ FORMAT JSONEachRow";
             "timestamp": "2023-01-01T00:00:00Z"
         }
     "#;
-        let inference: StoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Chat(chat_inference) = inference else {
+        let inference: StoredInferenceDatabase = serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Chat(chat_inference) = inference else {
             panic!("Expected a chat inference");
         };
         assert_eq!(
@@ -2570,8 +2166,9 @@ FORMAT JSONEachRow";
                 "timestamp": "2023-01-01T00:00:00Z"
             }
         "#;
-        let inference: ClickHouseStoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Json(json_inference) = inference.try_into().unwrap() else {
+        let inference: ClickHouseStoredInferenceWithDispreferredOutputs =
+            serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Json(json_inference) = inference.try_into().unwrap() else {
             panic!("Expected a json inference");
         };
         assert_eq!(json_inference.function_name, "test_function");
@@ -2579,7 +2176,7 @@ FORMAT JSONEachRow";
         assert_eq!(
             json_inference.input,
             StoredInput {
-                system: Some(json!("you are a helpful assistant")),
+                system: Some(System::Text("you are a helpful assistant".to_string())),
                 messages: vec![],
             }
         );
@@ -2619,8 +2216,8 @@ FORMAT JSONEachRow";
              "timestamp": "2023-01-01T00:00:00Z"
          }
      "#;
-        let inference: StoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Json(json_inference) = inference else {
+        let inference: StoredInferenceDatabase = serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Json(json_inference) = inference else {
             panic!("Expected a json inference");
         };
         assert_eq!(json_inference.function_name, "test_function");
@@ -2628,7 +2225,7 @@ FORMAT JSONEachRow";
         assert_eq!(
             json_inference.input,
             StoredInput {
-                system: Some(json!("you are a helpful assistant")),
+                system: Some(System::Text("you are a helpful assistant".to_string())),
                 messages: vec![],
             }
         );
@@ -2672,8 +2269,9 @@ FORMAT JSONEachRow";
                 "timestamp": "2023-01-01T00:00:00Z"
             }
         "#;
-        let inference: ClickHouseStoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Json(json_inference) = inference.try_into().unwrap() else {
+        let inference: ClickHouseStoredInferenceWithDispreferredOutputs =
+            serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Json(json_inference) = inference.try_into().unwrap() else {
             panic!("Expected a json inference");
         };
         assert_eq!(
@@ -2702,8 +2300,8 @@ FORMAT JSONEachRow";
              "timestamp": "2023-01-01T00:00:00Z"
          }
      "#;
-        let inference: StoredInference = serde_json::from_str(json).unwrap();
-        let StoredInference::Json(json_inference) = inference else {
+        let inference: StoredInferenceDatabase = serde_json::from_str(json).unwrap();
+        let StoredInferenceDatabase::Json(json_inference) = inference else {
             panic!("Expected a json inference");
         };
 
@@ -2724,14 +2322,9 @@ FORMAT JSONEachRow";
             direction: OrderDirection::Desc,
         }];
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
+            function_name: Some("extract_entities"),
             order_by: Some(&order_by),
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
 
@@ -2740,20 +2333,21 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 WHERE
     i.function_name = {p0:String}
 ORDER BY i.timestamp DESC NULLS LAST
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
 
         let expected_params = vec![QueryParameter {
             name: "p0".to_string(),
@@ -2772,14 +2366,9 @@ FORMAT JSONEachRow";
             direction: OrderDirection::Asc,
         }];
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
+            function_name: Some("extract_entities"),
             order_by: Some(&order_by),
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
         // NOTE: This test case enforces that the joins account for metrics that are only used in the order by clause.
@@ -2788,13 +2377,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -2809,7 +2399,7 @@ WHERE
     i.function_name = {p0:String}
 ORDER BY j0.value ASC NULLS LAST
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
 
         let expected_params = vec![
             QueryParameter {
@@ -2840,14 +2430,9 @@ FORMAT JSONEachRow";
             },
         ];
         let opts = ListInferencesParams {
-            function_name: "extract_entities",
-            variant_name: None,
-            filters: None,
-            output_source: InferenceOutputSource::Inference,
-            limit: None,
-            offset: None,
+            function_name: Some("extract_entities"),
             order_by: Some(&order_by),
-            format: ClickhouseFormat::JsonEachRow,
+            ..Default::default()
         };
         let (sql, params) = generate_list_inferences_sql(&config, &opts).unwrap();
 
@@ -2856,13 +2441,14 @@ SELECT
     'json' as type,
     formatDateTime(i.timestamp, '%Y-%m-%dT%H:%i:%SZ') as timestamp,
     i.episode_id as episode_id,
+    i.function_name as function_name,
     i.id as inference_id,
     i.input as input,
-    i.output as output,
     i.output_schema as output_schema,
     i.tags as tags,
+    '' as tool_params,
     i.variant_name as variant_name,
-    {p0:String} as function_name
+    i.output as output
 FROM
     JsonInference AS i
 LEFT JOIN (
@@ -2877,7 +2463,7 @@ WHERE
     i.function_name = {p0:String}
 ORDER BY j0.value DESC NULLS LAST, i.timestamp ASC NULLS LAST
 FORMAT JSONEachRow";
-        assert_eq!(sql, expected_sql);
+        assert_query_equals(&sql, expected_sql);
 
         let expected_params = vec![
             QueryParameter {

@@ -2,9 +2,6 @@ import type {
   DisplayInput,
   DisplayInputMessage,
   DisplayInputMessageContent,
-  DisplayMissingFunctionTextInput,
-  DisplayUnstructuredTextInput,
-  DisplayStructuredTextInput,
   FileContent,
   Input,
   InputMessage,
@@ -13,9 +10,15 @@ import type {
   ModelInferenceInputMessageContent,
   ResolvedBase64File,
   Role,
-  TextInput,
+  LegacyTextInput,
 } from "./clickhouse/common";
-import type { FunctionConfig } from "tensorzero-node";
+import type {
+  FunctionConfig,
+  JsonValue,
+  StoredInput,
+  StoredInputMessage,
+  StoredInputMessageContent,
+} from "tensorzero-node";
 import { getTensorZeroClient } from "./tensorzero.server";
 
 export async function resolveInput(
@@ -122,7 +125,7 @@ async function resolveContent(
       try {
         return {
           ...content,
-          file: await resolveFile(content as FileContent),
+          file: await resolveFile(content),
         };
       } catch (error) {
         return {
@@ -142,7 +145,7 @@ async function resolveModelInferenceContent(
       // Do not use prepareDisplayText here because these are model inferences and should be post-templating
       // and will always be unstructured text.
       return {
-        type: "unstructured_text",
+        type: "text",
         text: content.text,
       };
     case "tool_call":
@@ -178,7 +181,7 @@ async function resolveModelInferenceContent(
       try {
         return {
           ...content,
-          file: await resolveFile(content as FileContent),
+          file: await resolveFile(content),
         };
       } catch (error) {
         return {
@@ -192,9 +195,9 @@ async function resolveModelInferenceContent(
 async function resolveFile(content: FileContent): Promise<ResolvedBase64File> {
   const object = await getTensorZeroClient().getObject(content.storage_path);
   const json = JSON.parse(object);
-  const dataURL = `data:${content.file.mime_type};base64,${json.data}`;
+  const data = `data:${content.file.mime_type};base64,${json.data}`;
   return {
-    dataUrl: dataURL,
+    data,
     mime_type: content.file.mime_type,
   };
 }
@@ -202,34 +205,161 @@ async function resolveFile(content: FileContent): Promise<ResolvedBase64File> {
 // In the current data model we can't distinguish between a message being a structured one from a schema
 // or an unstructured one without a schema without knowing the function config.
 // So as we prepare the input for display, we check this and return an unambiguous type of structured or unstructured text.
+// TODO (Gabriel): this function uses legacy types and should be deprecated ASAP. It won't handle sad paths very well.
 function prepareDisplayText(
-  textBlock: TextInput,
+  textBlock: LegacyTextInput,
   role: Role,
   functionConfig: FunctionConfig | null,
-):
-  | DisplayUnstructuredTextInput
-  | DisplayStructuredTextInput
-  | DisplayMissingFunctionTextInput {
+): DisplayInputMessageContent {
+  // If there's no function config, we can't do any templating because of legacy templates...
   if (!functionConfig) {
     return {
       type: "missing_function_text",
-      value: textBlock.value,
+      value:
+        typeof textBlock.value === "string"
+          ? textBlock.value
+          : JSON.stringify(textBlock.value),
     };
   }
 
-  // True if the function has a schema for the role (user or assistant)
-  const hasSchemaForRole =
-    role === "user"
-      ? !!functionConfig.schemas.user
-      : !!functionConfig.schemas.assistant;
-  if (hasSchemaForRole) {
+  if (textBlock.text !== undefined) {
     return {
-      type: "structured_text",
-      arguments: textBlock.value,
+      type: "text",
+      text: textBlock.text,
     };
   }
+
+  // Handle the legacy structured prompts that were stored as text content blocks
+  if (role === "user" && functionConfig.schemas["user"] !== undefined) {
+    return {
+      type: "template",
+      name: "user",
+      arguments: (() => {
+        if (
+          typeof textBlock.value === "object" &&
+          textBlock.value !== null &&
+          !Array.isArray(textBlock.value)
+        ) {
+          return textBlock.value as Record<string, JsonValue>;
+        }
+        throw new Error(
+          `Invalid arguments for user template: expected object, got ${typeof textBlock.value}`,
+        );
+      })(),
+    };
+  }
+
+  if (
+    role === "assistant" &&
+    functionConfig.schemas["assistant"] !== undefined
+  ) {
+    return {
+      type: "template",
+      name: "assistant",
+      arguments: (() => {
+        if (
+          typeof textBlock.value === "object" &&
+          textBlock.value !== null &&
+          !Array.isArray(textBlock.value)
+        ) {
+          return textBlock.value as Record<string, JsonValue>;
+        }
+        throw new Error(
+          `Invalid arguments for assistant template: expected object, got ${typeof textBlock.value}`,
+        );
+      })(),
+    };
+  }
+
+  // Otherwise it's just unstructured text
   return {
-    type: "unstructured_text",
-    text: textBlock.value,
+    type: "text",
+    text:
+      typeof textBlock.value === "string"
+        ? textBlock.value
+        : JSON.stringify(textBlock.value),
   };
+}
+
+// ===== StoredInput =====
+// TODO: These functions should be deprecated as we clean up the types...
+
+export async function resolveStoredInput(
+  input: StoredInput,
+): Promise<DisplayInput> {
+  const resolvedMessages = await resolveStoredInputMessages(input.messages);
+  return {
+    ...input,
+    messages: resolvedMessages,
+  };
+}
+
+export async function resolveStoredInputMessages(
+  messages: StoredInputMessage[],
+): Promise<DisplayInputMessage[]> {
+  return Promise.all(
+    messages.map(async (message) => {
+      return resolveStoredInputMessage(message);
+    }),
+  );
+}
+
+async function resolveStoredInputMessage(
+  message: StoredInputMessage,
+): Promise<DisplayInputMessage> {
+  const resolvedContent = await Promise.all(
+    message.content.map(async (content) => {
+      return resolveStoredInputMessageContent(content);
+    }),
+  );
+  return {
+    ...message,
+    content: resolvedContent,
+  };
+}
+
+async function resolveStoredInputMessageContent(
+  content: StoredInputMessageContent,
+): Promise<DisplayInputMessageContent> {
+  switch (content.type) {
+    case "tool_call":
+    case "tool_result":
+    case "raw_text":
+    case "thought":
+    case "unknown":
+    case "template":
+    case "text":
+      return content;
+    case "file":
+      try {
+        // Convert flattened ObjectStorageFile to nested FileContent structure
+        const fileContent: FileContent = {
+          type: "file",
+          file: {
+            url: content.source_url ?? null,
+            mime_type: content.mime_type,
+          },
+          storage_path: content.storage_path,
+        };
+        const resolvedFile = await resolveFile(fileContent);
+        return {
+          type: "file",
+          file: {
+            data: resolvedFile.data,
+            mime_type: resolvedFile.mime_type,
+          },
+          storage_path: content.storage_path,
+        };
+      } catch (error) {
+        return {
+          type: "file_error",
+          file: {
+            url: content.source_url ?? null,
+            mime_type: content.mime_type,
+          },
+          storage_path: content.storage_path,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+  }
 }

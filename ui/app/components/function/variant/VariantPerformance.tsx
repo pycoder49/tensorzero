@@ -1,10 +1,13 @@
-import type {
-  TimeWindowUnit,
-  VariantPerformanceRow,
-} from "~/utils/clickhouse/function";
+import type { VariantPerformanceRow } from "~/utils/clickhouse/function";
 // import { TrendingUp } from "lucide-react";
 import { Bar, BarChart, ErrorBar, CartesianGrid, XAxis, YAxis } from "recharts";
-import { formatChartNumber, formatDetailedNumber } from "~/utils/chart";
+import {
+  formatChartNumber,
+  formatDetailedNumber,
+  formatXAxisTimestamp,
+  formatTooltipTimestamp,
+  CHART_COLORS,
+} from "~/utils/chart";
 
 import {
   Card,
@@ -21,28 +24,21 @@ import {
   ChartTooltipContent,
 } from "~/components/ui/chart";
 import { TimeGranularitySelector } from "./TimeGranularitySelector";
-
-const CHART_COLORS = [
-  "hsl(var(--chart-1))",
-  "hsl(var(--chart-2))",
-  "hsl(var(--chart-3))",
-  "hsl(var(--chart-4))",
-  "hsl(var(--chart-5))",
-] as const;
+import { useTimeGranularityParam } from "~/hooks/use-time-granularity-param";
 
 export function VariantPerformance({
   variant_performances,
   metric_name,
-  time_granularity,
-  onTimeGranularityChange,
   singleVariantMode = false,
 }: {
   variant_performances: VariantPerformanceRow[];
   metric_name: string;
-  time_granularity: TimeWindowUnit;
-  onTimeGranularityChange: (time_granularity: TimeWindowUnit) => void;
   singleVariantMode?: boolean;
 }) {
+  const [time_granularity, onTimeGranularityChange] = useTimeGranularityParam(
+    "time_granularity",
+    "week",
+  );
   const { data, variantNames } =
     transformVariantPerformances(variant_performances);
 
@@ -97,7 +93,9 @@ export function VariantPerformance({
                 tickLine={false}
                 tickMargin={10}
                 axisLine={true}
-                tickFormatter={(value) => new Date(value).toLocaleDateString()}
+                tickFormatter={(value) =>
+                  formatXAxisTimestamp(new Date(value), time_granularity)
+                }
               />
               <YAxis
                 tickLine={false}
@@ -109,15 +107,17 @@ export function VariantPerformance({
                 content={
                   <ChartTooltipContent
                     labelFormatter={(label) =>
-                      new Date(label).toLocaleDateString()
+                      formatTooltipTimestamp(new Date(label), time_granularity)
                     }
                     formatter={(value, name, entry) => {
                       const numInferences =
                         entry.payload[`${name}_num_inferences`];
                       return (
                         <div className="flex flex-1 items-center justify-between leading-none">
-                          <span className="text-muted-foreground">{name}</span>
-                          <div className="grid text-right">
+                          <span className="text-muted-foreground font-mono text-xs">
+                            {name}
+                          </span>
+                          <div className="ml-2 grid text-right">
                             <span className="text-foreground font-mono font-medium tabular-nums">
                               {formatDetailedNumber(value as number)}
                             </span>
@@ -131,7 +131,9 @@ export function VariantPerformance({
                   />
                 }
               />
-              <ChartLegend content={<ChartLegendContent />} />
+              <ChartLegend
+                content={<ChartLegendContent className="font-mono text-xs" />}
+              />
               {singleVariantMode ? (
                 <Bar
                   key={variantNames[0]}
@@ -201,7 +203,9 @@ export function transformVariantPerformances(
   // Remove rows with n=0 inferences
   const filtered = parsedRows.filter((row) => row.count > 0);
 
-  const variantNames = [...new Set(filtered.map((row) => row.variant_name))];
+  const variantNames = [
+    ...new Set(filtered.map((row) => row.variant_name)),
+  ].sort();
 
   // First group by date
   const groupedByDate = filtered.reduce<PerformanceDataGroupedByDate>(

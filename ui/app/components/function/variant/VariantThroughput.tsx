@@ -1,8 +1,11 @@
-import type {
-  TimeWindowUnit,
-  VariantThroughput,
-} from "~/utils/clickhouse/function";
+import type { VariantThroughput } from "~/utils/clickhouse/function";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
+import {
+  CHART_COLORS,
+  formatChartNumber,
+  formatXAxisTimestamp,
+  formatTooltipTimestamp,
+} from "~/utils/chart";
 
 import { Card, CardContent, CardHeader } from "~/components/ui/card";
 import {
@@ -12,24 +15,17 @@ import {
   ChartTooltip,
 } from "~/components/ui/chart";
 import { TimeGranularitySelector } from "./TimeGranularitySelector";
-
-const CHART_COLORS = [
-  "hsl(var(--chart-1))",
-  "hsl(var(--chart-2))",
-  "hsl(var(--chart-3))",
-  "hsl(var(--chart-4))",
-  "hsl(var(--chart-5))",
-] as const;
+import { useTimeGranularityParam } from "~/hooks/use-time-granularity-param";
 
 export function VariantThroughput({
   variant_throughput,
-  time_granularity,
-  onTimeGranularityChange,
 }: {
   variant_throughput: VariantThroughput[];
-  time_granularity: TimeWindowUnit;
-  onTimeGranularityChange: (time_granularity: TimeWindowUnit) => void;
 }) {
+  const [time_granularity, onTimeGranularityChange] = useTimeGranularityParam(
+    "throughput_time_granularity",
+    "week",
+  );
   const { data, variantNames } = transformVariantThroughput(variant_throughput);
 
   const chartConfig: Record<string, { label: string; color: string }> =
@@ -64,7 +60,7 @@ export function VariantThroughput({
                 tickMargin={10}
                 axisLine={true}
                 tickFormatter={(value) =>
-                  new Date(value).toISOString().slice(0, 10)
+                  formatXAxisTimestamp(new Date(value), time_granularity)
                 }
               />
               <YAxis
@@ -76,15 +72,7 @@ export function VariantThroughput({
                   angle: -90,
                   position: "insideLeft",
                 }}
-                tickFormatter={(value) => {
-                  const num = Number(value);
-                  if (num >= 1000000) {
-                    return (num / 1000000).toFixed(1) + "M";
-                  } else if (num >= 1000) {
-                    return (num / 1000).toFixed(1) + "K";
-                  }
-                  return num.toString();
-                }}
+                tickFormatter={(value) => formatChartNumber(Number(value))}
               />
               <ChartTooltip
                 content={({ active, payload, label }) => {
@@ -98,7 +86,10 @@ export function VariantThroughput({
                   return (
                     <div className="border-border/50 bg-background grid min-w-[8rem] items-start gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs shadow-xl">
                       <div className="font-medium">
-                        {new Date(label).toISOString().slice(0, 10)}
+                        {formatTooltipTimestamp(
+                          new Date(label),
+                          time_granularity,
+                        )}
                       </div>
                       <div className="grid gap-1.5">
                         {payload
@@ -114,10 +105,10 @@ export function VariantThroughput({
                                 style={{ backgroundColor: entry.color }}
                               />
                               <div className="flex flex-1 items-center justify-between gap-2 leading-none">
-                                <span className="text-muted-foreground">
+                                <span className="text-muted-foreground font-mono text-xs">
                                   {entry.name}
                                 </span>
-                                <span className="text-foreground font-mono font-medium tabular-nums">
+                                <span className="text-foreground ml-2 font-mono font-medium tabular-nums">
                                   {Number(entry.value).toLocaleString()}
                                 </span>
                               </div>
@@ -139,7 +130,9 @@ export function VariantThroughput({
                   );
                 }}
               />
-              <ChartLegend content={<ChartLegendContent />} />
+              <ChartLegend
+                content={<ChartLegendContent className="font-mono text-xs" />}
+              />
               {variantNames.map((variantName) => (
                 <Area
                   key={variantName}
@@ -169,7 +162,9 @@ export function transformVariantThroughput(parsedRows: VariantThroughput[]): {
   data: VariantThroughputData[];
   variantNames: string[];
 } {
-  const variantNames = [...new Set(parsedRows.map((row) => row.variant_name))];
+  const variantNames = [
+    ...new Set(parsedRows.map((row) => row.variant_name)),
+  ].sort();
 
   // Group by date
   const groupedByDate = parsedRows.reduce<

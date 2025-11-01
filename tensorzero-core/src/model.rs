@@ -1,16 +1,18 @@
 use futures::future::try_join_all;
 use futures::StreamExt;
 use secrecy::SecretString;
+use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
-use std::{env, fs};
 use strum::VariantNames;
 use tensorzero_derive::TensorZeroDeserialize;
 use tokio::time::error::Elapsed;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{span, Level, Span};
 use tracing_futures::{Instrument, Instrumented};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use url::Url;
 
 use crate::cache::{
@@ -18,9 +20,12 @@ use crate::cache::{
     CacheData, CacheValidationInfo, ModelProviderRequest, NonStreamingCacheData,
     StreamingCacheData,
 };
-use crate::config::{skip_credential_validation, ProviderTypesConfig, TimeoutsConfig};
+use crate::config::{
+    provider_types::ProviderTypesConfig, OtlpConfig, OtlpTracesFormat, TimeoutsConfig,
+};
 use crate::endpoints::inference::InferenceClients;
 use crate::http::TensorzeroHttpClient;
+use crate::model_table::ProviderKind;
 use crate::providers::aws_sagemaker::AWSSagemakerProvider;
 #[cfg(any(test, feature = "e2e_tests"))]
 use crate::providers::dummy::DummyProvider;
@@ -38,11 +43,18 @@ use crate::inference::types::{
     Usage,
 };
 use crate::inference::WrappedProvider;
-use crate::model_table::{BaseModelTable, ShorthandModelConfig};
+use crate::model_table::{
+    AnthropicKind, AzureKind, BaseModelTable, DeepSeekKind, FireworksKind,
+    GoogleAIStudioGeminiKind, GroqKind, HyperbolicKind, MistralKind, OpenAIKind, OpenRouterKind,
+    ProviderTypeDefaultCredentials, SGLangKind, ShorthandModelConfig, TGIKind, TogetherKind,
+    VLLMKind, XAIKind,
+};
 use crate::providers::helpers::peek_first_chunk;
 use crate::providers::hyperbolic::HyperbolicProvider;
+use crate::providers::openai::OpenAIAPIType;
 use crate::providers::sglang::SGLangProvider;
 use crate::providers::tgi::TGIProvider;
+use crate::rate_limiting::{RateLimitResourceUsage, TicketBorrows};
 use crate::{
     endpoints::inference::InferenceCredentials,
     error::{Error, ErrorDetails},
@@ -87,6 +99,7 @@ impl UninitializedModelConfig {
         self,
         model_name: &str,
         provider_types: &ProviderTypesConfig,
+        provider_type_default_credentials: &ProviderTypeDefaultCredentials,
     ) -> Result<ModelConfig, Error> {
         // We want `ModelProvider` to know its own name (from the 'providers' config section).
         // We first deserialize to `HashMap<Arc<str>, UninitializedModelProvider>`, and then
@@ -97,11 +110,15 @@ impl UninitializedModelConfig {
                     name.clone(),
                     ModelProvider {
                         name: name.clone(),
-                        config: provider.config.load(provider_types).await.map_err(|e| {
-                            Error::new(ErrorDetails::Config {
-                                message: format!("models.{model_name}.providers.{name}: {e}"),
-                            })
-                        })?,
+                        config: provider
+                            .config
+                            .load(provider_types, provider_type_default_credentials)
+                            .await
+                            .map_err(|e| {
+                                Error::new(ErrorDetails::Config {
+                                    message: format!("models.{model_name}.providers.{name}: {e}"),
+                                })
+                            })?,
                         extra_body: provider.extra_body,
                         extra_headers: provider.extra_headers,
                         timeouts: provider.timeouts,
@@ -197,6 +214,7 @@ impl ModelConfig {
                 ContentBlock::Thought(Thought {
                     text: _,
                     signature: _,
+                    summary: _,
                     provider_type,
                 }) => provider_type
                     .as_ref()
@@ -226,6 +244,7 @@ impl ModelConfig {
                             ContentBlock::Thought(Thought {
                                 text: _,
                                 signature: _,
+                                summary: _,
                                 provider_type,
                             }) => {
                                 // When a thought is scoped to a particular provider type, we discard
@@ -261,12 +280,12 @@ impl ModelConfig {
         &self,
         model_provider_request: ModelProviderRequest<'request>,
         provider: &'request ModelProvider,
-        clients: &'request InferenceClients<'request>,
+        clients: &InferenceClients,
     ) -> Result<ModelInferenceResponse, Error> {
         // TODO: think about how to best handle errors here
         if clients.cache_options.enabled.read() {
             let cache_lookup = cache_lookup(
-                clients.clickhouse_connection_info,
+                &clients.clickhouse_connection_info,
                 model_provider_request,
                 clients.cache_options.max_age_s,
             )
@@ -278,11 +297,7 @@ impl ModelConfig {
             }
         }
         let response = provider
-            .infer(
-                model_provider_request,
-                clients.http_client,
-                clients.credentials,
-            )
+            .infer(model_provider_request, clients)
             .instrument(span!(
                 Level::INFO,
                 "infer",
@@ -308,12 +323,12 @@ impl ModelConfig {
         &self,
         model_provider_request: ModelProviderRequest<'request>,
         provider: &'request ModelProvider,
-        clients: &'request InferenceClients<'request>,
+        clients: &InferenceClients,
     ) -> Result<StreamResponseAndMessages, Error> {
         // TODO: think about how to best handle errors here
         if clients.cache_options.enabled.read() {
             let cache_lookup = cache_lookup_streaming(
-                clients.clickhouse_connection_info,
+                &clients.clickhouse_connection_info,
                 model_provider_request,
                 clients.cache_options.max_age_s,
             )
@@ -331,34 +346,26 @@ impl ModelConfig {
         let StreamAndRawRequest {
             stream,
             raw_request,
+            ticket_borrow,
         } = provider
-            .infer_stream(
-                model_provider_request,
-                clients.http_client,
-                clients.credentials,
-            )
+            .infer_stream(model_provider_request, clients)
             .await?;
 
         // Note - we cache the chunks here so that we store the raw model provider input and response chunks
         // in the cache. We don't want this logic in `collect_chunks`, which would cause us to cache the result
         // of higher-level transformations (e.g. dicl)
-        let mut stream = if clients.cache_options.enabled.write() {
-            let span = stream.span().clone();
-            // Note - it's fine to call `stream_with_cache_write` inside of `streaming_provider_request`,
-            // as it doesn't immediately kick off a clickhouse cache write. The cache write only occurs
-            // when the stream finished, so the model provider TTFT timeout will (correctly) not include
-            // the time taken to write to clickhouse.
-            stream_with_cache_write(
-                raw_request.clone(),
-                model_provider_request,
-                clients,
-                stream.into_inner(),
-            )
-            .await?
-            .instrument(span)
-        } else {
-            stream
-        };
+        let write_to_cache = clients.cache_options.enabled.write();
+        let span = stream.span().clone();
+        let mut stream = wrap_provider_stream(
+            raw_request.clone(),
+            model_provider_request,
+            ticket_borrow,
+            clients,
+            stream,
+            write_to_cache,
+        )
+        .await?
+        .instrument(span);
         // Get a single chunk from the stream and make sure it is OK then send to client.
         // We want to do this here so that we can tell that the request is working.
         peek_first_chunk(
@@ -382,9 +389,12 @@ impl ModelConfig {
     pub async fn infer<'request>(
         &self,
         request: &'request ModelInferenceRequest<'request>,
-        clients: &'request InferenceClients<'request>,
+        clients: &InferenceClients,
         model_name: &'request str,
     ) -> Result<ModelInferenceResponse, Error> {
+        let span = tracing::Span::current();
+        clients.otlp_config.mark_openinference_chain_span(&span);
+
         let mut provider_errors: HashMap<String, Error> = HashMap::new();
         let run_all_models = async {
             for provider_name in &self.routing {
@@ -398,6 +408,7 @@ impl ModelConfig {
                     request: &request,
                     model_name,
                     provider_name,
+                    otlp_config: &clients.otlp_config,
                 };
                 let cache_key = model_provider_request.get_cache_key()?;
 
@@ -425,7 +436,7 @@ impl ModelConfig {
                         // (in case we ever add a blocking cache write option)
                         if !response.cached && clients.cache_options.enabled.write() {
                             let _ = start_cache_write(
-                                clients.clickhouse_connection_info,
+                                &clients.clickhouse_connection_info,
                                 cache_key,
                                 CacheData {
                                     output: NonStreamingCacheData {
@@ -483,9 +494,12 @@ impl ModelConfig {
     pub async fn infer_stream<'request>(
         &self,
         request: &'request ModelInferenceRequest<'request>,
-        clients: &'request InferenceClients<'request>,
+        clients: &InferenceClients,
         model_name: &'request str,
     ) -> Result<StreamResponseAndMessages, Error> {
+        clients
+            .otlp_config
+            .mark_openinference_chain_span(&tracing::Span::current());
         let mut provider_errors: HashMap<String, Error> = HashMap::new();
         let run_all_models = async {
             for provider_name in &self.routing {
@@ -499,6 +513,7 @@ impl ModelConfig {
                     request: &request,
                     model_name,
                     provider_name,
+                    otlp_config: &clients.otlp_config,
                 };
 
                 // This future includes a call to `peek_first_chunk`, so applying
@@ -589,12 +604,24 @@ impl ModelConfig {
     }
 }
 
-async fn stream_with_cache_write(
+/// Wraps a low-level model provider stream, adding in common functionality:
+/// * Model inference cache writes
+/// * OpenTelemetry usage attributes
+///
+/// This is used for functionality that needs access to individual chunks, which requires
+/// us to wrap the underlying stream.
+async fn wrap_provider_stream(
     raw_request: String,
     model_request: ModelProviderRequest<'_>,
-    clients: &InferenceClients<'_>,
-    mut stream: PeekableProviderInferenceResponseStream,
+    ticket_borrow: TicketBorrows,
+    clients: &InferenceClients,
+    stream: Instrumented<PeekableProviderInferenceResponseStream>,
+    write_to_cache: bool,
 ) -> Result<PeekableProviderInferenceResponseStream, Error> {
+    // Detach the span from the stream, and re-attach it to the 'async_stream::stream!' wrapper
+    // This ensures that the span duration include the entire provider-specific processing time
+    let span = stream.span().clone();
+    let mut stream = stream.into_inner();
     let cache_key = model_request.get_cache_key()?;
     let clickhouse_info = clients.clickhouse_connection_info.clone();
     let tool_config = model_request
@@ -602,11 +629,24 @@ async fn stream_with_cache_write(
         .tool_config
         .clone()
         .map(std::borrow::Cow::into_owned);
-    Ok((Box::pin(async_stream::stream! {
+    let otlp_config = clients.otlp_config.clone();
+    let postgres_connection_info = clients.postgres_connection_info.clone();
+    let deferred_tasks = clients.deferred_tasks.clone();
+    let base_stream = async_stream::stream! {
         let mut buffer = vec![];
         let mut errored = false;
+        let mut total_usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
         while let Some(chunk) = stream.next().await {
-            if !errored {
+            if let Ok(chunk) = chunk.as_ref() {
+                if let Some(chunk_usage) = &chunk.usage {
+                    total_usage = total_usage + *chunk_usage;
+                }
+            }
+            // We can skip cloning the chunk if we know we're not going to write to the cache
+            if write_to_cache && !errored {
                 match chunk.as_ref() {
                     Ok(chunk) => {
                         buffer.push(chunk.clone());
@@ -614,38 +654,71 @@ async fn stream_with_cache_write(
                     Err(e) => {
                         tracing::warn!("Skipping cache write for stream response due to error in stream: {e}");
                         errored = true;
+                        // If we see a `FatalStreamError`, then yield it and stop processing the stream,
+                        // to avoid holding open a stream that might never produce more chunks.
+                        // We'll still compute rate-limiting usage using all of the chunks that we've seen so far.
+                        if let ErrorDetails::FatalStreamError { .. } = e.get_details() {
+                            yield chunk;
+                            break;
+                        }
                     }
                 }
             }
             yield chunk;
         }
-        if !errored {
-            let usage = consolidate_usage(&buffer);
+        otlp_config.apply_usage_to_model_provider_span(&span, &total_usage);
+        // Make sure that we finish updating rate-limiting tickets if the gateway shuts down
+        deferred_tasks.spawn(async move {
+            let usage = if errored {
+                RateLimitResourceUsage::UnderEstimate {
+                    model_inferences: 1,
+                    tokens: total_usage.total_tokens() as u64,
+                }
+             } else {
+                RateLimitResourceUsage::Exact {
+                    model_inferences: 1,
+                    tokens: total_usage.total_tokens() as u64,
+                }
+            };
+
+            if let Err(e) = ticket_borrow
+                .return_tickets(&postgres_connection_info, usage)
+                .await
+            {
+                tracing::error!("Failed to return rate limit tickets: {}", e);
+            }
+        }.instrument(span));
+
+
+        if write_to_cache && !errored {
             let _ = start_cache_write_streaming(
                 &clickhouse_info,
                 cache_key,
                 buffer,
                 &raw_request,
-                &usage,
+                &total_usage,
                 tool_config
             );
         }
-    }) as ProviderInferenceResponseStreamInner).peekable())
-}
-
-fn consolidate_usage(chunks: &[ProviderInferenceResponseChunk]) -> Usage {
-    let mut input_tokens = 0;
-    let mut output_tokens = 0;
-    for chunk in chunks {
-        if let Some(usage) = &chunk.usage {
-            input_tokens += usage.input_tokens;
-            output_tokens += usage.output_tokens;
+    };
+    // We unconditionally create a stream, and forward items into it from a separate task
+    // This ensures that we keep processing chunks (and call `return_tickets` to update rate-limiting information)
+    // even if the top-level HTTP request is later dropped.
+    let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+    // Make sure that we finish processing the stream (so that we call `return_tickets` to update rate-limiting information)
+    // if the gateway shuts down.
+    clients.deferred_tasks.spawn(async move {
+        futures::pin_mut!(base_stream);
+        while let Some(chunk) = base_stream.next().await {
+            // Intentionally ignore errors - the receiver might be dropped, but we want to keep polling
+            // `base_stream` anyway (so that we compute the final usage and call `return_tickets`)
+            let _ = send.send(chunk);
         }
-    }
-    Usage {
-        input_tokens,
-        output_tokens,
-    }
+    });
+    Ok(
+        (UnboundedReceiverStream::new(recv).boxed() as ProviderInferenceResponseStreamInner)
+            .peekable(),
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -880,7 +953,9 @@ pub enum UninitializedProviderConfig {
     Anthropic {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_base: Option<Url>,
+        #[cfg_attr(test, ts(type = "string | null"))]
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     #[strum(serialize = "aws_bedrock")]
     #[serde(rename = "aws_bedrock")]
@@ -904,7 +979,7 @@ pub enum UninitializedProviderConfig {
         deployment_id: String,
         endpoint: EndpointLocation,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     #[strum(serialize = "gcp_vertex_anthropic")]
     #[serde(rename = "gcp_vertex_anthropic")]
@@ -913,7 +988,7 @@ pub enum UninitializedProviderConfig {
         location: String,
         project_id: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        credential_location: Option<CredentialLocation>,
+        credential_location: Option<CredentialLocationWithFallback>,
     },
     #[strum(serialize = "gcp_vertex_gemini")]
     #[serde(rename = "gcp_vertex_gemini")]
@@ -923,56 +998,62 @@ pub enum UninitializedProviderConfig {
         location: String,
         project_id: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        credential_location: Option<CredentialLocation>,
+        credential_location: Option<CredentialLocationWithFallback>,
     },
     #[strum(serialize = "google_ai_studio_gemini")]
     #[serde(rename = "google_ai_studio_gemini")]
     GoogleAIStudioGemini {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     #[strum(serialize = "groq")]
     #[serde(rename = "groq")]
     Groq {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     Hyperbolic {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     #[strum(serialize = "fireworks")]
     #[serde(rename = "fireworks")]
     Fireworks {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
         #[serde(default = "crate::providers::fireworks::default_parse_think_blocks")]
         parse_think_blocks: bool,
     },
     Mistral {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     OpenAI {
         model_name: String,
         api_base: Option<Url>,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
+        #[serde(default)]
+        api_type: OpenAIAPIType,
+        #[serde(default)]
+        include_encrypted_reasoning: bool,
+        #[serde(default)]
+        provider_tools: Vec<Value>,
     },
     OpenRouter {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     Together {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
         #[serde(default = "crate::providers::together::default_parse_think_blocks")]
         parse_think_blocks: bool,
     },
@@ -980,44 +1061,58 @@ pub enum UninitializedProviderConfig {
         model_name: String,
         api_base: Url,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     XAI {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     TGI {
         api_base: Url,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     SGLang {
         model_name: String,
         api_base: Url,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     DeepSeek {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
     #[cfg(any(test, feature = "e2e_tests"))]
     Dummy {
         model_name: String,
         #[cfg_attr(test, ts(type = "string | null"))]
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     },
 }
 
 impl UninitializedProviderConfig {
-    pub async fn load(self, provider_types: &ProviderTypesConfig) -> Result<ProviderConfig, Error> {
+    pub async fn load(
+        self,
+        provider_types: &ProviderTypesConfig,
+        provider_type_default_credentials: &ProviderTypeDefaultCredentials,
+    ) -> Result<ProviderConfig, Error> {
         Ok(match self {
             UninitializedProviderConfig::Anthropic {
                 model_name,
+                api_base,
                 api_key_location,
-            } => ProviderConfig::Anthropic(AnthropicProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::Anthropic(AnthropicProvider::new(
+                model_name,
+                api_base,
+                AnthropicKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::AWSBedrock {
                 model_id,
                 region,
@@ -1047,14 +1142,29 @@ impl UninitializedProviderConfig {
                         HostedProviderKind::OpenAI => Box::new(OpenAIProvider::new(
                             model_name,
                             None,
-                            Some(CredentialLocation::None),
-                        )?),
+
+                            OpenAIKind
+                                .get_defaulted_credential(
+                                    Some(&CredentialLocationWithFallback::Single(CredentialLocation::None)),
+                                    provider_type_default_credentials,
+                                )
+                                .await?,
+                            // TODO - decide how to expose the responses api for wrapped providers
+                            OpenAIAPIType::ChatCompletions,
+                            false,
+                            Vec::new(),
+                            )?),
                         HostedProviderKind::TGI => Box::new(TGIProvider::new(
                             Url::parse("http://tensorzero-unreachable-domain-please-file-a-bug-report.invalid").map_err(|e| {
                                 Error::new(ErrorDetails::InternalError { message: format!("Failed to parse fake TGI endpoint: `{e}`. This should never happen. Please file a bug report: https://github.com/tensorzero/tensorzero/issues/new") })
                             })?,
-                            Some(CredentialLocation::None),
-                        )?),
+                            TGIKind
+                                .get_defaulted_credential(
+                                    Some(&CredentialLocationWithFallback::Single(CredentialLocation::None)),
+                                    provider_type_default_credentials,
+                                )
+                                .await?,
+                        )),
                     };
 
                 ProviderConfig::AWSSagemaker(
@@ -1068,7 +1178,12 @@ impl UninitializedProviderConfig {
             } => ProviderConfig::Azure(AzureProvider::new(
                 deployment_id,
                 endpoint,
-                api_key_location,
+                AzureKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
             )?),
             UninitializedProviderConfig::Fireworks {
                 model_name,
@@ -1076,17 +1191,28 @@ impl UninitializedProviderConfig {
                 parse_think_blocks,
             } => ProviderConfig::Fireworks(FireworksProvider::new(
                 model_name,
-                api_key_location,
+                FireworksKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
                 parse_think_blocks,
-            )?),
+            )),
             UninitializedProviderConfig::GCPVertexAnthropic {
                 model_id,
                 location,
                 project_id,
                 credential_location: api_key_location,
             } => ProviderConfig::GCPVertexAnthropic(
-                GCPVertexAnthropicProvider::new(model_id, location, project_id, api_key_location)
-                    .await?,
+                GCPVertexAnthropicProvider::new(
+                    model_id,
+                    location,
+                    project_id,
+                    api_key_location,
+                    provider_type_default_credentials,
+                )
+                .await?,
             ),
             UninitializedProviderConfig::GCPVertexGemini {
                 model_id,
@@ -1102,6 +1228,7 @@ impl UninitializedProviderConfig {
                     project_id,
                     api_key_location,
                     provider_types,
+                    provider_type_default_credentials,
                 )
                 .await?,
             ),
@@ -1110,64 +1237,159 @@ impl UninitializedProviderConfig {
                 api_key_location,
             } => ProviderConfig::GoogleAIStudioGemini(GoogleAIStudioGeminiProvider::new(
                 model_name,
-                api_key_location,
+                GoogleAIStudioGeminiKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
             )?),
             UninitializedProviderConfig::Groq {
                 model_name,
                 api_key_location,
-            } => ProviderConfig::Groq(GroqProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::Groq(GroqProvider::new(
+                model_name,
+                GroqKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::Hyperbolic {
                 model_name,
                 api_key_location,
-            } => ProviderConfig::Hyperbolic(HyperbolicProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::Hyperbolic(HyperbolicProvider::new(
+                model_name,
+                HyperbolicKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::Mistral {
                 model_name,
                 api_key_location,
-            } => ProviderConfig::Mistral(MistralProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::Mistral(MistralProvider::new(
+                model_name,
+                MistralKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::OpenAI {
                 model_name,
                 api_base,
                 api_key_location,
-            } => {
-                ProviderConfig::OpenAI(OpenAIProvider::new(model_name, api_base, api_key_location)?)
-            }
+                api_type,
+                include_encrypted_reasoning,
+                provider_tools,
+            } => ProviderConfig::OpenAI(OpenAIProvider::new(
+                model_name,
+                api_base,
+                OpenAIKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+                api_type,
+                include_encrypted_reasoning,
+                provider_tools,
+            )?),
             UninitializedProviderConfig::OpenRouter {
                 model_name,
                 api_key_location,
-            } => ProviderConfig::OpenRouter(OpenRouterProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::OpenRouter(OpenRouterProvider::new(
+                model_name,
+                OpenRouterKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::Together {
                 model_name,
                 api_key_location,
                 parse_think_blocks,
             } => ProviderConfig::Together(TogetherProvider::new(
                 model_name,
-                api_key_location,
+                TogetherKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
                 parse_think_blocks,
-            )?),
+            )),
             UninitializedProviderConfig::VLLM {
                 model_name,
                 api_base,
                 api_key_location,
-            } => ProviderConfig::VLLM(VLLMProvider::new(model_name, api_base, api_key_location)?),
+            } => ProviderConfig::VLLM(VLLMProvider::new(
+                model_name,
+                api_base,
+                VLLMKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::XAI {
                 model_name,
                 api_key_location,
-            } => ProviderConfig::XAI(XAIProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::XAI(XAIProvider::new(
+                model_name,
+                XAIKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::SGLang {
                 model_name,
                 api_base,
                 api_key_location,
-            } => {
-                ProviderConfig::SGLang(SGLangProvider::new(model_name, api_base, api_key_location)?)
-            }
+            } => ProviderConfig::SGLang(SGLangProvider::new(
+                model_name,
+                api_base,
+                SGLangKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::TGI {
                 api_base,
                 api_key_location,
-            } => ProviderConfig::TGI(TGIProvider::new(api_base, api_key_location)?),
+            } => ProviderConfig::TGI(TGIProvider::new(
+                api_base,
+                TGIKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             UninitializedProviderConfig::DeepSeek {
                 model_name,
                 api_key_location,
-            } => ProviderConfig::DeepSeek(DeepSeekProvider::new(model_name, api_key_location)?),
+            } => ProviderConfig::DeepSeek(DeepSeekProvider::new(
+                model_name,
+                DeepSeekKind
+                    .get_defaulted_credential(
+                        api_key_location.as_ref(),
+                        provider_type_default_credentials,
+                    )
+                    .await?,
+            )),
             #[cfg(any(test, feature = "e2e_tests"))]
             UninitializedProviderConfig::Dummy {
                 model_name,
@@ -1180,6 +1402,7 @@ impl UninitializedProviderConfig {
 struct StreamAndRawRequest {
     stream: tracing_futures::Instrumented<PeekableProviderInferenceResponseStream>,
     raw_request: String,
+    ticket_borrow: TicketBorrows,
 }
 
 pub struct StreamResponseAndMessages {
@@ -1188,147 +1411,339 @@ pub struct StreamResponseAndMessages {
 }
 
 impl ModelProvider {
-    #[tracing::instrument(skip_all, fields(provider_name = &*self.name, otel.name = "model_provider_inference",
-        gen_ai.operation.name = "chat",
-        gen_ai.system = self.genai_system_name(),
-        gen_ai.request.model = self.genai_model_name(),
-    stream = false))]
-    async fn infer(
-        &self,
-        request: ModelProviderRequest<'_>,
-        client: &TensorzeroHttpClient,
-        api_keys: &InferenceCredentials,
-    ) -> Result<ProviderInferenceResponse, Error> {
-        match &self.config {
-            ProviderConfig::Anthropic(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::AWSBedrock(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::AWSSagemaker(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::Azure(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::Fireworks(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::GCPVertexAnthropic(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::GCPVertexGemini(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::Groq(provider) => provider.infer(request, client, api_keys, self).await,
-            ProviderConfig::GoogleAIStudioGemini(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::Hyperbolic(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::Mistral(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::OpenAI(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::OpenRouter(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::Together(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::SGLang(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            ProviderConfig::VLLM(provider) => provider.infer(request, client, api_keys, self).await,
-            ProviderConfig::XAI(provider) => provider.infer(request, client, api_keys, self).await,
-            ProviderConfig::TGI(provider) => provider.infer(request, client, api_keys, self).await,
-            ProviderConfig::DeepSeek(provider) => {
-                provider.infer(request, client, api_keys, self).await
-            }
-            #[cfg(any(test, feature = "e2e_tests"))]
-            ProviderConfig::Dummy(provider) => {
-                provider.infer(request, client, api_keys, self).await
+    fn apply_otlp_span_fields_input(&self, otlp_config: &OtlpConfig, span: &Span) {
+        if otlp_config.traces.enabled {
+            match otlp_config.traces.format {
+                OtlpTracesFormat::OpenTelemetry => {
+                    span.set_attribute("gen_ai.operation.name", "chat");
+                    span.set_attribute("gen_ai.system", self.genai_system_name());
+
+                    if let Some(model_name) = self.genai_model_name() {
+                        span.set_attribute("gen_ai.request.model", model_name.to_string());
+                    }
+                }
+                OtlpTracesFormat::OpenInference => {
+                    span.set_attribute("openinference.span.kind", "LLM");
+                    span.set_attribute("llm.system", self.genai_system_name());
+
+                    if let Some(model_name) = self.genai_model_name() {
+                        span.set_attribute("llm.model_name", model_name.to_string());
+                    }
+                }
             }
         }
     }
 
-    #[tracing::instrument(skip_all, fields(provider_name = &*self.name, otel.name = "model_provider_inference",
-        gen_ai.operation.name = "chat",
-        gen_ai.system = self.genai_system_name(),
-        gen_ai.request.model = self.genai_model_name(),
-        time_to_first_token,
-    stream = true))]
-    async fn infer_stream(
+    #[expect(clippy::unused_self)] // We'll need 'self' for other attributes
+    fn apply_otlp_span_fields_output(
+        &self,
+        otlp_config: &OtlpConfig,
+        span: &Span,
+        resp: &Result<ProviderInferenceResponse, Error>,
+    ) {
+        match resp {
+            Ok(response) => {
+                otlp_config.apply_usage_to_model_provider_span(span, &response.usage);
+                match otlp_config.traces.format {
+                    OtlpTracesFormat::OpenTelemetry => {}
+                    OtlpTracesFormat::OpenInference => {
+                        // If we ever add providers that don't use JSON, we'll need to update this.
+                        span.set_attribute("input.mime_type", "application/json");
+                        span.set_attribute("input.value", response.raw_request.clone());
+                        span.set_attribute("output.mime_type", "application/json");
+                        span.set_attribute("output.value", response.raw_response.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                // If an error occurs, try to extract the raw request/response to attach to the OpenTelemetry span
+                match e.get_details() {
+                    ErrorDetails::InferenceClient {
+                        raw_request,
+                        raw_response,
+                        ..
+                    }
+                    | ErrorDetails::InferenceServer {
+                        raw_request,
+                        raw_response,
+                        ..
+                    } => {
+                        match otlp_config.traces.format {
+                            OtlpTracesFormat::OpenTelemetry => {}
+                            OtlpTracesFormat::OpenInference => {
+                                // If we ever add providers that don't use JSON, we'll need to update this.
+                                if let Some(raw_request) = raw_request {
+                                    span.set_attribute("input.mime_type", "application/json");
+                                    span.set_attribute("input.value", raw_request.clone());
+                                }
+                                if let Some(raw_response) = raw_response {
+                                    span.set_attribute("output.mime_type", "application/json");
+                                    span.set_attribute("output.value", raw_response.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[tracing::instrument(skip_all, fields(provider_name = &*self.name, otel.name = "model_provider_inference", stream = false))]
+    async fn infer(
         &self,
         request: ModelProviderRequest<'_>,
-        client: &TensorzeroHttpClient,
-        api_keys: &InferenceCredentials,
-    ) -> Result<StreamAndRawRequest, Error> {
-        let (stream, raw_request) = match &self.config {
+        clients: &InferenceClients,
+    ) -> Result<ProviderInferenceResponse, Error> {
+        let span = Span::current();
+        self.apply_otlp_span_fields_input(request.otlp_config, &span);
+        let ticket_borrow = clients
+            .rate_limiting_config
+            .consume_tickets(
+                &clients.postgres_connection_info,
+                &clients.scope_info,
+                request.request,
+            )
+            .await?;
+        let res = match &self.config {
             ProviderConfig::Anthropic(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::AWSBedrock(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::AWSSagemaker(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::Azure(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::Fireworks(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::GCPVertexAnthropic(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::GCPVertexGemini(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
-            }
-            ProviderConfig::GoogleAIStudioGemini(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::Groq(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::GoogleAIStudioGemini(provider) => {
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::Hyperbolic(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::Mistral(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::OpenAI(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::OpenRouter(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::Together(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::SGLang(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
-            }
-            ProviderConfig::XAI(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::VLLM(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::XAI(provider) => {
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::TGI(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             ProviderConfig::DeepSeek(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
             #[cfg(any(test, feature = "e2e_tests"))]
             ProviderConfig::Dummy(provider) => {
-                provider.infer_stream(request, client, api_keys, self).await
+                provider
+                    .infer(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+        };
+        self.apply_otlp_span_fields_output(request.otlp_config, &span, &res);
+        let provider_inference_response = res?;
+        if let Ok(actual_resource_usage) = provider_inference_response.resource_usage() {
+            let postgres_connection_info = clients.postgres_connection_info.clone();
+            // Make sure that we finish updating rate-limiting tickets if the gateway shuts down
+            clients.deferred_tasks.spawn(
+                async move {
+                    if let Err(e) = ticket_borrow
+                        .return_tickets(&postgres_connection_info, actual_resource_usage)
+                        .await
+                    {
+                        tracing::error!("Failed to return rate limit tickets: {}", e);
+                    }
+                }
+                .instrument(span),
+            );
+        }
+        Ok(provider_inference_response)
+    }
+
+    #[tracing::instrument(skip_all, fields(provider_name = &*self.name, otel.name = "model_provider_inference", time_to_first_token, stream = true))]
+    async fn infer_stream(
+        &self,
+        request: ModelProviderRequest<'_>,
+        clients: &InferenceClients,
+    ) -> Result<StreamAndRawRequest, Error> {
+        self.apply_otlp_span_fields_input(request.otlp_config, &Span::current());
+        let ticket_borrow = clients
+            .rate_limiting_config
+            .consume_tickets(
+                &clients.postgres_connection_info,
+                &clients.scope_info,
+                request.request,
+            )
+            .await?;
+        let (stream, raw_request) = match &self.config {
+            ProviderConfig::Anthropic(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::AWSBedrock(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::AWSSagemaker(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::Azure(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::Fireworks(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::GCPVertexAnthropic(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::GCPVertexGemini(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::GoogleAIStudioGemini(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::Groq(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::Hyperbolic(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::Mistral(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::OpenAI(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::OpenRouter(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::Together(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::SGLang(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::XAI(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::VLLM(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::TGI(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            ProviderConfig::DeepSeek(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
+            }
+            #[cfg(any(test, feature = "e2e_tests"))]
+            ProviderConfig::Dummy(provider) => {
+                provider
+                    .infer_stream(request, &clients.http_client, &clients.credentials, self)
+                    .await
             }
         }?;
 
@@ -1339,6 +1754,7 @@ impl ModelProvider {
         Ok(StreamAndRawRequest {
             stream: stream.instrument(Span::current()),
             raw_request,
+            ticket_borrow,
         })
     }
 
@@ -1580,6 +1996,37 @@ pub enum CredentialLocation {
     None,
 }
 
+/// Credential location with optional fallback support
+#[derive(Debug, PartialEq, Clone, Serialize)]
+#[serde(untagged)]
+pub enum CredentialLocationWithFallback {
+    /// Single credential location (backward compatible)
+    Single(CredentialLocation),
+    /// Credential location with fallback
+    WithFallback {
+        default: CredentialLocation,
+        fallback: CredentialLocation,
+    },
+}
+
+impl CredentialLocationWithFallback {
+    /// Get the default (primary) credential location
+    pub fn default_location(&self) -> &CredentialLocation {
+        match self {
+            CredentialLocationWithFallback::Single(loc) => loc,
+            CredentialLocationWithFallback::WithFallback { default, .. } => default,
+        }
+    }
+
+    /// Get the fallback credential location if present
+    pub fn fallback_location(&self) -> Option<&CredentialLocation> {
+        match self {
+            CredentialLocationWithFallback::Single(_) => None,
+            CredentialLocationWithFallback::WithFallback { fallback, .. } => Some(fallback),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export))]
@@ -1666,7 +2113,78 @@ impl Serialize for CredentialLocation {
     }
 }
 
-#[derive(Clone)]
+impl<'de> Deserialize<'de> for CredentialLocationWithFallback {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        struct CredentialLocationWithFallbackVisitor;
+
+        impl<'de> Visitor<'de> for CredentialLocationWithFallbackVisitor {
+            type Value = CredentialLocationWithFallback;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string or an object with 'default' and 'fallback' fields")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: Error,
+            {
+                // Parse as single CredentialLocation
+                let location =
+                    CredentialLocation::deserialize(serde::de::value::StrDeserializer::new(value))?;
+                Ok(CredentialLocationWithFallback::Single(location))
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut default = None;
+                let mut fallback = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "default" => {
+                            if default.is_some() {
+                                return Err(Error::duplicate_field("default"));
+                            }
+                            let value: String = map.next_value()?;
+                            default = Some(CredentialLocation::deserialize(
+                                serde::de::value::StrDeserializer::new(&value),
+                            )?);
+                        }
+                        "fallback" => {
+                            if fallback.is_some() {
+                                return Err(Error::duplicate_field("fallback"));
+                            }
+                            let value: String = map.next_value()?;
+                            fallback = Some(CredentialLocation::deserialize(
+                                serde::de::value::StrDeserializer::new(&value),
+                            )?);
+                        }
+                        _ => {
+                            return Err(Error::unknown_field(&key, &["default", "fallback"]));
+                        }
+                    }
+                }
+
+                let default = default.ok_or_else(|| Error::missing_field("default"))?;
+                let fallback = fallback.ok_or_else(|| Error::missing_field("fallback"))?;
+
+                Ok(CredentialLocationWithFallback::WithFallback { default, fallback })
+            }
+        }
+
+        deserializer.deserialize_any(CredentialLocationWithFallbackVisitor)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum Credential {
     Static(SecretString),
     FileContents(SecretString),
@@ -1674,164 +2192,10 @@ pub enum Credential {
     Sdk,
     None,
     Missing,
-}
-
-/// Builds a credential type from the provided `CredentialLocation` and default location.
-/// This is a convenience function that calls `get_creds_with_cache_and_fn` using
-/// the `TryFrom<Credential>` implementation for `T`.
-///
-/// Most providers should be able to use this function to build their credentials,
-/// unless they have special requirements (e.g. calling an `async fn`)
-pub fn build_creds_caching_default<T: Clone + TryFrom<Credential, Error = Error>>(
-    location: Option<CredentialLocation>,
-    default_location: CredentialLocation,
-    provider_type: &str,
-    cache: &OnceLock<T>,
-) -> Result<T, Error> {
-    build_creds_caching_default_with_fn(location, default_location, provider_type, cache, |creds| {
-        T::try_from(creds)
-    })
-}
-
-/// Builds a credential type from the provided `CredentialLocation` and default location.
-/// If the location is `None`, we'll use the provided `OnceLock` to cache the result
-/// of `f(default_location)`.
-/// Otherwise, we'll call `f(location)` without caching the result.
-///
-/// **NOTE** - `f` may be run multiple times in parallel even when `default_location` is used,
-/// due to a limitation of the current `OnceLock` api.
-pub fn build_creds_caching_default_with_fn<T: Clone, F: FnOnce(Credential) -> Result<T, Error>>(
-    location: Option<CredentialLocation>,
-    default_location: CredentialLocation,
-    provider_type: &str,
-    cache: &OnceLock<T>,
-    f: F,
-) -> Result<T, Error> {
-    let make_creds = |location| {
-        let creds = Credential::try_from((location, provider_type))?;
-        let provider_creds = f(creds)?;
-        Ok(provider_creds)
-    };
-    if let Some(location) = location {
-        make_creds(location)
-    } else {
-        racy_get_or_try_init(cache, || make_creds(default_location))
-    }
-}
-
-/// Gets the value from a `OnceLock` or initializes it with the result of `f`
-/// If this is called simultaneously from multiple threads, it may call `f` multiple times
-/// If `f` returns an error, the `OnceLock` will remain uninitialized
-fn racy_get_or_try_init<T: Clone, E>(
-    once_lock: &OnceLock<T>,
-    f: impl FnOnce() -> Result<T, E>,
-) -> Result<T, E> {
-    if let Some(val) = once_lock.get() {
-        Ok(val.clone())
-    } else {
-        let val = f()?;
-        // We don't care if the value was est
-        let _ = once_lock.set(val.clone());
-        Ok(val)
-    }
-}
-
-impl TryFrom<(CredentialLocation, &str)> for Credential {
-    type Error = Error;
-
-    fn try_from(
-        (location, provider_type): (CredentialLocation, &str),
-    ) -> Result<Self, Self::Error> {
-        match location {
-            CredentialLocation::Env(key_name) => match env::var(&key_name) {
-                Ok(value) => Ok(Credential::Static(SecretString::from(value))),
-                Err(_) => {
-                    if skip_credential_validation() {
-                        #[cfg(any(test, feature = "e2e_tests"))]
-                        {
-                            tracing::warn!(
-                                "You are missing the credentials required for a model provider of type {provider_type} (environment variable `{key_name}` is unset), so the associated tests will likely fail.",
-                            );
-                        }
-                        Ok(Credential::Missing)
-                    } else {
-                        Err(Error::new(ErrorDetails::ApiKeyMissing {
-                            provider_name: provider_type.to_string(),
-                            message: format!("Environment variable `{key_name}` is missing"),
-                        }))
-                    }
-                }
-            },
-            CredentialLocation::PathFromEnv(env_key) => {
-                // First get the path from environment variable
-                let path = match env::var(&env_key) {
-                    Ok(path) => path,
-                    Err(_) => {
-                        if skip_credential_validation() {
-                            #[cfg(any(test, feature = "e2e_tests"))]
-                            {
-                                tracing::warn!(
-                                "Environment variable {} is required for a model provider of type {} but is missing, so the associated tests will likely fail.",
-                                env_key, provider_type
-
-                            );
-                            }
-                            return Ok(Credential::Missing);
-                        } else {
-                            return Err(Error::new(ErrorDetails::ApiKeyMissing {
-                                provider_name: provider_type.to_string(),
-                                message: format!("Environment variable `{env_key}` for credentials path is missing"),
-                            }));
-                        }
-                    }
-                };
-                // Then read the file contents
-                match fs::read_to_string(path) {
-                    Ok(contents) => Ok(Credential::FileContents(SecretString::from(contents))),
-                    Err(e) => {
-                        if skip_credential_validation() {
-                            #[cfg(any(test, feature = "e2e_tests"))]
-                            {
-                                tracing::warn!(
-                                "Failed to read credentials file for a model provider of type {}, so the associated tests will likely fail: {}",
-                                provider_type, e
-                            );
-                            }
-                            Ok(Credential::Missing)
-                        } else {
-                            Err(Error::new(ErrorDetails::ApiKeyMissing {
-                                provider_name: provider_type.to_string(),
-                                message: format!("Failed to read credentials file - {e}"),
-                            }))
-                        }
-                    }
-                }
-            }
-            CredentialLocation::Path(path) => match fs::read_to_string(path) {
-                Ok(contents) => Ok(Credential::FileContents(SecretString::from(contents))),
-                Err(e) => {
-                    if skip_credential_validation() {
-                        #[cfg(any(test, feature = "e2e_tests"))]
-                        {
-                            tracing::warn!(
-                                "Failed to read credentials file for a model provider of type {}, so the associated tests will likely fail: {}",
-                            provider_type, e
-                        );
-                        }
-                        Ok(Credential::Missing)
-                    } else {
-                        Err(Error::new(ErrorDetails::ApiKeyMissing {
-                            provider_name: provider_type.to_string(),
-                            message: format!("Failed to read credentials file - {e}"),
-                        }))
-                    }
-                }
-            },
-            CredentialLocation::Dynamic(key_name) => Ok(Credential::Dynamic(key_name.clone())),
-            CredentialLocation::Sdk => Ok(Credential::Sdk),
-            CredentialLocation::None => Ok(Credential::None),
-        }
-    }
+    WithFallback {
+        default: Box<Credential>,
+        fallback: Box<Credential>,
+    },
 }
 
 const SHORTHAND_MODEL_PREFIXES: &[&str] = &[
@@ -1856,36 +2220,109 @@ pub type ModelTable = BaseModelTable<ModelConfig>;
 impl ShorthandModelConfig for ModelConfig {
     const SHORTHAND_MODEL_PREFIXES: &[&str] = SHORTHAND_MODEL_PREFIXES;
     const MODEL_TYPE: &str = "Model";
-    async fn from_shorthand(provider_type: &str, model_name: &str) -> Result<Self, Error> {
+    async fn from_shorthand(
+        provider_type: &str,
+        model_name: &str,
+        default_credentials: &ProviderTypeDefaultCredentials,
+    ) -> Result<Self, Error> {
         let model_name = model_name.to_string();
         let provider_config = match provider_type {
-            "anthropic" => ProviderConfig::Anthropic(AnthropicProvider::new(model_name, None)?),
-            "deepseek" => ProviderConfig::DeepSeek(DeepSeekProvider::new(model_name, None)?),
+            "anthropic" => ProviderConfig::Anthropic(AnthropicProvider::new(
+                model_name,
+                None,
+                AnthropicKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
+            "deepseek" => ProviderConfig::DeepSeek(DeepSeekProvider::new(
+                model_name,
+                DeepSeekKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
             "fireworks" => ProviderConfig::Fireworks(FireworksProvider::new(
                 model_name,
-                None,
+                FireworksKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
                 crate::providers::fireworks::default_parse_think_blocks(),
-            )?),
-            "google_ai_studio_gemini" => ProviderConfig::GoogleAIStudioGemini(
-                GoogleAIStudioGeminiProvider::new(model_name, None)?,
-            ),
+            )),
+            "google_ai_studio_gemini" => {
+                ProviderConfig::GoogleAIStudioGemini(GoogleAIStudioGeminiProvider::new(
+                    model_name,
+                    GoogleAIStudioGeminiKind
+                        .get_defaulted_credential(None, default_credentials)
+                        .await?,
+                )?)
+            }
             "gcp_vertex_gemini" => ProviderConfig::GCPVertexGemini(
-                GCPVertexGeminiProvider::new_shorthand(model_name).await?,
+                GCPVertexGeminiProvider::new_shorthand(model_name, default_credentials).await?,
             ),
             "gcp_vertex_anthropic" => ProviderConfig::GCPVertexAnthropic(
-                GCPVertexAnthropicProvider::new_shorthand(model_name).await?,
+                GCPVertexAnthropicProvider::new_shorthand(model_name, default_credentials).await?,
             ),
-            "groq" => ProviderConfig::Groq(GroqProvider::new(model_name, None)?),
-            "hyperbolic" => ProviderConfig::Hyperbolic(HyperbolicProvider::new(model_name, None)?),
-            "mistral" => ProviderConfig::Mistral(MistralProvider::new(model_name, None)?),
-            "openai" => ProviderConfig::OpenAI(OpenAIProvider::new(model_name, None, None)?),
-            "openrouter" => ProviderConfig::OpenRouter(OpenRouterProvider::new(model_name, None)?),
+            "groq" => ProviderConfig::Groq(GroqProvider::new(
+                model_name,
+                GroqKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
+            "hyperbolic" => ProviderConfig::Hyperbolic(HyperbolicProvider::new(
+                model_name,
+                HyperbolicKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
+            "mistral" => ProviderConfig::Mistral(MistralProvider::new(
+                model_name,
+                MistralKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
+            "openai" => {
+                if let Some(stripped_model_name) = model_name.strip_prefix("responses::") {
+                    ProviderConfig::OpenAI(OpenAIProvider::new(
+                        stripped_model_name.to_string(),
+                        None,
+                        OpenAIKind
+                            .get_defaulted_credential(None, default_credentials)
+                            .await?,
+                        OpenAIAPIType::Responses,
+                        false,
+                        Vec::new(),
+                    )?)
+                } else {
+                    ProviderConfig::OpenAI(OpenAIProvider::new(
+                        model_name,
+                        None,
+                        OpenAIKind
+                            .get_defaulted_credential(None, default_credentials)
+                            .await?,
+                        OpenAIAPIType::ChatCompletions,
+                        false,
+                        Vec::new(),
+                    )?)
+                }
+            }
+            "openrouter" => ProviderConfig::OpenRouter(OpenRouterProvider::new(
+                model_name,
+                OpenRouterKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
             "together" => ProviderConfig::Together(TogetherProvider::new(
                 model_name,
-                None,
+                TogetherKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
                 crate::providers::together::default_parse_think_blocks(),
-            )?),
-            "xai" => ProviderConfig::XAI(XAIProvider::new(model_name, None)?),
+            )),
+            "xai" => ProviderConfig::XAI(XAIProvider::new(
+                model_name,
+                XAIKind
+                    .get_defaulted_credential(None, default_credentials)
+                    .await?,
+            )),
             #[cfg(any(test, feature = "e2e_tests"))]
             "dummy" => ProviderConfig::Dummy(DummyProvider::new(model_name, None)?),
             _ => {
@@ -1964,22 +2401,25 @@ impl ShorthandModelConfig for ModelConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, cell::Cell};
+    use std::borrow::Cow;
 
     use crate::cache::CacheEnabledMode;
     use crate::config::SKIP_CREDENTIAL_VALIDATION;
-    use crate::tool::{ToolCallConfig, ToolChoice};
+    use crate::rate_limiting::ScopeInfo;
+    use crate::tool::ToolCallConfig;
     use crate::{
         cache::CacheOptions,
-        db::clickhouse::ClickHouseConnectionInfo,
+        db::{clickhouse::ClickHouseConnectionInfo, postgres::PostgresConnectionInfo},
         inference::types::{
             ContentBlockChunk, FunctionType, ModelInferenceRequestJsonMode, TextChunk,
         },
         model_table::RESERVED_MODEL_PREFIXES,
+        providers::anthropic::AnthropicCredentials,
         providers::dummy::{
             DummyCredentials, DUMMY_INFER_RESPONSE_CONTENT, DUMMY_INFER_RESPONSE_RAW,
             DUMMY_STREAMING_RESPONSE,
         },
+        rate_limiting::{RateLimitingConfig, UninitializedRateLimitingConfig},
     };
     use secrecy::SecretString;
     use tokio_stream::StreamExt;
@@ -2013,21 +2453,25 @@ mod tests {
             )]),
             timeouts: Default::default(),
         };
-        let tool_config = ToolCallConfig {
-            tools_available: vec![],
-            tool_choice: ToolChoice::Auto,
-            parallel_tool_calls: None,
-        };
+        let tool_config = ToolCallConfig::with_tools_available(vec![], vec![]);
         let api_keys = InferenceCredentials::default();
         let http_client = TensorzeroHttpClient::new().unwrap();
-        let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
+        let clickhouse_connection_info = ClickHouseConnectionInfo::new_disabled();
         let clients = InferenceClients {
-            http_client: &http_client,
-            clickhouse_connection_info: &clickhouse_connection_info,
-            credentials: &api_keys,
-            cache_options: &CacheOptions {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: PostgresConnectionInfo::Disabled,
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(Default::default()),
+            rate_limiting_config: Arc::new(Default::default()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(HashMap::new()),
             },
         };
 
@@ -2114,6 +2558,106 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
+    async fn test_model_provider_infer_max_tokens_check() {
+        let provider = ModelProvider {
+            name: "test_provider".into(),
+            config: ProviderConfig::Dummy(DummyProvider {
+                model_name: "good".into(),
+                credentials: DummyCredentials::None,
+            }),
+            extra_body: Default::default(),
+            extra_headers: Default::default(),
+            timeouts: Default::default(),
+            discard_unknown_chunks: false,
+        };
+
+        let http_client = TensorzeroHttpClient::new().unwrap();
+        let clickhouse_connection_info = ClickHouseConnectionInfo::new_disabled();
+        let postgres_mock = PostgresConnectionInfo::Disabled;
+        let api_keys = InferenceCredentials::default();
+        let tags = HashMap::new();
+
+        // With token rate limiting enabled and no max_tokens
+        let toml_str = r"
+            [[rules]]
+            tokens_per_second = 10
+            always = true
+        ";
+        let uninitialized_config: UninitializedRateLimitingConfig =
+            toml::from_str(toml_str).unwrap();
+        let rate_limit_config: RateLimitingConfig = uninitialized_config.try_into().unwrap();
+
+        let clients = InferenceClients {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: postgres_mock.clone(),
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
+                max_age_s: None,
+                enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(tags.clone()),
+            rate_limiting_config: Arc::new(rate_limit_config.clone()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(tags.clone()),
+            },
+        };
+
+        let request_no_max_tokens = ModelInferenceRequest {
+            inference_id: Uuid::now_v7(),
+            messages: vec![],
+            system: None,
+            tool_config: None,
+            temperature: None,
+            max_tokens: None, // No max_tokens!
+            ..Default::default()
+        };
+
+        let provider_request = ModelProviderRequest {
+            request: &request_no_max_tokens,
+            model_name: "test",
+            provider_name: "test_provider",
+            otlp_config: &Default::default(),
+        };
+
+        // Should fail with RateLimitMissingMaxTokens
+        let result = provider.infer(provider_request, &clients).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            Error::new(ErrorDetails::RateLimitMissingMaxTokens)
+        );
+
+        // With token rate limiting enabled and max_tokens provided
+        let request_with_max_tokens = ModelInferenceRequest {
+            inference_id: Uuid::now_v7(),
+            messages: vec![],
+            system: None,
+            tool_config: None,
+            temperature: None,
+            max_tokens: Some(100), // max_tokens provided
+            ..Default::default()
+        };
+
+        // This should error because postgres is disabled, but it should not be the RateLimitMissingMaxTokens error
+        let provider_request = ModelProviderRequest {
+            request: &request_with_max_tokens,
+            model_name: "test",
+            provider_name: "test_provider",
+            otlp_config: &Default::default(),
+        };
+
+        let result = provider
+            .infer(provider_request, &clients)
+            .await
+            .unwrap_err();
+        assert_ne!(result, Error::new(ErrorDetails::RateLimitMissingMaxTokens));
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn test_model_config_infer_routing_fallback() {
         // Test that fallback works with bad --> good model provider
 
@@ -2127,14 +2671,22 @@ mod tests {
         });
         let api_keys = InferenceCredentials::default();
         let http_client = TensorzeroHttpClient::new().unwrap();
-        let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
+        let clickhouse_connection_info = ClickHouseConnectionInfo::new_disabled();
         let clients = InferenceClients {
-            http_client: &http_client,
-            clickhouse_connection_info: &clickhouse_connection_info,
-            credentials: &api_keys,
-            cache_options: &CacheOptions {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: PostgresConnectionInfo::Disabled,
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(Default::default()),
+            rate_limiting_config: Arc::new(Default::default()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(HashMap::new()),
             },
         };
         // Try inferring the good model only
@@ -2275,12 +2827,20 @@ mod tests {
             .infer_stream(
                 &request,
                 &InferenceClients {
-                    http_client: &TensorzeroHttpClient::new().unwrap(),
-                    clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
-                    credentials: &api_keys,
-                    cache_options: &CacheOptions {
+                    http_client: TensorzeroHttpClient::new().unwrap(),
+                    clickhouse_connection_info: ClickHouseConnectionInfo::new_disabled(),
+                    postgres_connection_info: PostgresConnectionInfo::Disabled,
+                    credentials: Arc::new(api_keys.clone()),
+                    cache_options: CacheOptions {
                         max_age_s: None,
                         enabled: CacheEnabledMode::Off,
+                    },
+                    tags: Arc::new(Default::default()),
+                    rate_limiting_config: Arc::new(Default::default()),
+                    otlp_config: Default::default(),
+                    deferred_tasks: tokio_util::task::TaskTracker::new(),
+                    scope_info: ScopeInfo {
+                        tags: Arc::new(HashMap::new()),
                     },
                 },
                 "my_model",
@@ -2339,12 +2899,20 @@ mod tests {
             .infer_stream(
                 &request,
                 &InferenceClients {
-                    http_client: &TensorzeroHttpClient::new().unwrap(),
-                    clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
-                    credentials: &api_keys,
-                    cache_options: &CacheOptions {
+                    http_client: TensorzeroHttpClient::new().unwrap(),
+                    clickhouse_connection_info: ClickHouseConnectionInfo::new_disabled(),
+                    postgres_connection_info: PostgresConnectionInfo::Disabled,
+                    credentials: Arc::new(api_keys.clone()),
+                    cache_options: CacheOptions {
                         max_age_s: None,
                         enabled: CacheEnabledMode::Off,
+                    },
+                    tags: Arc::new(Default::default()),
+                    rate_limiting_config: Arc::new(Default::default()),
+                    otlp_config: Default::default(),
+                    deferred_tasks: tokio_util::task::TaskTracker::new(),
+                    scope_info: ScopeInfo {
+                        tags: Arc::new(HashMap::new()),
                     },
                 },
                 "my_model",
@@ -2450,12 +3018,20 @@ mod tests {
             .infer_stream(
                 &request,
                 &InferenceClients {
-                    http_client: &TensorzeroHttpClient::new().unwrap(),
-                    clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
-                    credentials: &api_keys,
-                    cache_options: &CacheOptions {
+                    http_client: TensorzeroHttpClient::new().unwrap(),
+                    clickhouse_connection_info: ClickHouseConnectionInfo::new_disabled(),
+                    postgres_connection_info: PostgresConnectionInfo::Disabled,
+                    credentials: Arc::new(api_keys.clone()),
+                    cache_options: CacheOptions {
                         max_age_s: None,
                         enabled: CacheEnabledMode::Off,
+                    },
+                    tags: Arc::new(Default::default()),
+                    rate_limiting_config: Arc::new(Default::default()),
+                    otlp_config: Default::default(),
+                    deferred_tasks: tokio_util::task::TaskTracker::new(),
+                    scope_info: ScopeInfo {
+                        tags: Arc::new(HashMap::new()),
                     },
                 },
                 "my_model",
@@ -2518,21 +3094,25 @@ mod tests {
             )]),
             timeouts: Default::default(),
         };
-        let tool_config = ToolCallConfig {
-            tools_available: vec![],
-            tool_choice: ToolChoice::Auto,
-            parallel_tool_calls: None,
-        };
+        let tool_config = ToolCallConfig::with_tools_available(vec![], vec![]);
         let api_keys = InferenceCredentials::default();
         let http_client = TensorzeroHttpClient::new().unwrap();
-        let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
+        let clickhouse_connection_info = ClickHouseConnectionInfo::new_disabled();
         let clients = InferenceClients {
-            http_client: &http_client,
-            clickhouse_connection_info: &clickhouse_connection_info,
-            credentials: &api_keys,
-            cache_options: &CacheOptions {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: PostgresConnectionInfo::Disabled,
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(Default::default()),
+            rate_limiting_config: Arc::new(Default::default()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(HashMap::new()),
             },
         };
 
@@ -2579,12 +3159,20 @@ mod tests {
             SecretString::from("notgoodkey".to_string()),
         )]);
         let clients = InferenceClients {
-            http_client: &http_client,
-            clickhouse_connection_info: &clickhouse_connection_info,
-            credentials: &api_keys,
-            cache_options: &CacheOptions {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: PostgresConnectionInfo::Disabled,
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(Default::default()),
+            rate_limiting_config: Arc::new(Default::default()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(HashMap::new()),
             },
         };
         let response = model_config
@@ -2628,21 +3216,25 @@ mod tests {
             )]),
             timeouts: Default::default(),
         };
-        let tool_config = ToolCallConfig {
-            tools_available: vec![],
-            tool_choice: ToolChoice::Auto,
-            parallel_tool_calls: None,
-        };
+        let tool_config = ToolCallConfig::with_tools_available(vec![], vec![]);
         let api_keys = InferenceCredentials::default();
         let http_client = TensorzeroHttpClient::new().unwrap();
-        let clickhouse_connection_info = ClickHouseConnectionInfo::Disabled;
+        let clickhouse_connection_info = ClickHouseConnectionInfo::new_disabled();
         let clients = InferenceClients {
-            http_client: &http_client,
-            clickhouse_connection_info: &clickhouse_connection_info,
-            credentials: &api_keys,
-            cache_options: &CacheOptions {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: PostgresConnectionInfo::Disabled,
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(Default::default()),
+            rate_limiting_config: Arc::new(Default::default()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(HashMap::new()),
             },
         };
 
@@ -2688,12 +3280,20 @@ mod tests {
             SecretString::from("good_key".to_string()),
         )]);
         let clients = InferenceClients {
-            http_client: &http_client,
-            clickhouse_connection_info: &clickhouse_connection_info,
-            credentials: &api_keys,
-            cache_options: &CacheOptions {
+            http_client: http_client.clone(),
+            clickhouse_connection_info: clickhouse_connection_info.clone(),
+            postgres_connection_info: PostgresConnectionInfo::Disabled,
+            credentials: Arc::new(api_keys.clone()),
+            cache_options: CacheOptions {
                 max_age_s: None,
                 enabled: CacheEnabledMode::WriteOnly,
+            },
+            tags: Arc::new(Default::default()),
+            rate_limiting_config: Arc::new(Default::default()),
+            otlp_config: Default::default(),
+            deferred_tasks: tokio_util::task::TaskTracker::new(),
+            scope_info: ScopeInfo {
+                tags: Arc::new(HashMap::new()),
             },
         };
         let response = model_config
@@ -2737,7 +3337,11 @@ mod tests {
         );
         // Test that it works with an initialized model
         let anthropic_provider_config = SKIP_CREDENTIAL_VALIDATION.sync_scope((), || {
-            ProviderConfig::Anthropic(AnthropicProvider::new("claude".to_string(), None).unwrap())
+            ProviderConfig::Anthropic(AnthropicProvider::new(
+                "claude".to_string(),
+                None,
+                AnthropicCredentials::None,
+            ))
         });
         let anthropic_model_config = ModelConfig {
             routing: vec!["anthropic".into()],
@@ -2754,9 +3358,12 @@ mod tests {
             )]),
             timeouts: Default::default(),
         };
-        let model_table: ModelTable = HashMap::from([("claude".into(), anthropic_model_config)])
-            .try_into()
-            .unwrap();
+        let provider_types = ProviderTypesConfig::default();
+        let model_table: ModelTable = ModelTable::new(
+            HashMap::from([("claude".into(), anthropic_model_config)]),
+            ProviderTypeDefaultCredentials::new(&provider_types).into(),
+        )
+        .unwrap();
 
         model_table.validate("dummy::claude").unwrap();
     }
@@ -2772,80 +3379,204 @@ mod tests {
     }
 
     #[test]
-    fn test_racy_get_or_try_init() {
-        let lock: OnceLock<bool> = OnceLock::new();
-
-        // If the closure returns an error, `racy_get_or_try_init` should return an error
-        racy_get_or_try_init(&lock, || {
-            Err::<_, Box<dyn std::error::Error>>("Test error".into())
-        })
-        .expect_err("Test error");
-        assert!(
-            lock.get().is_none(),
-            "OnceLock was initialized after an error"
-        );
-
-        racy_get_or_try_init(&lock, || Ok::<_, Box<dyn std::error::Error>>(true))
-            .expect("racy_get_or_try_init should succeed with successful closure");
-
-        assert_eq!(lock.get(), Some(&true));
+    fn test_credential_location_with_fallback_serialize_single() {
+        // Test serializing a Single variant (backward compatible)
+        let single =
+            CredentialLocationWithFallback::Single(CredentialLocation::Env("API_KEY".to_string()));
+        let json = serde_json::to_string(&single).unwrap();
+        assert_eq!(json, r#""env::API_KEY""#);
     }
 
     #[test]
-    fn test_cache_default_creds() {
-        let make_creds_call_count = Cell::new(0);
-        let make_creds = |_| {
-            make_creds_call_count.set(make_creds_call_count.get() + 1);
-            Ok(())
+    fn test_credential_location_with_fallback_serialize_with_fallback() {
+        // Test serializing a WithFallback variant
+        let with_fallback = CredentialLocationWithFallback::WithFallback {
+            default: CredentialLocation::Dynamic("key1".to_string()),
+            fallback: CredentialLocation::Env("FALLBACK_KEY".to_string()),
         };
-
-        let cache = OnceLock::new();
-
-        build_creds_caching_default_with_fn(
-            None,
-            CredentialLocation::None,
-            "test",
-            &cache,
-            make_creds,
-        )
-        .expect("Failed to build creds");
-        // The first call should initialize the OnceLock, and call `make_creds`
-        assert_eq!(make_creds_call_count.get(), 1);
-        assert_eq!(cache.get(), Some(&()));
-
-        // Subsequent calls should not call `make_creds`
-        build_creds_caching_default_with_fn(
-            None,
-            CredentialLocation::None,
-            "test",
-            &cache,
-            make_creds,
-        )
-        .expect("Failed to build creds");
-        assert_eq!(make_creds_call_count.get(), 1);
+        let json = serde_json::to_string(&with_fallback).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["default"], "dynamic::key1");
+        assert_eq!(parsed["fallback"], "env::FALLBACK_KEY");
     }
 
     #[test]
-    fn test_dont_cache_non_default_creds() {
-        let make_creds_call_count = Cell::new(0);
-        let make_creds = |_| {
-            make_creds_call_count.set(make_creds_call_count.get() + 1);
-            Ok(())
+    fn test_credential_location_with_fallback_deserialize_single_string() {
+        // Test deserializing from a simple string (backward compatible)
+        let json = r#""env::API_KEY""#;
+        let result: CredentialLocationWithFallback = serde_json::from_str(json).unwrap();
+        match result {
+            CredentialLocationWithFallback::Single(CredentialLocation::Env(key)) => {
+                assert_eq!(key, "API_KEY");
+            }
+            _ => panic!("Expected Single(Env)"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_dynamic_string() {
+        // Test deserializing a dynamic credential from a string
+        let json = r#""dynamic::my_key""#;
+        let result: CredentialLocationWithFallback = serde_json::from_str(json).unwrap();
+        match result {
+            CredentialLocationWithFallback::Single(CredentialLocation::Dynamic(key)) => {
+                assert_eq!(key, "my_key");
+            }
+            _ => panic!("Expected Single(Dynamic)"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_with_fallback() {
+        // Test deserializing an object with default and fallback fields
+        let json = r#"{"default":"dynamic::key1","fallback":"env::FALLBACK_KEY"}"#;
+        let result: CredentialLocationWithFallback = serde_json::from_str(json).unwrap();
+        match result {
+            CredentialLocationWithFallback::WithFallback { default, fallback } => {
+                match default {
+                    CredentialLocation::Dynamic(key) => assert_eq!(key, "key1"),
+                    _ => panic!("Expected Dynamic for default"),
+                }
+                match fallback {
+                    CredentialLocation::Env(key) => assert_eq!(key, "FALLBACK_KEY"),
+                    _ => panic!("Expected Env for fallback"),
+                }
+            }
+            CredentialLocationWithFallback::Single(..) => panic!("Expected WithFallback"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_path_variants() {
+        // Test deserializing path-based credentials
+        let json = r#"{"default":"path::/etc/key","fallback":"path_from_env::KEY_PATH"}"#;
+        let result: CredentialLocationWithFallback = serde_json::from_str(json).unwrap();
+        match result {
+            CredentialLocationWithFallback::WithFallback { default, fallback } => {
+                match default {
+                    CredentialLocation::Path(path) => assert_eq!(path, "/etc/key"),
+                    _ => panic!("Expected Path for default"),
+                }
+                match fallback {
+                    CredentialLocation::PathFromEnv(key) => assert_eq!(key, "KEY_PATH"),
+                    _ => panic!("Expected PathFromEnv for fallback"),
+                }
+            }
+            CredentialLocationWithFallback::Single(..) => panic!("Expected WithFallback"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_sdk() {
+        // Test deserializing SDK credential
+        let json = r#""sdk""#;
+        let result: CredentialLocationWithFallback = serde_json::from_str(json).unwrap();
+        match result {
+            CredentialLocationWithFallback::Single(CredentialLocation::Sdk) => {}
+            _ => panic!("Expected Single(Sdk)"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_none() {
+        // Test deserializing None credential
+        let json = r#""none""#;
+        let result: CredentialLocationWithFallback = serde_json::from_str(json).unwrap();
+        match result {
+            CredentialLocationWithFallback::Single(CredentialLocation::None) => {}
+            _ => panic!("Expected Single(None)"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_roundtrip_single() {
+        // Test serializing and deserializing a Single variant
+        let original =
+            CredentialLocationWithFallback::Single(CredentialLocation::Env("MY_KEY".to_string()));
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: CredentialLocationWithFallback = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_roundtrip_with_fallback() {
+        // Test serializing and deserializing a WithFallback variant
+        let original = CredentialLocationWithFallback::WithFallback {
+            default: CredentialLocation::Dynamic("primary".to_string()),
+            fallback: CredentialLocation::Env("SECONDARY".to_string()),
         };
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: CredentialLocationWithFallback = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
 
-        let cache = OnceLock::new();
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_missing_default() {
+        // Test that missing default field returns an error
+        let json = r#"{"fallback":"env::FALLBACK_KEY"}"#;
+        let result: Result<CredentialLocationWithFallback, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `default`"));
+    }
 
-        // When we provide a `Some(credential_location)`, we should not cache the creds.
-        build_creds_caching_default_with_fn(
-            Some(CredentialLocation::None),
-            CredentialLocation::None,
-            "test",
-            &cache,
-            make_creds,
-        )
-        .expect("Failed to build creds");
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_missing_fallback() {
+        // Test that missing fallback field returns an error
+        let json = r#"{"default":"env::DEFAULT_KEY"}"#;
+        let result: Result<CredentialLocationWithFallback, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `fallback`"));
+    }
 
-        assert_eq!(cache.get(), None);
-        assert_eq!(make_creds_call_count.get(), 1);
+    #[test]
+    fn test_credential_location_with_fallback_deserialize_unknown_field() {
+        // Test that unknown fields return an error
+        let json = r#"{"default":"env::KEY","fallback":"env::FALLBACK","unknown":"value"}"#;
+        let result: Result<CredentialLocationWithFallback, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_default_location() {
+        // Test the default_location() method
+        let single =
+            CredentialLocationWithFallback::Single(CredentialLocation::Env("KEY".to_string()));
+        match single.default_location() {
+            CredentialLocation::Env(key) => assert_eq!(key, "KEY"),
+            _ => panic!("Expected Env"),
+        }
+
+        let with_fallback = CredentialLocationWithFallback::WithFallback {
+            default: CredentialLocation::Dynamic("primary".to_string()),
+            fallback: CredentialLocation::Env("secondary".to_string()),
+        };
+        match with_fallback.default_location() {
+            CredentialLocation::Dynamic(key) => assert_eq!(key, "primary"),
+            _ => panic!("Expected Dynamic"),
+        }
+    }
+
+    #[test]
+    fn test_credential_location_with_fallback_fallback_location() {
+        // Test the fallback_location() method
+        let single =
+            CredentialLocationWithFallback::Single(CredentialLocation::Env("KEY".to_string()));
+        assert!(single.fallback_location().is_none());
+
+        let with_fallback = CredentialLocationWithFallback::WithFallback {
+            default: CredentialLocation::Dynamic("primary".to_string()),
+            fallback: CredentialLocation::Env("secondary".to_string()),
+        };
+        match with_fallback.fallback_location() {
+            Some(CredentialLocation::Env(key)) => assert_eq!(key, "secondary"),
+            _ => panic!("Expected Some(Env)"),
+        }
     }
 }

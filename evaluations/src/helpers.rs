@@ -39,6 +39,8 @@ pub async fn get_tool_params_args(
                 additional_tools: Some(additional_tools),
                 tool_choice: Some(tool_params.tool_choice.clone()),
                 parallel_tool_calls: tool_params.parallel_tool_calls,
+                // TODO (Viraj): once we have this stored in the database, be sure to add it
+                provider_tools: None,
             }
         }
         // This branch is actually unreachable
@@ -47,6 +49,7 @@ pub async fn get_tool_params_args(
             additional_tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
+            provider_tools: None,
         },
     }
 }
@@ -60,7 +63,7 @@ pub fn setup_logging(args: &Args) -> Result<()> {
                 .with_env_filter(EnvFilter::from_default_env())
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
-                .map_err(|e| anyhow!("Failed to initialize tracing: {}", e))
+                .map_err(|e| anyhow!("Failed to initialize tracing: {e}"))
         }
         OutputFormat::Pretty => {
             let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -68,7 +71,7 @@ pub fn setup_logging(args: &Args) -> Result<()> {
                 .with_env_filter(EnvFilter::from_default_env())
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
-                .map_err(|e| anyhow!("Failed to initialize tracing: {}", e))
+                .map_err(|e| anyhow!("Failed to initialize tracing: {e}"))
         }
     }
 }
@@ -87,13 +90,16 @@ pub struct HumanFeedbackResult {
     pub evaluator_inference_id: Uuid,
 }
 
-pub async fn check_static_eval_human_feedback(
+pub async fn check_inference_evaluation_human_feedback(
     clickhouse: &ClickHouseConnectionInfo,
     metric_name: &str,
     datapoint_id: Uuid,
     inference_output: &InferenceResponse,
 ) -> Result<Option<HumanFeedbackResult>> {
     let serialized_output = inference_output.get_serialized_output()?;
+    // Note: StaticEvaluationHumanFeedback is the actual database table name,
+    // retained for backward compatibility even though this feature is now
+    // called "Inference Evaluations" in the product and user-facing documentation.
     let query = r"
         SELECT value, evaluator_inference_id FROM StaticEvaluationHumanFeedback
         WHERE
@@ -123,7 +129,7 @@ pub async fn check_static_eval_human_feedback(
         return Ok(None);
     }
     let human_feedback_result: HumanFeedbackResult = serde_json::from_str(&result.response)
-        .map_err(|e| anyhow!("Failed to parse human feedback result: {}", e))?;
+        .map_err(|e| anyhow!("Failed to parse human feedback result: {e}"))?;
     Ok(Some(human_feedback_result))
 }
 
@@ -133,7 +139,10 @@ mod tests {
 
     use serde_json::json;
     use tensorzero::Tool;
-    use tensorzero_core::{config::SchemaData, function::FunctionConfigChat, tool::ToolChoice};
+    use tensorzero_core::{
+        config::SchemaData, experimentation::ExperimentationConfig, function::FunctionConfigChat,
+        tool::ToolChoice,
+    };
 
     use super::*;
 
@@ -158,6 +167,7 @@ mod tests {
             parallel_tool_calls: None,
             description: None,
             all_explicit_templates_names: HashSet::new(),
+            experimentation: ExperimentationConfig::legacy_from_variants_map(&HashMap::new()),
         });
         let tool_params_args = get_tool_params_args(&tool_database_insert, &function_config).await;
         assert_eq!(
@@ -172,6 +182,7 @@ mod tests {
                     parameters: json!({}),
                     strict: true,
                 }]),
+                provider_tools: None,
             }
         );
 
@@ -194,6 +205,7 @@ mod tests {
             parallel_tool_calls: None,
             description: None,
             all_explicit_templates_names: HashSet::new(),
+            experimentation: ExperimentationConfig::legacy_from_variants_map(&HashMap::new()),
         });
         let tool_params_args = get_tool_params_args(&tool_database_insert, &function_config).await;
         assert_eq!(
@@ -203,6 +215,7 @@ mod tests {
                 parallel_tool_calls: None,
                 allowed_tools: Some(vec!["tool_1".to_string()]),
                 additional_tools: Some(vec![]),
+                provider_tools: None,
             }
         );
     }

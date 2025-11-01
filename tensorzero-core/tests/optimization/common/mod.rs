@@ -1,36 +1,38 @@
 #![expect(clippy::panic, clippy::print_stdout, clippy::unwrap_used)]
 use base64::Engine;
-use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tensorzero_core::rate_limiting::ScopeInfo;
 use tokio::time::{sleep, Duration};
 use url::Url;
 use uuid::Uuid;
 
 use tracing_subscriber::{self, EnvFilter};
 
-use tensorzero::{
-    Client, InferenceOutputSource, LaunchOptimizationWorkflowParams, RenderedSample, Role,
-};
+use tensorzero::{InferenceOutputSource, LaunchOptimizationWorkflowParams, RenderedSample, Role};
 use tensorzero_core::{
     cache::CacheOptions,
-    config::{Config, ConfigFileGlob, ProviderTypesConfig},
-    db::clickhouse::{test_helpers::CLICKHOUSE_URL, ClickHouseConnectionInfo, ClickhouseFormat},
+    config::{provider_types::ProviderTypesConfig, Config, ConfigFileGlob},
+    db::{
+        clickhouse::{test_helpers::CLICKHOUSE_URL, ClickHouseConnectionInfo},
+        postgres::PostgresConnectionInfo,
+    },
     endpoints::inference::InferenceClients,
     http::TensorzeroHttpClient,
     inference::types::{
-        file::Base64FileMetadata,
-        resolved_input::FileWithPath,
         storage::{StorageKind, StoragePath},
         stored_input::StoredFile,
-        Base64File, ContentBlock, ContentBlockChatOutput, FunctionType, ModelInferenceRequest,
-        ModelInput, RequestMessage, StoredInput, StoredInputMessage, StoredInputMessageContent,
+        ContentBlock, ContentBlockChatOutput, FunctionType, ModelInferenceRequest, ModelInput,
+        ObjectStorageFile, ObjectStoragePointer, RequestMessage, ResolvedContentBlock,
+        ResolvedRequestMessage, StoredInput, StoredInputMessage, StoredInputMessageContent, System,
         Text,
     },
+    model_table::ProviderTypeDefaultCredentials,
     optimization::{
         JobHandle, OptimizationJobInfo, Optimizer, OptimizerOutput, UninitializedOptimizerInfo,
     },
     stored_inference::StoredOutput,
-    tool::{Tool, ToolCall, ToolCallConfigDatabaseInsert, ToolCallOutput, ToolChoice, ToolResult},
+    tool::{DynamicToolParams, Tool, ToolCall, ToolCallOutput, ToolChoice, ToolResult},
     variant::JsonMode,
 };
 
@@ -69,7 +71,7 @@ pub async fn run_test_case(test_case: &impl OptimizationTestCase) {
 
     let optimizer_info = test_case
         .get_optimizer_info(use_mock_inference_provider())
-        .load()
+        .load(&ProviderTypeDefaultCredentials::default())
         .await
         .unwrap();
 
@@ -121,7 +123,14 @@ pub async fn run_test_case(test_case: &impl OptimizationTestCase) {
         .unwrap();
     let mut status;
     loop {
-        status = job_handle.poll(&client, &credentials).await.unwrap();
+        status = job_handle
+            .poll(
+                &client,
+                &credentials,
+                &ProviderTypeDefaultCredentials::default(),
+            )
+            .await
+            .unwrap();
         println!("Status: `{status:?}` Handle: `{job_handle}`");
         if matches!(status, OptimizationJobInfo::Completed { .. }) {
             break;
@@ -145,7 +154,11 @@ pub async fn run_test_case(test_case: &impl OptimizationTestCase) {
     match output {
         OptimizerOutput::Model(model_config) => {
             let model_config = model_config
-                .load("test-fine-tuned-model", &ProviderTypesConfig::default())
+                .load(
+                    "test-fine-tuned-model",
+                    &ProviderTypesConfig::default(),
+                    &ProviderTypeDefaultCredentials::default(),
+                )
                 .await
                 .unwrap();
             // Test the model configuration
@@ -175,15 +188,24 @@ pub async fn run_test_case(test_case: &impl OptimizationTestCase) {
                 json_mode: JsonMode::Off.into(),
                 function_type: FunctionType::Chat,
                 output_schema: None,
+                fetch_and_encode_input_files_before_inference: true,
                 extra_body: Default::default(),
                 extra_headers: Default::default(),
                 extra_cache_key: None,
             };
             let clients = InferenceClients {
-                http_client: &client,
-                clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
-                credentials: &HashMap::new(),
-                cache_options: &CacheOptions::default(),
+                http_client: client.clone(),
+                clickhouse_connection_info: ClickHouseConnectionInfo::new_disabled(),
+                postgres_connection_info: PostgresConnectionInfo::Disabled,
+                credentials: Arc::new(HashMap::new()),
+                cache_options: CacheOptions::default(),
+                tags: Arc::new(Default::default()),
+                rate_limiting_config: Arc::new(Default::default()),
+                otlp_config: Default::default(),
+                deferred_tasks: tokio_util::task::TaskTracker::new(),
+                scope_info: ScopeInfo {
+                    tags: Arc::new(HashMap::new()),
+                },
             };
             // We didn't produce a real model, so there's nothing to test
             if use_mock_inference_provider() {
@@ -217,7 +239,6 @@ pub async fn run_workflow_test_case_with_tensorzero_client(
         limit: Some(10),
         offset: None,
         val_fraction: None,
-        format: ClickhouseFormat::JsonEachRow,
         // We always mock the client tests since this is tested above
         optimizer_config: test_case.get_optimizer_info(true),
     };
@@ -272,27 +293,27 @@ fn generate_text_example() -> RenderedSample {
         function_name: "basic_test".to_string(),
         input: ModelInput {
             system: Some(system_prompt.clone()),
-            messages: vec![RequestMessage {
+            messages: vec![ResolvedRequestMessage {
                 role: Role::User,
-                content: vec![ContentBlock::Text(Text {
+                content: vec![ResolvedContentBlock::Text(Text {
                     text: "What is the capital of France?".to_string(),
                 })],
             }],
         },
         stored_input: StoredInput {
-            system: Some(json!(system_prompt)),
+            system: Some(System::Text(system_prompt.clone())),
             messages: vec![StoredInputMessage {
                 role: Role::User,
-                content: vec![StoredInputMessageContent::Text {
-                    value: "What is the capital of France?".into(),
-                }],
+                content: vec![StoredInputMessageContent::Text(Text {
+                    text: "What is the capital of France?".to_string(),
+                })],
             }],
         },
         output: Some(output.clone()),
         stored_output: Some(StoredOutput::Chat(output)),
         episode_id: Some(Uuid::now_v7()),
         inference_id: Some(Uuid::now_v7()),
-        tool_params: None,
+        tool_params: DynamicToolParams::default(),
         output_schema: None,
         dispreferred_outputs: vec![vec![ContentBlockChatOutput::Text(Text {
             text: "The capital of France is Marseille.".to_string(),
@@ -323,19 +344,19 @@ fn generate_tool_call_example() -> RenderedSample {
         input: ModelInput {
             system: Some(system_prompt.clone()),
             messages: vec![
-                RequestMessage {
+                ResolvedRequestMessage {
                     role: Role::User,
-                    content: vec![ContentBlock::Text(Text {
+                    content: vec![ResolvedContentBlock::Text(Text {
                         text: "What is the weather in Paris?".to_string(),
                     })],
                 },
-                RequestMessage {
+                ResolvedRequestMessage {
                     role: Role::Assistant,
                     content: vec![
-                        ContentBlock::Text(Text {
+                        ResolvedContentBlock::Text(Text {
                             text: "Let me look that up for you.".to_string(),
                         }),
-                        ContentBlock::ToolCall(ToolCall {
+                        ResolvedContentBlock::ToolCall(ToolCall {
                             name: "get_weather".to_string(),
                             arguments: serde_json::json!({
                                 "location": "Paris"
@@ -345,9 +366,9 @@ fn generate_tool_call_example() -> RenderedSample {
                         }),
                     ],
                 },
-                RequestMessage {
+                ResolvedRequestMessage {
                     role: Role::User,
-                    content: vec![ContentBlock::ToolResult(ToolResult {
+                    content: vec![ResolvedContentBlock::ToolResult(ToolResult {
                         name: "get_weather".to_string(),
                         result: serde_json::json!({
                             "weather": "sunny, 25 degrees Celsius",
@@ -356,35 +377,35 @@ fn generate_tool_call_example() -> RenderedSample {
                         id: "call_1".to_string(),
                     })],
                 },
-                RequestMessage {
+                ResolvedRequestMessage {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::Text(Text {
+                    content: vec![ResolvedContentBlock::Text(Text {
                         text: "The weather in Paris is sunny, 25 degrees Celsius.".to_string(),
                     })],
                 },
-                RequestMessage {
+                ResolvedRequestMessage {
                     role: Role::User,
-                    content: vec![ContentBlock::Text(Text {
+                    content: vec![ResolvedContentBlock::Text(Text {
                         text: "What is the weather in London?".to_string(),
                     })],
                 },
             ],
         },
         stored_input: StoredInput {
-            system: Some(json!(system_prompt)),
+            system: Some(System::Text(system_prompt.clone())),
             messages: vec![
                 StoredInputMessage {
                     role: Role::User,
-                    content: vec![StoredInputMessageContent::Text {
-                        value: json!("What is the weather in Paris?"),
-                    }],
+                    content: vec![StoredInputMessageContent::Text(Text {
+                        text: "What is the weather in Paris?".to_string(),
+                    })],
                 },
                 StoredInputMessage {
                     role: Role::Assistant,
                     content: vec![
-                        StoredInputMessageContent::Text {
-                            value: json!("Let me look that up for you."),
-                        },
+                        StoredInputMessageContent::Text(Text {
+                            text: "Let me look that up for you.".to_string(),
+                        }),
                         StoredInputMessageContent::ToolCall(ToolCall {
                             name: "get_weather".to_string(),
                             arguments: serde_json::json!({
@@ -408,22 +429,23 @@ fn generate_tool_call_example() -> RenderedSample {
                 },
                 StoredInputMessage {
                     role: Role::Assistant,
-                    content: vec![StoredInputMessageContent::Text {
-                        value: json!("The weather in Paris is sunny, 25 degrees Celsius."),
-                    }],
+                    content: vec![StoredInputMessageContent::Text(Text {
+                        text: "The weather in Paris is sunny, 25 degrees Celsius.".to_string(),
+                    })],
                 },
                 StoredInputMessage {
                     role: Role::User,
-                    content: vec![StoredInputMessageContent::Text {
-                        value: json!("What is the weather in London?"),
-                    }],
+                    content: vec![StoredInputMessageContent::Text(Text {
+                        text: "What is the weather in London?".to_string(),
+                    })],
                 },
             ],
         },
         output: Some(tool_call_output.clone()),
         stored_output: Some(StoredOutput::Chat(tool_call_output)),
-        tool_params: Some(ToolCallConfigDatabaseInsert {
-            tools_available: vec![Tool {
+        tool_params: DynamicToolParams {
+            allowed_tools: None,
+            additional_tools: Some(vec![Tool {
                 name: "get_weather".to_string(),
                 description: "Get the weather for a location".to_string(),
                 parameters: serde_json::json!({
@@ -437,10 +459,11 @@ fn generate_tool_call_example() -> RenderedSample {
                     "required": ["location"]
                 }),
                 strict: false,
-            }],
-            tool_choice: ToolChoice::Auto,
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
             parallel_tool_calls: None,
-        }),
+            provider_tools: None,
+        },
         episode_id: Some(Uuid::now_v7()),
         inference_id: Some(Uuid::now_v7()),
         output_schema: None,
@@ -461,54 +484,54 @@ fn generate_image_example() -> RenderedSample {
         function_name: "basic_test".to_string(),
         input: ModelInput {
             system: Some(system_prompt.clone()),
-            messages: vec![RequestMessage {
+            messages: vec![ResolvedRequestMessage {
                 role: Role::User,
                 content: vec![
-                    ContentBlock::Text(Text {
+                    ResolvedContentBlock::Text(Text {
                         text: "What is the main color of this image?".to_string(),
                     }),
-                    ContentBlock::File(Box::new(FileWithPath {
-                        file: Base64File {
-                            url: None,
+                    ResolvedContentBlock::File(Box::new(ObjectStorageFile {
+                        file: ObjectStoragePointer {
+                            source_url: None,
                             mime_type: mime::IMAGE_PNG,
-                            data: base64::prelude::BASE64_STANDARD.encode(FERRIS_PNG),
+                            storage_path: StoragePath {
+                                kind: StorageKind::Disabled,
+                                path: object_store::path::Path::parse(
+                                    "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"
+                                ).unwrap(),
+                            },
                         },
-                        storage_path: StoragePath {
-                            kind: StorageKind::Disabled,
-                            path: object_store::path::Path::parse(
-                                "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"
-                            ).unwrap(),
-                        },
+                        data: base64::prelude::BASE64_STANDARD.encode(FERRIS_PNG),
                     })),
                 ],
             }],
         },
         stored_input: StoredInput {
-            system: Some(json!(system_prompt)),
+            system: Some(System::Text(system_prompt.clone())),
             messages: vec![StoredInputMessage {
                 role: Role::User,
                 content: vec![
-                    StoredInputMessageContent::Text {
-                        value: json!("What is the main color of this image?"),
-                    },
-                    StoredInputMessageContent::File(Box::new(StoredFile {
-                        file: Base64FileMetadata {
-                            url: None,
+                    StoredInputMessageContent::Text(Text {
+                        text: "What is the main color of this image?".to_string(),
+                    }),
+                    StoredInputMessageContent::File(Box::new(StoredFile(
+                        ObjectStoragePointer {
+                            source_url: None,
                             mime_type: mime::IMAGE_PNG,
+                            storage_path: StoragePath {
+                                kind: StorageKind::Disabled,
+                                path: object_store::path::Path::parse(
+                                    "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"
+                                ).unwrap(),
+                            },
                         },
-                        storage_path: StoragePath {
-                            kind: StorageKind::Disabled,
-                            path: object_store::path::Path::parse(
-                                "observability/files/08bfa764c6dc25e658bab2b8039ddb494546c3bc5523296804efc4cab604df5d.png"
-                            ).unwrap(),
-                        },
-                    })),
+                    ))),
                 ],
             }],
         },
         output: Some(output.clone()),
         stored_output: Some(StoredOutput::Chat(output)),
-        tool_params: None,
+        tool_params: DynamicToolParams::default(),
         episode_id: Some(Uuid::now_v7()),
         inference_id: Some(Uuid::now_v7()),
         output_schema: None,
@@ -517,37 +540,6 @@ fn generate_image_example() -> RenderedSample {
         })]],
         tags: HashMap::new(),
     }
-}
-
-#[allow(clippy::allow_attributes, dead_code)]
-pub async fn make_embedded_gateway() -> Client {
-    let mut config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    config_path.push("tests/e2e/tensorzero.toml");
-    tensorzero::ClientBuilder::new(tensorzero::ClientBuilderMode::EmbeddedGateway {
-        config_file: Some(config_path),
-        clickhouse_url: Some(CLICKHOUSE_URL.clone()),
-        postgres_url: None,
-        timeout: None,
-        verify_credentials: true,
-        allow_batch_writes: true,
-    })
-    .with_verbose_errors(true)
-    .build()
-    .await
-    .unwrap()
-}
-
-#[allow(clippy::allow_attributes, dead_code)]
-pub async fn make_http_gateway() -> Client {
-    let gateway_url = std::env::var("TENSORZERO_GATEWAY_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
-    tensorzero::ClientBuilder::new(tensorzero::ClientBuilderMode::HTTPGateway {
-        url: gateway_url.parse().unwrap(),
-    })
-    .with_verbose_errors(true)
-    .build()
-    .await
-    .unwrap()
 }
 
 /// Generates a `#[tokio::test] async fn $fn_name() { run_test_case(&$constructor).await; }`
@@ -574,7 +566,7 @@ macro_rules! embedded_workflow_test_case {
         ::paste::paste! {
             #[tokio::test(flavor = "multi_thread")]
             async fn [<test_embedded_slow_optimization_ $fn_name>]() {
-                let client = $crate::common::make_embedded_gateway().await;
+                let client = tensorzero::test_helpers::make_embedded_gateway().await;
                 $crate::common::run_workflow_test_case_with_tensorzero_client(&$constructor, &client).await;
             }
         }
@@ -590,7 +582,7 @@ macro_rules! http_workflow_test_case {
         ::paste::paste! {
             #[tokio::test]
             async fn [<test_http_slow_optimization_ $fn_name>]() {
-                let client = $crate::common::make_http_gateway().await;
+                let client = tensorzero::test_helpers::make_http_gateway().await;
                 $crate::common::run_workflow_test_case_with_tensorzero_client(&$constructor, &client).await;
             }
         }

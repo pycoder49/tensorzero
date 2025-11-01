@@ -4,7 +4,6 @@ use crate::error::{Error, ErrorDetails};
 
 pub mod batch_inference;
 pub mod datasets;
-pub mod dynamic_evaluation_run;
 pub mod embeddings;
 pub mod fallback;
 pub mod feedback;
@@ -14,6 +13,18 @@ pub mod openai_compatible;
 pub mod optimization;
 pub mod status;
 pub mod stored_inference;
+pub mod variant_probabilities;
+pub mod workflow_evaluation_run;
+use crate::utils::gateway::AppStateData;
+use axum::routing::MethodRouter;
+use std::convert::Infallible;
+
+/// Helper struct to hold the data needed for a call to `Router.route`
+/// We use this to pass the route names to middleware before they register the routes
+/// (since axum doesn't let you list the registered routes in a `Router`)
+pub struct RouteHandlers {
+    pub routes: Vec<(&'static str, MethodRouter<AppStateData, Infallible>)>,
+}
 
 pub fn validate_tags(tags: &HashMap<String, String>, internal: bool) -> Result<(), Error> {
     if internal {

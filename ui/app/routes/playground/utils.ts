@@ -6,6 +6,7 @@ import type {
   ClientInferenceParams,
   FunctionConfig,
   InferenceResponse,
+  StaticToolConfig,
 } from "tensorzero-node";
 import { prepareInferenceActionRequest } from "../api/tensorzero/inference.utils";
 import { getExtraInferenceOptions } from "~/utils/feature_flags";
@@ -139,36 +140,48 @@ export interface ClientInferenceInputArgs {
   datapoint: TensorZeroDatapoint;
   input: DisplayInput;
   functionConfig: FunctionConfig;
+  toolsConfig: { [key in string]?: StaticToolConfig };
 }
 
 export function preparePlaygroundInferenceRequest(
   args: ClientInferenceInputArgs,
 ): ClientInferenceParams {
-  const { variant, functionName, datapoint, input, functionConfig } = args;
+  const {
+    variant,
+    functionName,
+    datapoint,
+    input,
+    functionConfig,
+    toolsConfig,
+  } = args;
   const variantInferenceInfo = getVariantInferenceInfo(variant);
   const request = prepareInferenceActionRequest({
     source: "clickhouse_datapoint",
     input,
     functionName,
     variant: variantInferenceInfo.variant,
-    tool_params:
-      datapoint?.type === "chat"
-        ? (datapoint.tool_params ?? undefined)
-        : undefined,
+    allowed_tools:
+      datapoint?.type === "chat" ? datapoint.allowed_tools : undefined,
+    additional_tools:
+      datapoint?.type === "chat" ? datapoint.additional_tools : null,
+    tool_choice: datapoint?.type === "chat" ? datapoint.tool_choice : null,
+    parallel_tool_calls:
+      datapoint?.type === "chat" ? datapoint.parallel_tool_calls : null,
     output_schema: datapoint?.type === "json" ? datapoint.output_schema : null,
     // The default is write_only but we do off in the playground
     cache_options: {
       max_age_s: null,
       enabled: "off",
     },
-    dryrun: true,
     editedVariantInfo: variantInferenceInfo.editedVariantInfo,
     functionConfig,
+    toolsConfig,
   });
   const extraOptions = getExtraInferenceOptions();
   return {
     ...request,
     ...extraOptions,
+    dryrun: variant.type === "edited",
   };
 }
 

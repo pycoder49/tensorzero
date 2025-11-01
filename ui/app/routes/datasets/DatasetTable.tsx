@@ -7,9 +7,10 @@ import {
   TableRow,
   TableEmptyState,
 } from "~/components/ui/table";
-import type { DatasetCountInfo } from "~/utils/clickhouse/datasets";
+import type { DatasetMetadata } from "tensorzero-node";
 import { Link, useFetcher } from "react-router";
 import { TableItemTime } from "~/components/ui/TableItems";
+import { toDatasetUrl } from "~/utils/urls";
 import { Button } from "~/components/ui/button";
 import { Trash, ChevronUp, ChevronDown, Search } from "lucide-react";
 import { useMemo, useState } from "react";
@@ -30,13 +31,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "~/components/ui/dialog";
+import { ReadOnlyGuard } from "~/components/utils/read-only-guard";
 
-const columnHelper = createColumnHelper<DatasetCountInfo>();
+const columnHelper = createColumnHelper<DatasetMetadata>();
 
 export default function DatasetTable({
   counts,
 }: {
-  counts: DatasetCountInfo[];
+  counts: DatasetMetadata[];
 }) {
   const fetcher = useFetcher();
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -51,7 +53,7 @@ export default function DatasetTable({
         header: "Dataset Name",
         cell: (info) => (
           <Link
-            to={`/datasets/${info.getValue()}`}
+            to={toDatasetUrl(info.getValue())}
             className="block no-underline"
           >
             <code className="block overflow-hidden rounded font-mono text-ellipsis whitespace-nowrap transition-colors duration-300 hover:text-gray-500">
@@ -73,17 +75,21 @@ export default function DatasetTable({
         header: "",
         cell: (info) => (
           <div className="text-right">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="opacity-60 transition-opacity hover:opacity-100"
+            <ReadOnlyGuard
+              asChild
               onClick={() => {
                 setDatasetToDelete(info.row.original.dataset_name);
                 setDeleteDialogOpen(true);
               }}
             >
-              <Trash />
-            </Button>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="opacity-60 transition-opacity hover:opacity-100"
+              >
+                <Trash />
+              </Button>
+            </ReadOnlyGuard>
           </div>
         ),
         enableSorting: false,

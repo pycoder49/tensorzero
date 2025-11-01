@@ -1,9 +1,7 @@
 use std::borrow::Cow;
-use std::sync::OnceLock;
 use std::time::Duration;
 
-use futures::StreamExt;
-use itertools::Itertools;
+use futures::{future::try_join_all, StreamExt};
 use reqwest::StatusCode;
 use reqwest_eventsource::Event;
 use secrecy::{ExposeSecret, SecretString};
@@ -24,11 +22,9 @@ use crate::error::{DisplayOrDebugGateway, Error, ErrorDetails};
 use crate::http::TensorZeroEventSource;
 use crate::http::TensorzeroHttpClient;
 use crate::inference::types::batch::{BatchRequestRow, PollBatchInferenceResponse};
-use crate::inference::types::file::require_image;
-use crate::inference::types::resolved_input::FileWithPath;
 use crate::inference::types::{
     batch::StartBatchProviderInferenceResponse, serialize_or_log, ModelInferenceRequest,
-    PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
+    ObjectStorageFile, PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
     ProviderInferenceResponseChunk, RequestMessage, Usage,
 };
 use crate::inference::types::{
@@ -38,15 +34,11 @@ use crate::inference::types::{
 };
 use crate::inference::types::{FinishReason, FlattenUnknown};
 use crate::inference::InferenceProvider;
-use crate::model::{
-    build_creds_caching_default, fully_qualified_name, Credential, CredentialLocation,
-    ModelProvider,
-};
+use crate::model::{fully_qualified_name, Credential, ModelProvider};
 use crate::tool::{ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
 
 use super::gcp_vertex_gemini::process_output_schema;
-use super::helpers::inject_extra_request_data_and_send;
-use super::openai::convert_stream_error;
+use super::helpers::{convert_stream_error, inject_extra_request_data_and_send};
 
 const PROVIDER_NAME: &str = "Google AI Studio Gemini";
 pub const PROVIDER_TYPE: &str = "google_ai_studio_gemini";
@@ -64,20 +56,8 @@ pub struct GoogleAIStudioGeminiProvider {
     credentials: GoogleAIStudioCredentials,
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<GoogleAIStudioCredentials> = OnceLock::new();
-
 impl GoogleAIStudioGeminiProvider {
-    pub fn new(
-        model_name: String,
-        api_key_location: Option<CredentialLocation>,
-    ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-
+    pub fn new(model_name: String, credentials: GoogleAIStudioCredentials) -> Result<Self, Error> {
         let request_url = Url::parse(&format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
         ))
@@ -107,15 +87,15 @@ impl GoogleAIStudioGeminiProvider {
     }
 }
 
-fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("GOOGLE_AI_STUDIO_API_KEY".to_string())
-}
-
 #[derive(Clone, Debug)]
 pub enum GoogleAIStudioCredentials {
     Static(SecretString),
     Dynamic(String),
     None,
+    WithFallback {
+        default: Box<GoogleAIStudioCredentials>,
+        fallback: Box<GoogleAIStudioCredentials>,
+    },
 }
 
 impl TryFrom<Credential> for GoogleAIStudioCredentials {
@@ -126,10 +106,16 @@ impl TryFrom<Credential> for GoogleAIStudioCredentials {
             Credential::Static(key) => Ok(GoogleAIStudioCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(GoogleAIStudioCredentials::Dynamic(key_name)),
             Credential::Missing => Ok(GoogleAIStudioCredentials::None),
+            Credential::WithFallback { default, fallback } => {
+                Ok(GoogleAIStudioCredentials::WithFallback {
+                    default: Box::new((*default).try_into()?),
+                    fallback: Box::new((*fallback).try_into()?),
+                })
+            }
             _ => Err(Error::new(ErrorDetails::Config {
                 message: "Invalid api_key_location for Google AI Studio Gemini provider"
                     .to_string(),
-            }))?,
+            })),
         }
     }
 }
@@ -150,10 +136,21 @@ impl GoogleAIStudioCredentials {
                     .into()
                 })
             }
+            GoogleAIStudioCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
+            }
             GoogleAIStudioCredentials::None => Err(ErrorDetails::ApiKeyMissing {
                 provider_name: PROVIDER_NAME.to_string(),
                 message: "No credentials are set".to_string(),
-            })?,
+            }
+            .into()),
         }
     }
 }
@@ -166,19 +163,21 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
             request,
             provider_name,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(GeminiRequest::new(request)?).map_err(|e| {
-            Error::new(ErrorDetails::Serialization {
-                message: format!(
-                    "Error serializing Gemini request: {}",
-                    DisplayOrDebugGateway::new(e)
-                ),
-            })
-        })?;
+        let request_body =
+            serde_json::to_value(GeminiRequest::new(request).await?).map_err(|e| {
+                Error::new(ErrorDetails::Serialization {
+                    message: format!(
+                        "Error serializing Gemini request: {}",
+                        DisplayOrDebugGateway::new(e)
+                    ),
+                })
+            })?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
         let mut url = self.request_url.clone();
@@ -256,19 +255,21 @@ impl InferenceProvider for GoogleAIStudioGeminiProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(GeminiRequest::new(request)?).map_err(|e| {
-            Error::new(ErrorDetails::Serialization {
-                message: format!(
-                    "Error serializing Gemini request: {}",
-                    DisplayOrDebugGateway::new(e)
-                ),
-            })
-        })?;
+        let request_body =
+            serde_json::to_value(GeminiRequest::new(request).await?).map_err(|e| {
+                Error::new(ErrorDetails::Serialization {
+                    message: format!(
+                        "Error serializing Gemini request: {}",
+                        DisplayOrDebugGateway::new(e)
+                    ),
+                })
+            })?;
         let api_key = self.credentials.get_api_key(dynamic_api_keys)?;
         let start_time = Instant::now();
         let mut url = self.streaming_request_url.clone();
@@ -325,6 +326,7 @@ fn stream_google_ai_studio_gemini(
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
+        let mut last_unknown_chunk_id = 0;
         while let Some(ev) = event_source.next().await {
             match ev {
                 Err(e) => {
@@ -352,13 +354,16 @@ fn stream_google_ai_studio_gemini(
                             }
                         };
                         yield convert_stream_response_with_metadata_to_chunk(
-                            message.data,
-                            data,
-                            start_time.elapsed(),
-                            &mut last_tool_name,
-                            &mut last_tool_idx,
-                            &mut last_thought_id,
-                            discard_unknown_chunks,
+                            ConvertStreamResponseArgs {
+                                raw_response: message.data,
+                                response: data,
+                                latency: start_time.elapsed(),
+                                last_tool_name: &mut last_tool_name,
+                                last_tool_idx: &mut last_tool_idx,
+                                last_thought_id: &mut last_thought_id,
+                                last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                                discard_unknown_chunks,
+                            },
                         )
                     }
                 }
@@ -415,7 +420,7 @@ enum GeminiPartData<'a> {
     },
     InlineData {
         #[serde(rename = "inline_data")]
-        inline_data: GeminiInlineData<'a>,
+        inline_data: GeminiInlineData,
     },
     // TODO (if needed): FileData { file_data: FileData },
     FunctionCall {
@@ -429,9 +434,9 @@ enum GeminiPartData<'a> {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-struct GeminiInlineData<'a> {
+struct GeminiInlineData {
     mime_type: String,
-    data: &'a str,
+    data: String,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -440,10 +445,8 @@ struct GeminiContent<'a> {
     parts: Vec<GeminiContentPart<'a>>,
 }
 
-impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
-    type Error = Error;
-
-    fn try_from(message: &'a RequestMessage) -> Result<Self, Self::Error> {
+impl<'a> GeminiContent<'a> {
+    async fn from_request_message(message: &'a RequestMessage) -> Result<Self, Error> {
         let role = GeminiRole::from(message.role);
         let mut output = Vec::with_capacity(message.content.len());
         let mut iter = message.content.iter();
@@ -453,6 +456,7 @@ impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
                     thought @ Thought {
                         text,
                         signature,
+                        summary: _,
                         provider_type: _,
                     },
                 ) => {
@@ -491,7 +495,8 @@ impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
                                 }));
                             }
                             Some(next_block) => {
-                                let gemini_part = convert_non_thought_content_block(next_block)?;
+                                let gemini_part =
+                                    convert_non_thought_content_block(next_block).await?;
                                 match gemini_part {
                                     FlattenUnknown::Normal(part) => {
                                         output.push(GeminiContentPart {
@@ -512,7 +517,7 @@ impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
                     }
                 }
                 _ => {
-                    let part = convert_non_thought_content_block(block)?;
+                    let part = convert_non_thought_content_block(block).await?;
                     match part {
                         FlattenUnknown::Normal(part) => {
                             output.push(GeminiContentPart {
@@ -541,7 +546,7 @@ impl<'a> TryFrom<&'a RequestMessage> for GeminiContent<'a> {
 
 /// Handles all `ContentBlock`s other than `ContentBlock::Thought` (which needs special handling
 /// to merge the signature with the next block).
-fn convert_non_thought_content_block(
+async fn convert_non_thought_content_block(
     block: &ContentBlock,
 ) -> Result<FlattenUnknown<'_, GeminiPartData<'_>>, Error> {
     match block {
@@ -597,15 +602,12 @@ fn convert_non_thought_content_block(
             }))
         }
         ContentBlock::File(file) => {
-            let FileWithPath {
-                file,
-                storage_path: _,
-            } = &**file;
-            require_image(&file.mime_type, PROVIDER_TYPE)?;
+            let resolved_file = file.resolve().await?;
+            let ObjectStorageFile { file, data } = &*resolved_file;
             Ok(FlattenUnknown::Normal(GeminiPartData::InlineData {
                 inline_data: GeminiInlineData {
                     mime_type: file.mime_type.to_string(),
-                    data: file.data()?.as_str(),
+                    data: data.to_string(),
                 },
             }))
         }
@@ -629,7 +631,7 @@ struct GeminiFunctionDeclaration<'a> {
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiTool<'a> {
-    function_declarations: Vec<GeminiFunctionDeclaration<'a>>,
+    pub function_declarations: Vec<GeminiFunctionDeclaration<'a>>,
     // TODO (if needed): code_execution ([docs](https://ai.google.dev/api/caching#CodeExecution))
 }
 
@@ -645,16 +647,6 @@ impl<'a> From<&'a ToolConfig> for GeminiFunctionDeclaration<'a> {
             name: tool.name(),
             description: tool.description(),
             parameters,
-        }
-    }
-}
-
-impl<'a> From<&'a Vec<ToolConfig>> for GeminiTool<'a> {
-    fn from(tools: &'a Vec<ToolConfig>) -> Self {
-        let function_declarations: Vec<GeminiFunctionDeclaration<'a>> =
-            tools.iter().map(Into::into).collect();
-        GeminiTool {
-            function_declarations,
         }
     }
 }
@@ -747,7 +739,7 @@ struct GeminiRequest<'a> {
 }
 
 impl<'a> GeminiRequest<'a> {
-    pub fn new(request: &'a ModelInferenceRequest<'a>) -> Result<Self, Error> {
+    pub async fn new(request: &'a ModelInferenceRequest<'a>) -> Result<Self, Error> {
         if request.messages.is_empty() {
             return Err(ErrorDetails::InvalidRequest {
                 message: "Google AI Studio Gemini requires at least one message".to_string(),
@@ -761,12 +753,17 @@ impl<'a> GeminiRequest<'a> {
                 .map(|system_instruction| GeminiPartData::Text {
                     text: system_instruction,
                 });
-        let contents: Vec<GeminiContent> = request
-            .messages
-            .iter()
-            .map(GeminiContent::try_from)
-            .filter_ok(|m| !m.parts.is_empty())
-            .collect::<Result<_, _>>()?;
+        let all_contents: Vec<GeminiContent> = try_join_all(
+            request
+                .messages
+                .iter()
+                .map(GeminiContent::from_request_message),
+        )
+        .await?;
+        let contents: Vec<GeminiContent> = all_contents
+            .into_iter()
+            .filter(|m| !m.parts.is_empty())
+            .collect();
         let (tools, tool_config) = prepare_tools(request);
         let (response_mime_type, response_schema) = match request.json_mode {
             ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
@@ -816,10 +813,15 @@ fn prepare_tools<'a>(
 ) {
     match &request.tool_config {
         Some(tool_config) => {
-            if tool_config.tools_available.is_empty() {
+            if !tool_config.any_tools_available() {
                 return (None, None);
             }
-            let tools = Some(vec![(&tool_config.tools_available).into()]);
+            let tools = Some(vec![GeminiTool {
+                function_declarations: tool_config
+                    .tools_available()
+                    .map(GeminiFunctionDeclaration::from)
+                    .collect(),
+            }]);
             let tool_config = Some((&tool_config.tool_choice).into());
             (tools, tool_config)
         }
@@ -863,6 +865,7 @@ fn content_part_to_tensorzero_chunk(
     last_thought_id: &mut u32,
     discard_unknown_chunks: bool,
     output: &mut Vec<ContentBlockChunk>,
+    last_unknown_chunk_id: &mut u32,
 ) -> Result<(), Error> {
     if part.thought {
         match part.data {
@@ -872,6 +875,8 @@ fn content_part_to_tensorzero_chunk(
                     id: last_thought_id.to_string(),
                     text: Some(text),
                     signature: part.thought_signature,
+                    summary_id: None,
+                    summary_text: None,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 }));
             }
@@ -884,6 +889,8 @@ fn content_part_to_tensorzero_chunk(
                     id: last_thought_id.to_string(),
                     text: None,
                     signature: part.thought_signature,
+                    summary_id: None,
+                    summary_text: None,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 }));
             }
@@ -916,6 +923,8 @@ fn content_part_to_tensorzero_chunk(
         output.push(ContentBlockChunk::Thought(ThoughtChunk {
             id: last_thought_id.to_string(),
             text: None,
+            summary_id: None,
+            summary_text: None,
             signature: Some(thought_signature),
             provider_type: Some(PROVIDER_TYPE.to_string()),
         }));
@@ -958,12 +967,12 @@ fn content_part_to_tensorzero_chunk(
                 warn_discarded_unknown_chunk(PROVIDER_TYPE, &part.to_string());
                 return Ok(());
             }
-            return Err(Error::new(ErrorDetails::InferenceServer {
-                message: "Unknown content part in Google AI Studio Gemini response".to_string(),
-                provider_type: PROVIDER_TYPE.to_string(),
-                raw_request: None,
-                raw_response: Some(part.to_string()),
-            }));
+            output.push(ContentBlockChunk::Unknown {
+                id: last_unknown_chunk_id.to_string(),
+                data: part.into_owned(),
+                provider_type: Some(PROVIDER_TYPE.to_string()),
+            });
+            *last_unknown_chunk_id += 1;
         }
     }
     Ok(())
@@ -981,6 +990,7 @@ fn convert_part_to_output(
                 output.push(ContentBlockOutput::Thought(Thought {
                     signature: part.thought_signature,
                     text: Some(text),
+                    summary: None,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 }));
             }
@@ -991,6 +1001,7 @@ fn convert_part_to_output(
                 output.push(ContentBlockOutput::Thought(Thought {
                     signature: part.thought_signature,
                     text: None,
+                    summary: None,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 }));
             }
@@ -1019,6 +1030,7 @@ fn convert_part_to_output(
         output.push(ContentBlockOutput::Thought(Thought {
             signature: Some(thought_signature),
             text: None,
+            summary: None,
             provider_type: Some(PROVIDER_TYPE.to_string()),
         }));
     }
@@ -1202,15 +1214,30 @@ impl<'a> TryFrom<GeminiResponseWithMetadata<'a>> for ProviderInferenceResponse {
     }
 }
 
-fn convert_stream_response_with_metadata_to_chunk(
+struct ConvertStreamResponseArgs<'a> {
     raw_response: String,
     response: GeminiResponse,
     latency: Duration,
-    last_tool_name: &mut Option<String>,
-    last_tool_idx: &mut Option<u32>,
-    last_thought_id: &mut u32,
+    last_tool_name: &'a mut Option<String>,
+    last_tool_idx: &'a mut Option<u32>,
+    last_thought_id: &'a mut u32,
+    last_unknown_chunk_id: &'a mut u32,
     discard_unknown_chunks: bool,
+}
+
+fn convert_stream_response_with_metadata_to_chunk(
+    args: ConvertStreamResponseArgs,
 ) -> Result<ProviderInferenceResponseChunk, Error> {
+    let ConvertStreamResponseArgs {
+        raw_response,
+        response,
+        latency,
+        last_tool_name,
+        last_tool_idx,
+        last_thought_id,
+        last_unknown_chunk_id,
+        discard_unknown_chunks,
+    } = args;
     let first_candidate = response.candidates.into_iter().next().ok_or_else(|| {
         Error::new(ErrorDetails::InferenceServer {
             message: "Google AI Studio Gemini response has no candidates".to_string(),
@@ -1232,6 +1259,7 @@ fn convert_stream_response_with_metadata_to_chunk(
                     last_thought_id,
                     discard_unknown_chunks,
                     &mut output,
+                    last_unknown_chunk_id,
                 )?;
             }
             output
@@ -1331,15 +1359,17 @@ mod tests {
 
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let res = convert_stream_response_with_metadata_to_chunk(
-            "raw_response".to_string(),
+        let mut last_unknown_chunk_id = 0;
+        let res = convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+            raw_response: "raw_response".to_string(),
             response,
             latency,
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            true,
-        )
+            last_tool_name: &mut last_tool_name,
+            last_tool_idx: &mut last_tool_idx,
+            last_thought_id: &mut last_thought_id,
+            last_unknown_chunk_id: &mut last_unknown_chunk_id,
+            discard_unknown_chunks: true,
+        })
         .unwrap();
         assert_eq!(res.content, []);
         assert!(
@@ -1348,13 +1378,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_google_ai_studio_gemini_content_try_from() {
+    #[tokio::test]
+    async fn test_google_ai_studio_gemini_content_try_from() {
         let message = RequestMessage {
             role: Role::User,
             content: vec!["Hello, world!".to_string().into()],
         };
-        let content = GeminiContent::try_from(&message).unwrap();
+        let content = GeminiContent::from_request_message(&message).await.unwrap();
         assert_eq!(content.role, GeminiRole::User);
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
@@ -1372,7 +1402,7 @@ mod tests {
             role: Role::Assistant,
             content: vec!["Hello, world!".to_string().into()],
         };
-        let content = GeminiContent::try_from(&message).unwrap();
+        let content = GeminiContent::from_request_message(&message).await.unwrap();
         assert_eq!(content.role, GeminiRole::Model);
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
@@ -1396,7 +1426,7 @@ mod tests {
                 }),
             ],
         };
-        let content = GeminiContent::try_from(&message).unwrap();
+        let content = GeminiContent::from_request_message(&message).await.unwrap();
         assert_eq!(content.role, GeminiRole::Model);
         assert_eq!(content.parts.len(), 2);
         assert_eq!(
@@ -1431,7 +1461,7 @@ mod tests {
                 result: r#"{"temperature": 25, "conditions": "sunny"}"#.to_string(),
             })],
         };
-        let content = GeminiContent::try_from(&message).unwrap();
+        let content = GeminiContent::from_request_message(&message).await.unwrap();
         assert_eq!(content.role, GeminiRole::User);
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
@@ -1454,7 +1484,13 @@ mod tests {
 
     #[test]
     fn test_from_vec_tool() {
-        let tool = GeminiTool::from(&MULTI_TOOL_CONFIG.tools_available);
+        let tools_vec: Vec<&ToolConfig> = MULTI_TOOL_CONFIG.tools_available().collect();
+        let tool = GeminiTool {
+            function_declarations: tools_vec
+                .iter()
+                .map(|&t| GeminiFunctionDeclaration::from(t))
+                .collect(),
+        };
         assert_eq!(
             tool,
             GeminiTool {
@@ -1462,12 +1498,12 @@ mod tests {
                     GeminiFunctionDeclaration {
                         name: "get_temperature",
                         description: "Get the current temperature in a given location",
-                        parameters: MULTI_TOOL_CONFIG.tools_available[0].parameters().clone(),
+                        parameters: tools_vec[0].parameters().clone(),
                     },
                     GeminiFunctionDeclaration {
                         name: "query_articles",
                         description: "Query articles from Wikipedia",
-                        parameters: MULTI_TOOL_CONFIG.tools_available[1].parameters().clone(),
+                        parameters: tools_vec[1].parameters().clone(),
                     }
                 ]
             }
@@ -1525,14 +1561,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_google_ai_studio_gemini_request_try_from() {
+    #[tokio::test]
+    async fn test_google_ai_studio_gemini_request_try_from() {
         // Test Case 1: Empty message list
-        let tool_config = ToolCallConfig {
-            tools_available: vec![],
-            tool_choice: ToolChoice::None,
-            parallel_tool_calls: None,
-        };
+        let tool_config = ToolCallConfig::default();
         let inference_request = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
             messages: vec![],
@@ -1551,7 +1583,7 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let result = GeminiRequest::new(&inference_request);
+        let result = GeminiRequest::new(&inference_request).await;
         let error = result.unwrap_err();
         let details = error.get_details();
         assert_eq!(
@@ -1590,7 +1622,7 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let result = GeminiRequest::new(&inference_request);
+        let result = GeminiRequest::new(&inference_request).await;
         let request = result.unwrap();
         assert_eq!(request.contents.len(), 2);
         assert_eq!(request.contents[0].role, GeminiRole::User);
@@ -1650,7 +1682,7 @@ mod tests {
             ..Default::default()
         };
         // JSON schema should be supported for Gemini Pro models
-        let result = GeminiRequest::new(&inference_request);
+        let result = GeminiRequest::new(&inference_request).await;
         let request = result.unwrap();
         assert_eq!(request.contents.len(), 3);
         assert_eq!(request.contents[0].role, GeminiRole::User);
@@ -2288,16 +2320,19 @@ mod tests {
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let chunk: ProviderInferenceResponseChunk = convert_stream_response_with_metadata_to_chunk(
-            "my_raw_chunk".to_string(),
-            response,
-            Duration::from_millis(100),
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            false,
-        )
-        .unwrap();
+        let mut last_unknown_chunk_id = 0;
+        let chunk: ProviderInferenceResponseChunk =
+            convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+                raw_response: "my_raw_chunk".to_string(),
+                response,
+                latency: Duration::from_millis(100),
+                last_tool_name: &mut last_tool_name,
+                last_tool_idx: &mut last_tool_idx,
+                last_thought_id: &mut last_thought_id,
+                last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                discard_unknown_chunks: false,
+            })
+            .unwrap();
 
         // Verify tool call tracking state - should remain None for text chunks
         assert_eq!(last_tool_idx, None);
@@ -2348,16 +2383,19 @@ mod tests {
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let chunk: ProviderInferenceResponseChunk = convert_stream_response_with_metadata_to_chunk(
-            "my_raw_chunk".to_string(),
-            response,
-            Duration::from_millis(50),
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            false,
-        )
-        .unwrap();
+        let mut last_unknown_chunk_id = 0;
+        let chunk: ProviderInferenceResponseChunk =
+            convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+                raw_response: "my_raw_chunk".to_string(),
+                response,
+                latency: Duration::from_millis(50),
+                last_tool_name: &mut last_tool_name,
+                last_tool_idx: &mut last_tool_idx,
+                last_thought_id: &mut last_thought_id,
+                last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                discard_unknown_chunks: false,
+            })
+            .unwrap();
 
         // Verify tool call tracking state - should remain None for text chunks
         assert_eq!(last_tool_idx, None);
@@ -2412,16 +2450,19 @@ mod tests {
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let chunk: ProviderInferenceResponseChunk = convert_stream_response_with_metadata_to_chunk(
-            "my_raw_chunk".to_string(),
-            response,
-            Duration::from_millis(75),
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            false,
-        )
-        .unwrap();
+        let mut last_unknown_chunk_id = 0;
+        let chunk: ProviderInferenceResponseChunk =
+            convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+                raw_response: "my_raw_chunk".to_string(),
+                response,
+                latency: Duration::from_millis(75),
+                last_tool_name: &mut last_tool_name,
+                last_tool_idx: &mut last_tool_idx,
+                last_thought_id: &mut last_thought_id,
+                last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                discard_unknown_chunks: false,
+            })
+            .unwrap();
 
         // Verify tool call tracking state - should remain None for text chunks
         assert_eq!(last_tool_idx, None);
@@ -2466,16 +2507,19 @@ mod tests {
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let chunk: ProviderInferenceResponseChunk = convert_stream_response_with_metadata_to_chunk(
-            "my_raw_chunk".to_string(),
-            response,
-            Duration::from_millis(120),
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            false,
-        )
-        .unwrap();
+        let mut last_unknown_chunk_id = 0;
+        let chunk: ProviderInferenceResponseChunk =
+            convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+                raw_response: "my_raw_chunk".to_string(),
+                response,
+                latency: Duration::from_millis(120),
+                last_tool_name: &mut last_tool_name,
+                last_tool_idx: &mut last_tool_idx,
+                last_thought_id: &mut last_thought_id,
+                last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                discard_unknown_chunks: false,
+            })
+            .unwrap();
 
         // Verify tool call tracking state - should be Some(0) for first tool call
         assert_eq!(last_tool_idx, Some(0));
@@ -2517,16 +2561,19 @@ mod tests {
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let chunk: ProviderInferenceResponseChunk = convert_stream_response_with_metadata_to_chunk(
-            "my_raw_chunk".to_string(),
-            response,
-            Duration::from_millis(60),
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            false,
-        )
-        .unwrap();
+        let mut last_unknown_chunk_id = 0;
+        let chunk: ProviderInferenceResponseChunk =
+            convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+                raw_response: "my_raw_chunk".to_string(),
+                response,
+                latency: Duration::from_millis(60),
+                last_tool_name: &mut last_tool_name,
+                last_tool_idx: &mut last_tool_idx,
+                last_thought_id: &mut last_thought_id,
+                last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                discard_unknown_chunks: false,
+            })
+            .unwrap();
 
         // Verify tool call tracking state - should remain None for responses without content
         assert_eq!(last_tool_idx, None);
@@ -2559,15 +2606,17 @@ mod tests {
         let mut last_tool_name = None;
         let mut last_tool_idx = None;
         let mut last_thought_id = 0;
-        let result = convert_stream_response_with_metadata_to_chunk(
-            "my_raw_chunk".to_string(),
+        let mut last_unknown_chunk_id = 0;
+        let result = convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+            raw_response: "my_raw_chunk".to_string(),
             response,
-            Duration::from_millis(30),
-            &mut last_tool_name,
-            &mut last_tool_idx,
-            &mut last_thought_id,
-            false,
-        );
+            latency: Duration::from_millis(30),
+            last_tool_name: &mut last_tool_name,
+            last_tool_idx: &mut last_tool_idx,
+            last_thought_id: &mut last_thought_id,
+            last_unknown_chunk_id: &mut last_unknown_chunk_id,
+            discard_unknown_chunks: false,
+        });
 
         // Should remain None when there's an error
         assert_eq!(last_tool_idx, None);
@@ -2634,15 +2683,18 @@ mod tests {
                 let mut last_tool_name = None;
                 let mut last_tool_idx = None;
                 let mut last_thought_id = 0;
-                let result = convert_stream_response_with_metadata_to_chunk(
-                    "my_raw_chunk".to_string(),
-                    response,
-                    Duration::from_millis(10),
-                    &mut last_tool_name,
-                    &mut last_tool_idx,
-                    &mut last_thought_id,
-                    false,
-                );
+                let mut last_unknown_chunk_id = 0;
+                let result =
+                    convert_stream_response_with_metadata_to_chunk(ConvertStreamResponseArgs {
+                        raw_response: "my_raw_chunk".to_string(),
+                        response,
+                        latency: Duration::from_millis(10),
+                        last_tool_name: &mut last_tool_name,
+                        last_tool_idx: &mut last_tool_idx,
+                        last_thought_id: &mut last_thought_id,
+                        last_unknown_chunk_id: &mut last_unknown_chunk_id,
+                        discard_unknown_chunks: false,
+                    });
                 // Verify tool call tracking state
                 assert_eq!(last_tool_idx, None);
                 result

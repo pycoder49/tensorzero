@@ -9,7 +9,13 @@ use reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
 use serde_json::Value;
 use std::fmt::Debug;
 use tensorzero_core::config::ConfigFileGlob;
-pub use tensorzero_core::db::DatabaseConnection;
+pub use tensorzero_core::db::datasets::{
+    AdjacentDatapointIds, CountDatapointsForDatasetFunctionParams, DatapointInsert,
+    DatasetDetailRow, DatasetQueries, DatasetQueryParams, GetAdjacentDatapointIdsParams,
+    GetDatapointParams, GetDatasetMetadataParams, GetDatasetRowsParams, StaleDatapointParams,
+};
+use tensorzero_core::db::inferences::InferenceQueries;
+pub use tensorzero_core::db::ClickHouseConnection;
 use tensorzero_core::db::HealthCheckable;
 pub use tensorzero_core::db::{ModelUsageTimePoint, TimeWindow};
 use tensorzero_core::endpoints::datasets::StaleDatasetResponse;
@@ -17,23 +23,26 @@ pub use tensorzero_core::endpoints::optimization::LaunchOptimizationParams;
 pub use tensorzero_core::endpoints::optimization::LaunchOptimizationWorkflowParams;
 use tensorzero_core::endpoints::optimization::{launch_optimization, launch_optimization_workflow};
 use tensorzero_core::endpoints::stored_inference::render_samples;
-pub use tensorzero_core::gateway_util::setup_clickhouse_without_config;
-use tensorzero_core::gateway_util::setup_postgres;
+use tensorzero_core::endpoints::variant_probabilities::{
+    GetVariantSamplingProbabilitiesParams, GetVariantSamplingProbabilitiesResponse,
+};
 use tensorzero_core::http::TensorzeroHttpClient;
 use tensorzero_core::inference::types::stored_input::StoragePathResolver;
 pub use tensorzero_core::optimization::{OptimizationJobHandle, OptimizationJobInfo};
 use tensorzero_core::stored_inference::StoredSample;
+pub use tensorzero_core::utils::gateway::setup_clickhouse_without_config;
+use tensorzero_core::utils::gateway::setup_postgres;
 use tensorzero_core::{
     config::Config,
     endpoints::{
         datasets::InsertDatapointParams,
-        dynamic_evaluation_run::{
-            DynamicEvaluationRunEpisodeParams, DynamicEvaluationRunEpisodeResponse,
-        },
         validate_tags,
+        workflow_evaluation_run::{
+            WorkflowEvaluationRunEpisodeParams, WorkflowEvaluationRunEpisodeResponse,
+        },
     },
     error::{Error, ErrorDetails},
-    gateway_util::{setup_clickhouse, GatewayHandle},
+    utils::gateway::{setup_clickhouse, GatewayHandle},
 };
 use thiserror::Error;
 use tokio::{sync::Mutex, time::error::Elapsed};
@@ -44,8 +53,11 @@ use uuid::Uuid;
 mod client_inference_params;
 mod client_input;
 mod git;
+#[cfg(feature = "e2e_tests")]
+pub mod test_helpers;
 pub use tensorzero_core::stored_inference::{
-    RenderedSample, StoredChatInference, StoredInference, StoredJsonInference,
+    RenderedSample, StoredChatInferenceDatabase, StoredInference, StoredInferenceDatabase,
+    StoredJsonInference,
 };
 pub mod input_handling;
 pub use client_inference_params::{ClientInferenceParams, ClientSecretString};
@@ -53,15 +65,13 @@ pub use client_input::{ClientInput, ClientInputMessage, ClientInputMessageConten
 
 pub use tensorzero_core::cache::CacheParamsOptions;
 pub use tensorzero_core::db::clickhouse::query_builder::{
-    BooleanMetricNode, FloatComparisonOperator, FloatMetricNode, InferenceFilterTreeNode,
-    InferenceOutputSource, ListInferencesParams, TagComparisonOperator, TagNode,
-    TimeComparisonOperator, TimeNode,
+    BooleanMetricFilter, FloatComparisonOperator, FloatMetricFilter, InferenceFilter,
+    TagComparisonOperator, TagFilter, TimeComparisonOperator, TimeFilter,
 };
+pub use tensorzero_core::db::inferences::{InferenceOutputSource, ListInferencesParams};
 pub use tensorzero_core::endpoints::datasets::{
-    ChatInferenceDatapoint, Datapoint, JsonInferenceDatapoint,
-};
-pub use tensorzero_core::endpoints::dynamic_evaluation_run::{
-    DynamicEvaluationRunParams, DynamicEvaluationRunResponse,
+    ChatInferenceDatapoint, Datapoint, DatapointKind, JsonInferenceDatapoint,
+    StoredChatInferenceDatapoint, StoredDatapoint,
 };
 pub use tensorzero_core::endpoints::feedback::FeedbackResponse;
 pub use tensorzero_core::endpoints::feedback::Params as FeedbackParams;
@@ -69,10 +79,13 @@ pub use tensorzero_core::endpoints::inference::{
     InferenceOutput, InferenceParams, InferenceResponse, InferenceResponseChunk, InferenceStream,
 };
 pub use tensorzero_core::endpoints::object_storage::ObjectResponse;
+pub use tensorzero_core::endpoints::workflow_evaluation_run::{
+    WorkflowEvaluationRunParams, WorkflowEvaluationRunResponse,
+};
 pub use tensorzero_core::inference::types::storage::{StorageKind, StoragePath};
-pub use tensorzero_core::inference::types::File;
+pub use tensorzero_core::inference::types::{Base64File, File, ObjectStoragePointer, UrlFile};
 pub use tensorzero_core::inference::types::{
-    ContentBlockChunk, Input, InputMessage, InputMessageContent, Role,
+    ContentBlockChunk, Input, InputMessage, InputMessageContent, Role, System, Unknown,
 };
 pub use tensorzero_core::tool::{DynamicToolParams, Tool};
 
@@ -142,6 +155,8 @@ pub struct ClientBuilder {
     mode: ClientBuilderMode,
     http_client: Option<reqwest::Client>,
     verbose_errors: bool,
+    api_key: Option<String>,
+    timeout: Option<Duration>,
 }
 
 /// An error type representing an error from within the TensorZero gateway
@@ -201,6 +216,8 @@ pub enum ClientBuilderError {
     HTTPClientBuild(TensorZeroError),
     #[error("Failed to get gateway version: {0}")]
     GatewayVersion(String),
+    #[error("Failed to set up embedded gateway: {0}")]
+    EmbeddedGatewaySetup(TensorZeroError),
 }
 
 // Helper type to choose between using Debug or Display for a type
@@ -247,6 +264,8 @@ impl ClientBuilder {
             mode,
             http_client: None,
             verbose_errors: false,
+            api_key: None,
+            timeout: None,
         }
     }
 
@@ -266,6 +285,21 @@ impl ClientBuilder {
     /// This is `false` by default.
     pub fn with_verbose_errors(mut self, verbose_errors: bool) -> Self {
         self.verbose_errors = verbose_errors;
+        self
+    }
+
+    /// Sets the API key to use for authentication with the TensorZero gateway.
+    /// This is only used in `HTTPGateway` mode.
+    /// If not set, the client will attempt to read from the `TENSORZERO_API_KEY` environment variable.
+    pub fn with_api_key(mut self, api_key: String) -> Self {
+        self.api_key = Some(api_key);
+        self
+    }
+
+    /// Sets the timeout for HTTP requests to the TensorZero gateway.
+    /// This is only used in `HTTPGateway` mode.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -309,7 +343,12 @@ impl ClientBuilder {
                     )
                 } else {
                     tracing::info!("No config file provided, so only default functions will be available. Set `config_file` to specify your `tensorzero.toml`");
-                    Arc::new(Config::default())
+                    Arc::new(Config::new_empty().await.map_err(|e| {
+                        ClientBuilderError::ConfigParsing {
+                            error: TensorZeroError::Other { source: e.into() },
+                            glob: ConfigFileGlob::new_empty(),
+                        }
+                    })?)
                 };
                 if !allow_batch_writes
                     && config.gateway.observability.batch_writes.enabled
@@ -367,7 +406,13 @@ impl ClientBuilder {
                                 clickhouse_connection_info,
                                 postgres_connection_info,
                                 http_client,
-                            ),
+                            )
+                            .await
+                            .map_err(|e| {
+                                ClientBuilderError::EmbeddedGatewaySetup(TensorZeroError::Other {
+                                    source: e.into(),
+                                })
+                            })?,
                         },
                         timeout: *timeout,
                     }),
@@ -388,25 +433,16 @@ impl ClientBuilder {
     /// (e.g. if a TLS backend cannot be initialized)
     #[cfg(feature = "pyo3")]
     pub fn build_dummy() -> Client {
-        use tensorzero_core::db::{
-            clickhouse::ClickHouseConnectionInfo, postgres::PostgresConnectionInfo,
-        };
-
+        let handle = GatewayHandle::new_dummy(
+            // NOTE - we previously called `reqwest::Client::new()`, which panics
+            // if a TLS backend cannot be initialized.
+            // This explicit `expect` does not actually increase the risk of panics,
+            #[expect(clippy::expect_used)]
+            TensorzeroHttpClient::new().expect("Failed to construct TensorzeroHttpClient"),
+        );
         Client {
             mode: Arc::new(ClientMode::EmbeddedGateway {
-                gateway: EmbeddedGateway {
-                    handle: GatewayHandle::new_with_database_and_http_client(
-                        Arc::new(Config::default()),
-                        ClickHouseConnectionInfo::Disabled,
-                        PostgresConnectionInfo::Disabled,
-                        // NOTE - we previously called `reqwest::Client::new()`, which panics
-                        // if a TLS backend cannot be initialized.
-                        // This explicit `expect` does not actually increase the risk of panics,
-                        #[expect(clippy::expect_used)]
-                        TensorzeroHttpClient::new()
-                            .expect("Failed to construct TensorzeroHttpClient"),
-                    ),
-                },
+                gateway: EmbeddedGateway { handle },
                 timeout: None,
             }),
             verbose_errors: false,
@@ -440,10 +476,71 @@ impl ClientBuilder {
         if !url.path().ends_with('/') {
             url.set_path(&format!("{}/", url.path()));
         }
+
+        // Try to get API key from constructor parameter, otherwise try environment variable
+        let api_key = self.api_key.or_else(|| env::var("TENSORZERO_API_KEY").ok());
+
+        // Build the HTTP client, applying timeout and/or API key
+        let http_client = if let Some(client) = self.http_client {
+            // Use custom client provided by advanced users
+
+            // TODO: Later we can decide if we want to override the custom HTTP clients.
+
+            if self.timeout.is_some() {
+                tracing::warn!("A timeout is set but a custom HTTP client is being used. The TensorZero SDK will not automatically apply the timeout to the custom client.");
+            }
+
+            if api_key.is_some() {
+                tracing::warn!("A TensorZero API key is available but a custom HTTP client is being used. The TensorZero SDK will not automatically apply the authentication header to the custom client.");
+            }
+
+            client
+        } else {
+            // Build client from scratch, composing timeout and api_key
+            let mut builder = reqwest::Client::builder();
+
+            // Apply timeout if provided
+            if let Some(timeout) = self.timeout {
+                builder = builder.timeout(timeout);
+            }
+
+            // Apply API key as default Authorization header if provided
+            if let Some(ref key) = api_key {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).map_err(
+                        |e| {
+                            ClientBuilderError::HTTPClientBuild(TensorZeroError::Other {
+                                source: tensorzero_core::error::Error::new(
+                                    ErrorDetails::InternalError {
+                                        message: format!(
+                                            "Failed to create authorization header: {e}"
+                                        ),
+                                    },
+                                )
+                                .into(),
+                            })
+                        },
+                    )?,
+                );
+                builder = builder.default_headers(headers);
+            }
+
+            builder.build().map_err(|e| {
+                ClientBuilderError::HTTPClientBuild(TensorZeroError::Other {
+                    source: tensorzero_core::error::Error::new(ErrorDetails::InternalError {
+                        message: format!("Failed to build HTTP client: {e}"),
+                    })
+                    .into(),
+                })
+            })?
+        };
+
         Ok(Client {
             mode: Arc::new(ClientMode::HTTPGateway(HTTPGateway {
                 base_url: url,
-                http_client: self.http_client.unwrap_or_default(),
+                http_client,
                 gateway_version: Mutex::new(None),
             })),
             verbose_errors: self.verbose_errors,
@@ -454,12 +551,12 @@ impl ClientBuilder {
 }
 
 /// A TensorZero client. This is constructed using `ClientBuilder`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     mode: Arc<ClientMode>,
     verbose_errors: bool,
     #[cfg(feature = "e2e_tests")]
-    pub last_body: Mutex<Option<String>>,
+    pub last_body: Arc<Mutex<Option<String>>>,
 }
 
 impl StoragePathResolver for Client {
@@ -492,6 +589,15 @@ impl Client {
                 .health()
                 .await
                 .map_err(|e| TensorZeroError::Other { source: e.into() }),
+        }
+    }
+
+    /// Gets the config from the embedded gateway
+    /// Returns None for HTTP gateway mode
+    pub fn config(&self) -> Option<&Config> {
+        match &*self.mode {
+            ClientMode::HTTPGateway(_) => None,
+            ClientMode::EmbeddedGateway { gateway, .. } => Some(&gateway.handle.app_state.config),
         }
     }
 
@@ -573,11 +679,18 @@ impl Client {
                 {
                     *self.last_body.lock().await = Some(body.clone());
                 }
-                let builder = client
+                let mut builder = client
                     .http_client
                     .post(url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body);
+
+                // Add OTLP trace headers with the required prefix
+                for (key, value) in &params.otlp_traces_extra_headers {
+                    let header_name = format!("tensorzero-otlp-traces-extra-header-{key}");
+                    builder = builder.header(header_name, value);
+                }
+
                 if params.stream.unwrap_or(false) {
                     let event_source =
                         builder.eventsource().map_err(|e| TensorZeroError::Other {
@@ -601,6 +714,8 @@ impl Client {
                         gateway.handle.app_state.config.clone(),
                         &gateway.handle.app_state.http_client,
                         gateway.handle.app_state.clickhouse_connection_info.clone(),
+                        gateway.handle.app_state.postgres_connection_info.clone(),
+                        gateway.handle.app_state.deferred_tasks.clone(),
                         params.try_into().map_err(err_to_http)?,
                     )
                     .await
@@ -684,7 +799,7 @@ impl Client {
             ClientMode::EmbeddedGateway { gateway, timeout } => {
                 Ok(with_embedded_timeout(*timeout, async {
                     tensorzero_core::endpoints::object_storage::get_object(
-                        &gateway.handle.app_state.config,
+                        gateway.handle.app_state.config.object_store_info.as_ref(),
                         storage_path,
                     )
                     .await
@@ -695,24 +810,28 @@ impl Client {
         }
     }
 
-    pub async fn dynamic_evaluation_run(
+    pub async fn workflow_evaluation_run(
         &self,
-        mut params: DynamicEvaluationRunParams,
-    ) -> Result<DynamicEvaluationRunResponse, TensorZeroError> {
+        mut params: WorkflowEvaluationRunParams,
+    ) -> Result<WorkflowEvaluationRunResponse, TensorZeroError> {
         // We validate the tags here since we're going to add git information to the tags afterwards and set internal to true
         validate_tags(&params.tags, false)
             .map_err(|e| TensorZeroError::Other { source: e.into() })?;
-        // Apply the git information to the tags so it gets stored for our dynamic evaluation run
+        // Apply the git information to the tags so it gets stored for our workflow evaluation run
         if let Ok(git_info) = GitInfo::new() {
             params.tags.extend(git_info.into_tags());
         }
         // Set internal to true so we don't validate the tags again
         params.internal = true;
+        // Automatically add internal tag when internal=true
+        params
+            .tags
+            .insert("tensorzero::internal".to_string(), "true".to_string());
         match &*self.mode {
             ClientMode::HTTPGateway(client) => {
-                let url = client.base_url.join("dynamic_evaluation_run").map_err(|e| TensorZeroError::Other {
+                let url = client.base_url.join("workflow_evaluation_run").map_err(|e| TensorZeroError::Other {
                     source: tensorzero_core::error::Error::new(ErrorDetails::InvalidBaseUrl {
-                        message: format!("Failed to join base URL with /dynamic_evaluation_run endpoint: {e}"),
+                        message: format!("Failed to join base URL with /workflow_evaluation_run endpoint: {e}"),
                     })
                     .into(),
                 })?;
@@ -721,7 +840,7 @@ impl Client {
             }
             ClientMode::EmbeddedGateway { gateway, timeout } => {
                 Ok(with_embedded_timeout(*timeout, async {
-                    tensorzero_core::endpoints::dynamic_evaluation_run::dynamic_evaluation_run(
+                    tensorzero_core::endpoints::workflow_evaluation_run::workflow_evaluation_run(
                         gateway.handle.app_state.clone(),
                         params,
                     )
@@ -733,16 +852,16 @@ impl Client {
         }
     }
 
-    pub async fn dynamic_evaluation_run_episode(
+    pub async fn workflow_evaluation_run_episode(
         &self,
         run_id: Uuid,
-        params: DynamicEvaluationRunEpisodeParams,
-    ) -> Result<DynamicEvaluationRunEpisodeResponse, TensorZeroError> {
+        params: WorkflowEvaluationRunEpisodeParams,
+    ) -> Result<WorkflowEvaluationRunEpisodeResponse, TensorZeroError> {
         match &*self.mode {
             ClientMode::HTTPGateway(client) => {
-                let url = client.base_url.join(&format!("dynamic_evaluation_run/{run_id}/episode")).map_err(|e| TensorZeroError::Other {
+                let url = client.base_url.join(&format!("workflow_evaluation_run/{run_id}/episode")).map_err(|e| TensorZeroError::Other {
                     source: tensorzero_core::error::Error::new(ErrorDetails::InvalidBaseUrl {
-                        message: format!("Failed to join base URL with /dynamic_evaluation_run/{run_id}/episode endpoint: {e}"),
+                        message: format!("Failed to join base URL with /workflow_evaluation_run/{run_id}/episode endpoint: {e}"),
                     })
                     .into(),
                 })?;
@@ -751,7 +870,7 @@ impl Client {
             }
             ClientMode::EmbeddedGateway { gateway, timeout } => {
                 Ok(with_embedded_timeout(*timeout, async {
-                    tensorzero_core::endpoints::dynamic_evaluation_run::dynamic_evaluation_run_episode(
+                    tensorzero_core::endpoints::workflow_evaluation_run::workflow_evaluation_run_episode(
                         gateway.handle.app_state.clone(),
                         run_id,
                         params,
@@ -764,16 +883,17 @@ impl Client {
         }
     }
 
-    pub async fn bulk_insert_datapoints(
+    async fn create_datapoints_internal(
         &self,
         dataset_name: String,
         params: InsertDatapointParams,
+        endpoint_path: &str,
     ) -> Result<Vec<Uuid>, TensorZeroError> {
         match &*self.mode {
             ClientMode::HTTPGateway(client) => {
-                let url = client.base_url.join(&format!("datasets/{dataset_name}/datapoints/bulk")).map_err(|e| TensorZeroError::Other {
+                let url = client.base_url.join(&format!("datasets/{dataset_name}/{endpoint_path}")).map_err(|e| TensorZeroError::Other {
                     source: tensorzero_core::error::Error::new(ErrorDetails::InvalidBaseUrl {
-                        message: format!("Failed to join base URL with /datasets/{dataset_name}/datapoints/bulk endpoint: {e}"),
+                        message: format!("Failed to join base URL with /datasets/{dataset_name}/{endpoint_path} endpoint: {e}"),
                     })
                     .into(),
                 })?;
@@ -795,6 +915,26 @@ impl Client {
                 .await?)
             }
         }
+    }
+
+    pub async fn create_datapoints(
+        &self,
+        dataset_name: String,
+        params: InsertDatapointParams,
+    ) -> Result<Vec<Uuid>, TensorZeroError> {
+        self.create_datapoints_internal(dataset_name, params, "datapoints")
+            .await
+    }
+
+    /// DEPRECATED: Use `create_datapoints` instead.
+    pub async fn bulk_insert_datapoints(
+        &self,
+        dataset_name: String,
+        params: InsertDatapointParams,
+    ) -> Result<Vec<Uuid>, TensorZeroError> {
+        tracing::warn!("`Client::bulk_insert_datapoints` is deprecated. Use `Client::create_datapoints` instead.");
+        self.create_datapoints_internal(dataset_name, params, "datapoints/bulk")
+            .await
     }
 
     pub async fn delete_datapoint(
@@ -871,10 +1011,11 @@ impl Client {
                 self.parse_http_response(builder.send().await).await
             }
             ClientMode::EmbeddedGateway { gateway, timeout } => {
-                Ok(with_embedded_timeout(*timeout, async {
+                with_embedded_timeout(*timeout, async {
                     tensorzero_core::endpoints::datasets::list_datapoints(
                         dataset_name,
                         &gateway.handle.app_state.clickhouse_connection_info,
+                        &gateway.handle.app_state.config,
                         function_name,
                         limit,
                         offset,
@@ -882,7 +1023,7 @@ impl Client {
                     .await
                     .map_err(err_to_http)
                 })
-                .await?)
+                .await
             }
         }
     }
@@ -904,16 +1045,26 @@ impl Client {
                 self.parse_http_response(builder.send().await).await
             }
             ClientMode::EmbeddedGateway { gateway, timeout } => {
-                Ok(with_embedded_timeout(*timeout, async {
-                    tensorzero_core::endpoints::datasets::get_datapoint(
-                        dataset_name,
-                        datapoint_id,
-                        &gateway.handle.app_state.clickhouse_connection_info,
-                    )
-                    .await
-                    .map_err(err_to_http)
+                let datapoint = with_embedded_timeout(*timeout, async {
+                    gateway
+                        .handle
+                        .app_state
+                        .clickhouse_connection_info
+                        .get_datapoint(&GetDatapointParams {
+                            dataset_name,
+                            datapoint_id,
+                            // By default, we don't return stale datapoints.
+                            allow_stale: None,
+                        })
+                        .await
+                        .map_err(err_to_http)
                 })
-                .await?)
+                .await?;
+
+                // Convert storage type to wire type
+                datapoint
+                    .into_datapoint(&gateway.handle.app_state.config)
+                    .map_err(|e| TensorZeroError::Other { source: e.into() })
             }
         }
     }
@@ -984,7 +1135,14 @@ impl Client {
             .list_inferences(&gateway.handle.app_state.config, &params)
             .await
             .map_err(err_to_http)?;
-        Ok(inferences)
+
+        // Convert storage types to wire types
+        let wire_inferences: Result<Vec<StoredInference>, _> = inferences
+            .into_iter()
+            .map(|inf| inf.into_stored_inference(&gateway.handle.app_state.config))
+            .collect();
+
+        wire_inferences.map_err(|e| TensorZeroError::Other { source: e.into() })
     }
 
     /// There are two things that need to happen in this function:
@@ -1112,6 +1270,7 @@ impl Client {
                     tensorzero_core::endpoints::optimization::poll_optimization(
                         &gateway.handle.app_state.http_client,
                         job_handle,
+                        &gateway.handle.app_state.config.models.default_credentials,
                     )
                     .await
                     .map_err(err_to_http)
@@ -1151,6 +1310,48 @@ impl Client {
                 })
                 .into(),
             }),
+        }
+    }
+
+    pub async fn get_variant_sampling_probabilities(
+        &self,
+        function_name: &str,
+    ) -> Result<HashMap<String, f64>, TensorZeroError> {
+        match &*self.mode {
+            ClientMode::HTTPGateway(client) => {
+                let url = client
+                    .base_url
+                    .join("variant_sampling_probabilities")
+                    .map_err(|e| TensorZeroError::Other {
+                        source: tensorzero_core::error::Error::new(ErrorDetails::InvalidBaseUrl {
+                            message: format!(
+                                "Failed to join base URL with /variant_sampling_probabilities endpoint: {e}"
+                            ),
+                        })
+                        .into(),
+                    })?;
+                let builder = client
+                    .http_client
+                    .get(url)
+                    .query(&[("function_name", function_name)]);
+                let response: GetVariantSamplingProbabilitiesResponse =
+                    self.parse_http_response(builder.send().await).await?;
+                Ok(response.probabilities)
+            }
+            ClientMode::EmbeddedGateway { gateway, timeout } => {
+                Ok(with_embedded_timeout(*timeout, async {
+                    let response = tensorzero_core::endpoints::variant_probabilities::get_variant_sampling_probabilities(
+                        gateway.handle.app_state.clone(),
+                        GetVariantSamplingProbabilitiesParams {
+                            function_name: function_name.to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(err_to_http)?;
+                    Ok(response.probabilities)
+                })
+                .await?)
+            }
         }
     }
 
@@ -1318,7 +1519,7 @@ impl Client {
     }
 
     #[cfg(any(feature = "e2e_tests", feature = "pyo3"))]
-    pub fn get_app_state_data(&self) -> Option<&tensorzero_core::gateway_util::AppStateData> {
+    pub fn get_app_state_data(&self) -> Option<&tensorzero_core::utils::gateway::AppStateData> {
         match &*self.mode {
             ClientMode::EmbeddedGateway { gateway, .. } => Some(&gateway.handle.app_state),
             ClientMode::HTTPGateway(_) => None,
@@ -1395,7 +1596,9 @@ pub async fn get_config_no_verify_credentials(
         )
         .await
         .map_err(|e| TensorZeroError::Other { source: e.into() }),
-        None => Ok(Config::default()),
+        None => Ok(Config::new_empty()
+            .await
+            .map_err(|e| TensorZeroError::Other { source: e.into() })?),
     }
 }
 

@@ -4,7 +4,6 @@ import { useState } from "react";
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from "~/components/ui/tooltip";
 
@@ -12,12 +11,16 @@ interface DeleteButtonProps {
   onClick: () => void;
   className?: string;
   isLoading?: boolean;
+  disabled?: boolean;
+  tooltip?: string;
 }
 
 export function DeleteButton({
   onClick,
   className,
   isLoading,
+  disabled = false,
+  tooltip = "Delete",
 }: DeleteButtonProps) {
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -62,25 +65,22 @@ export function DeleteButton({
   }
 
   return (
-    <TooltipProvider>
-      <Tooltip delayDuration={100}>
-        <TooltipTrigger asChild>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-block">
           <Button
             variant="outline"
             size="iconSm"
             className={className}
-            disabled={isLoading}
+            disabled={disabled || isLoading}
             onClick={handleInitialClick}
-            aria-label="Delete"
-            title="Delete"
+            aria-label={tooltip}
           >
             <Trash2 className="h-4 w-4" />
           </Button>
-        </TooltipTrigger>
-        <TooltipContent>
-          <p>Delete</p>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{tooltip}</TooltipContent>
+    </Tooltip>
   );
 }

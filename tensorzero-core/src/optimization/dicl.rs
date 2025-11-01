@@ -1,31 +1,39 @@
-#[cfg(feature = "pyo3")]
-use pyo3::prelude::*;
+use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use crate::{
     cache::CacheOptions,
     config::{Config, UninitializedVariantConfig},
-    db::clickhouse::{ClickHouseConnectionInfo, ExternalDataInfo},
-    embeddings::{
-        Embedding, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingModelConfig, EmbeddingRequest,
+    db::{
+        clickhouse::{
+            clickhouse_client::ClickHouseClientType, ClickHouseConnectionInfo, ExternalDataInfo,
+        },
+        postgres::PostgresConnectionInfo,
     },
+    embeddings::{Embedding, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest},
     endpoints::inference::{InferenceClients, InferenceCredentials},
     error::{Error, ErrorDetails, IMPOSSIBLE_ERROR_MESSAGE},
     function::FunctionConfig,
     http::TensorzeroHttpClient,
-    model::{build_creds_caching_default, CredentialLocation},
+    inference::types::StoredInputMessageContent,
+    model::CredentialLocationWithFallback,
+    model_table::{OpenAIKind, ProviderKind, ProviderTypeDefaultCredentials},
     optimization::{JobHandle, OptimizationJobInfo, Optimizer, OptimizerOutput},
-    providers::openai::{
-        default_api_key_location, OpenAICredentials, DEFAULT_CREDENTIALS, PROVIDER_TYPE,
-    },
+    providers::openai::OpenAICredentials,
+    rate_limiting::ScopeInfo,
     stored_inference::RenderedSample,
-    variant::{dicl::UninitializedDiclConfig, RetryConfig},
+    utils::retries::RetryConfig,
+    variant::dicl::UninitializedDiclConfig,
 };
-use futures::future::try_join_all;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::Semaphore;
-use uuid::Uuid;
+
+#[cfg(feature = "pyo3")]
+use crate::model::CredentialLocation;
+#[cfg(feature = "pyo3")]
+use pyo3::prelude::*;
 
 fn default_batch_size() -> usize {
     128
@@ -63,7 +71,7 @@ pub struct DiclOptimizationConfig {
     #[serde(skip)]
     pub credentials: OpenAICredentials,
     #[cfg_attr(test, ts(type = "string | null"))]
-    pub credential_location: Option<CredentialLocation>,
+    pub credential_location: Option<CredentialLocationWithFallback>,
 }
 
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -86,7 +94,7 @@ pub struct UninitializedDiclOptimizationConfig {
     #[serde(default = "default_append_to_existing_variants")]
     pub append_to_existing_variants: bool,
     #[cfg_attr(test, ts(type = "string | null"))]
-    pub credentials: Option<CredentialLocation>,
+    pub credentials: Option<CredentialLocationWithFallback>,
 }
 
 impl Default for UninitializedDiclOptimizationConfig {
@@ -136,9 +144,12 @@ impl UninitializedDiclOptimizationConfig {
         append_to_existing_variants: Option<bool>,
         credentials: Option<String>,
     ) -> PyResult<Self> {
-        // Use Deserialize to convert the string to a CredentialLocation
-        let credentials =
-            credentials.map(|s| serde_json::from_str(&s).unwrap_or(CredentialLocation::Env(s)));
+        // Use Deserialize to convert the string to a CredentialLocationWithFallback
+        let credentials = credentials.map(|s| {
+            serde_json::from_str(&s).unwrap_or(CredentialLocationWithFallback::Single(
+                CredentialLocation::Env(s),
+            ))
+        });
         Ok(Self {
             embedding_model,
             variant_name,
@@ -186,7 +197,10 @@ impl UninitializedDiclOptimizationConfig {
 }
 
 impl UninitializedDiclOptimizationConfig {
-    pub fn load(self) -> Result<DiclOptimizationConfig, Error> {
+    pub async fn load(
+        self,
+        default_credentials: &ProviderTypeDefaultCredentials,
+    ) -> Result<DiclOptimizationConfig, Error> {
         Ok(DiclOptimizationConfig {
             embedding_model: Arc::from(self.embedding_model),
             variant_name: self.variant_name,
@@ -197,12 +211,9 @@ impl UninitializedDiclOptimizationConfig {
             k: self.k,
             model: Arc::from(self.model),
             append_to_existing_variants: self.append_to_existing_variants,
-            credentials: build_creds_caching_default(
-                self.credentials.clone(),
-                default_api_key_location(),
-                PROVIDER_TYPE,
-                &DEFAULT_CREDENTIALS,
-            )?,
+            credentials: OpenAIKind
+                .get_defaulted_credential(self.credentials.as_ref(), default_credentials)
+                .await?,
             credential_location: self.credentials,
         })
     }
@@ -246,10 +257,7 @@ impl Optimizer for DiclOptimizationConfig {
         }
 
         // Check if ClickHouse is available (required for DICL)
-        if matches!(
-            clickhouse_connection_info,
-            ClickHouseConnectionInfo::Disabled
-        ) {
+        if clickhouse_connection_info.client_type() == ClickHouseClientType::Disabled {
             return Err(Error::new(ErrorDetails::AppState {
                 message: "DICL optimization requires ClickHouse to be enabled to store examples"
                     .to_string(),
@@ -286,20 +294,6 @@ impl Optimizer for DiclOptimizationConfig {
             }));
         }
 
-        // 4. Check that the embedding model exists in the config
-        let embedding_model_config = config
-            .embedding_models
-            .get(&self.embedding_model)
-            .await?
-            .ok_or_else(|| {
-                Error::new(ErrorDetails::Config {
-                    message: format!(
-                        "embedding model '{}' not found in configuration",
-                        self.embedding_model
-                    ),
-                })
-            })?;
-
         tracing::info!(
             "Starting DICL optimization for function '{}' variant '{}' with {} examples",
             self.function_name,
@@ -325,7 +319,7 @@ impl Optimizer for DiclOptimizationConfig {
 
         // Process embeddings with batching and concurrency control
         let all_embeddings = process_embeddings_with_batching(
-            &embedding_model_config,
+            config,
             &self.embedding_model,
             client,
             credentials,
@@ -388,6 +382,7 @@ impl JobHandle for DiclOptimizationJobHandle {
         &self,
         client: &TensorzeroHttpClient,
         credentials: &InferenceCredentials,
+        _default_credentials: &ProviderTypeDefaultCredentials,
     ) -> Result<OptimizationJobInfo, Error> {
         // DICL optimization is synchronous, so it's always complete once launched
         let _ = (client, credentials);
@@ -413,6 +408,7 @@ impl JobHandle for DiclOptimizationJobHandle {
                     extra_body: None,
                     extra_headers: None,
                     retries: RetryConfig::default(),
+                    max_distance: None,
                 },
             ))),
         })
@@ -439,12 +435,17 @@ fn validate_function_config(
         }
         FunctionConfig::Json(json_config) => {
             // JSON functions should have exactly one implicit tool for schema validation
-            if json_config.implicit_tool_call_config.tools_available.len() != 1 {
+            if json_config
+                .implicit_tool_call_config
+                .tools_available()
+                .count()
+                != 1
+            {
                 return Err(Error::new(ErrorDetails::InvalidRequest {
                     message: format!(
                         "DICL optimization expected JSON function '{}' to have exactly 1 implicit tool, but found {}. This indicates a configuration issue.",
                         function_name,
-                        json_config.implicit_tool_call_config.tools_available.len()
+                        json_config.implicit_tool_call_config.tools_available().count()
                     ),
                 }));
             }
@@ -474,24 +475,41 @@ fn validate_train_examples(train_examples: &[RenderedSample]) -> Result<(), Erro
                 ),
             }));
         }
-        // Check if tools_available contains actual tools
-        if let Some(tool_params) = &example.tool_params {
-            if !tool_params.tools_available.is_empty() {
-                return Err(Error::new(ErrorDetails::InvalidRequest {
+        // Check if tools are available
+        let has_additional_tools = example
+            .tool_params
+            .additional_tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false);
+        let has_allowed_tools = example
+            .tool_params
+            .allowed_tools
+            .as_ref()
+            .map(|tools| !tools.is_empty())
+            .unwrap_or(false);
+
+        if has_additional_tools || has_allowed_tools {
+            let num_tools = example
+                .tool_params
+                .additional_tools
+                .as_ref()
+                .map(std::vec::Vec::len)
+                .unwrap_or(0);
+            return Err(Error::new(ErrorDetails::InvalidRequest {
                     message: format!(
                         "DICL optimization does not support tool calls. Training example {} contains {} available tools.",
                         i + 1,
-                        tool_params.tools_available.len()
+                        num_tools
                     ),
                 }));
-            }
         }
 
         // Check stored_input messages for ToolCall or ToolResult content
         for message in &example.stored_input.messages {
             for content in &message.content {
                 match content {
-                    crate::inference::types::StoredInputMessageContent::ToolCall(_) => {
+                    StoredInputMessageContent::ToolCall(_) => {
                         return Err(Error::new(ErrorDetails::InvalidRequest {
                             message: format!(
                                 "DICL optimization does not support tool calls. Training example {} contains a tool call in message content.",
@@ -499,7 +517,7 @@ fn validate_train_examples(train_examples: &[RenderedSample]) -> Result<(), Erro
                             ),
                         }));
                     }
-                    crate::inference::types::StoredInputMessageContent::ToolResult(_) => {
+                    StoredInputMessageContent::ToolResult(_) => {
                         return Err(Error::new(ErrorDetails::InvalidRequest {
                             message: format!(
                                 "DICL optimization does not support tool calls. Training example {} contains a tool result in message content.",
@@ -518,7 +536,7 @@ fn validate_train_examples(train_examples: &[RenderedSample]) -> Result<(), Erro
 
 /// Processes a batch of input texts to get embeddings
 async fn process_embedding_batch(
-    embedding_model_config: &EmbeddingModelConfig,
+    config: &Config,
     model_name: &str,
     client: &TensorzeroHttpClient,
     credentials: &InferenceCredentials,
@@ -532,18 +550,43 @@ async fn process_embedding_batch(
         encoding_format: EmbeddingEncodingFormat::Float,
     };
 
+    let embedding_model_config =
+        config
+            .embedding_models
+            .get(model_name)
+            .await?
+            .ok_or_else(|| {
+                Error::new(ErrorDetails::Config {
+                    message: format!("embedding model '{model_name}' not found in configuration",),
+                })
+            })?;
+
+    let tags = Arc::new(HashMap::default());
+
     // Create InferenceClients context for the embedding model
-    let cache_options = CacheOptions::default();
+    let deferred_tasks = tokio_util::task::TaskTracker::new();
     let clients = InferenceClients {
-        http_client: client,
-        credentials,
-        clickhouse_connection_info: &ClickHouseConnectionInfo::Disabled,
-        cache_options: &cache_options,
+        http_client: client.clone(),
+        credentials: Arc::new(credentials.clone()),
+        clickhouse_connection_info: ClickHouseConnectionInfo::new_disabled(),
+        postgres_connection_info: PostgresConnectionInfo::Disabled,
+        cache_options: CacheOptions::default(),
+        tags: tags.clone(),
+        rate_limiting_config: Arc::new(config.rate_limiting.clone()),
+        // We don't currently perform any OTLP export in optimization workflows
+        otlp_config: Default::default(),
+        deferred_tasks: deferred_tasks.clone(),
+        scope_info: ScopeInfo { tags: tags.clone() },
     };
 
     let response = embedding_model_config
         .embed(&embedding_request, model_name, &clients)
         .await?;
+
+    // We're running an optimization, so we don't really have a gateway to shutdown
+    // Let's just wait for the deferred tasks to finish immediately
+    deferred_tasks.close();
+    deferred_tasks.wait().await;
 
     tracing::debug!("Successfully processed embedding batch {}", batch_index);
 
@@ -565,7 +608,7 @@ async fn process_embedding_batch(
 /// Processes all embedding batches with concurrency control
 #[expect(clippy::too_many_arguments)]
 async fn process_embeddings_with_batching(
-    embedding_model_config: &EmbeddingModelConfig,
+    config: &Config,
     model_name: &str,
     client: &TensorzeroHttpClient,
     credentials: &InferenceCredentials,
@@ -605,7 +648,7 @@ async fn process_embeddings_with_batching(
                 })?;
 
                 let result = process_embedding_batch(
-                    embedding_model_config,
+                    config,
                     model_name,
                     client,
                     credentials,
@@ -787,27 +830,48 @@ pub async fn dicl_examples_exist(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::TimeoutsConfig,
-        embeddings::{EmbeddingModelConfig, EmbeddingProviderConfig, EmbeddingProviderInfo},
-        endpoints::inference::InferenceCredentials,
-    };
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use crate::{
+        config::{provider_types::ProviderTypesConfig, SchemaData},
+        embeddings::{
+            EmbeddingModelConfig, EmbeddingModelTable, EmbeddingProviderConfig,
+            EmbeddingProviderInfo,
+        },
+        endpoints::inference::InferenceCredentials,
+        experimentation::ExperimentationConfig,
+        function::{FunctionConfigChat, FunctionConfigJson},
+    };
+    use crate::{
+        inference::types::{
+            ContentBlockChatOutput, ModelInput, ResolvedContentBlock, ResolvedRequestMessage, Role,
+            StoredInput, StoredInputMessage, StoredInputMessageContent, System, Text,
+        },
+        jsonschema_util::StaticJSONSchema,
+        stored_inference::StoredOutput,
+        tool::{
+            create_implicit_tool_call_config, DynamicToolParams, Tool, ToolCall, ToolCallConfig,
+            ToolChoice, ToolResult,
+        },
+    };
+
+    #[cfg(any(test, feature = "e2e_tests"))]
+    use crate::providers::dummy::DummyProvider;
 
     // Helper functions to create test embedding models using the Dummy provider
 
-    fn create_test_embedding_model() -> EmbeddingModelConfig {
+    fn create_test_embedding_model_config() -> Config {
         create_test_embedding_model_with_name("test-embedding")
     }
 
-    fn create_test_embedding_model_with_failure() -> EmbeddingModelConfig {
+    fn create_test_embedding_model_with_failure_config() -> Config {
         create_test_embedding_model_with_name("error") // This will cause the dummy provider to fail
     }
 
-    fn create_test_embedding_model_with_name(model_name: &str) -> EmbeddingModelConfig {
+    fn create_test_embedding_model_with_name(model_name: &str) -> Config {
         #[cfg(any(test, feature = "e2e_tests"))]
         {
-            use crate::providers::dummy::DummyProvider;
             let mut providers = HashMap::new();
             providers.insert(
                 Arc::from("dummy"),
@@ -816,15 +880,26 @@ mod tests {
                         model_name: model_name.to_string(),
                         ..Default::default()
                     }),
-                    timeouts: TimeoutsConfig::default(),
+                    timeout_ms: None,
                     provider_name: Arc::from("dummy"),
                     extra_body: None,
                 },
             );
-            EmbeddingModelConfig {
+            let embedding_model_config = EmbeddingModelConfig {
                 routing: vec![Arc::from("dummy")],
                 providers,
-                timeouts: TimeoutsConfig::default(),
+                timeout_ms: None,
+            };
+            let provider_types = ProviderTypesConfig::default();
+            Config {
+                embedding_models: Arc::new(
+                    EmbeddingModelTable::new(
+                        HashMap::from([(Arc::from(model_name), embedding_model_config)]),
+                        ProviderTypeDefaultCredentials::new(&provider_types).into(),
+                    )
+                    .unwrap(),
+                ),
+                ..Default::default()
             }
         }
         #[cfg(not(any(test, feature = "e2e_tests")))]
@@ -835,14 +910,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_embedding_batch_success() {
-        let embedding_model = create_test_embedding_model();
+        let config = create_test_embedding_model_config();
 
         let client = TensorzeroHttpClient::new().unwrap();
         let credentials = InferenceCredentials::default();
         let batch_texts = vec!["hello".to_string(), "world".to_string()];
 
         let result = process_embedding_batch(
-            &embedding_model,
+            &config,
             "test-embedding",
             &client,
             &credentials,
@@ -862,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_embedding_batch_with_dimensions() {
-        let embedding_model = create_test_embedding_model();
+        let config = create_test_embedding_model_config();
 
         let client = TensorzeroHttpClient::new().unwrap();
         let credentials = InferenceCredentials::default();
@@ -870,7 +945,7 @@ mod tests {
         let dimensions = Some(512);
 
         let result = process_embedding_batch(
-            &embedding_model,
+            &config,
             "test-embedding",
             &client,
             &credentials,
@@ -888,14 +963,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_embedding_batch_failure() {
-        let embedding_model = create_test_embedding_model_with_failure();
+        let config = create_test_embedding_model_with_failure_config();
 
         let client = TensorzeroHttpClient::new().unwrap();
         let credentials = InferenceCredentials::default();
         let batch_texts = vec!["test".to_string()];
 
         let result = process_embedding_batch(
-            &embedding_model,
+            &config,
             "error", // Use "error" model name to trigger failure
             &client,
             &credentials,
@@ -910,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_embeddings_with_batching_success() {
-        let embedding_model = create_test_embedding_model();
+        let config = create_test_embedding_model_config();
 
         let client = TensorzeroHttpClient::new().unwrap();
         let credentials = InferenceCredentials::default();
@@ -921,7 +996,7 @@ mod tests {
         ];
 
         let result = process_embeddings_with_batching(
-            &embedding_model,
+            &config,
             "test-embedding",
             &client,
             &credentials,
@@ -943,14 +1018,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_embeddings_with_batching_respects_concurrency() {
-        let embedding_model = create_test_embedding_model();
+        let config = create_test_embedding_model_config();
 
         let client = TensorzeroHttpClient::new().unwrap();
         let credentials = InferenceCredentials::default();
         let input_texts = vec!["1".to_string(), "2".to_string(), "3".to_string()];
 
         let result = process_embeddings_with_batching(
-            &embedding_model,
+            &config,
             "test-embedding",
             &client,
             &credentials,
@@ -968,35 +1043,24 @@ mod tests {
 
     // Helper function to create a basic RenderedSample for testing
     fn create_test_rendered_sample() -> RenderedSample {
-        use crate::{
-            inference::types::{
-                ContentBlock, ContentBlockChatOutput, ModelInput, RequestMessage, Role,
-                StoredInput, StoredInputMessage, StoredInputMessageContent, Text,
-            },
-            stored_inference::StoredOutput,
-        };
-        use serde_json::json;
-        use std::collections::HashMap;
-        use uuid::Uuid;
-
         RenderedSample {
             function_name: "test_function".to_string(),
             input: ModelInput {
                 system: Some("Test system".to_string()),
-                messages: vec![RequestMessage {
+                messages: vec![ResolvedRequestMessage {
                     role: Role::User,
-                    content: vec![ContentBlock::Text(Text {
+                    content: vec![ResolvedContentBlock::Text(Text {
                         text: "Test message".to_string(),
                     })],
                 }],
             },
             stored_input: StoredInput {
-                system: Some(json!("Test system")),
+                system: Some(System::Text("Test system".to_string())),
                 messages: vec![StoredInputMessage {
                     role: Role::User,
-                    content: vec![StoredInputMessageContent::Text {
-                        value: json!("Test message"),
-                    }],
+                    content: vec![StoredInputMessageContent::Text(Text {
+                        text: "Test message".to_string(),
+                    })],
                 }],
             },
             output: Some(vec![ContentBlockChatOutput::Text(Text {
@@ -1009,32 +1073,26 @@ mod tests {
             )])),
             episode_id: Some(Uuid::now_v7()),
             inference_id: Some(Uuid::now_v7()),
-            tool_params: None,
+            tool_params: DynamicToolParams::default(),
             output_schema: None,
             dispreferred_outputs: vec![],
             tags: HashMap::new(),
         }
     }
 
-    fn create_test_rendered_sample_with_tools(tools: Vec<crate::tool::Tool>) -> RenderedSample {
-        use crate::tool::{ToolCallConfigDatabaseInsert, ToolChoice};
-
+    fn create_test_rendered_sample_with_tools(tools: Vec<Tool>) -> RenderedSample {
         let mut sample = create_test_rendered_sample();
-        sample.tool_params = Some(ToolCallConfigDatabaseInsert {
-            tools_available: tools,
-            tool_choice: ToolChoice::Auto,
+        sample.tool_params = DynamicToolParams {
+            allowed_tools: None,
+            additional_tools: Some(tools),
+            tool_choice: Some(ToolChoice::Auto),
             parallel_tool_calls: Some(true),
-        });
+            provider_tools: None,
+        };
         sample
     }
 
     fn create_test_rendered_sample_with_tool_content() -> RenderedSample {
-        use crate::{
-            inference::types::{Role, StoredInputMessage, StoredInputMessageContent},
-            tool::{ToolCall, ToolCallConfigDatabaseInsert, ToolChoice},
-        };
-        use serde_json::json;
-
         let mut sample = create_test_rendered_sample();
 
         // Add a message with tool call content
@@ -1043,26 +1101,23 @@ mod tests {
             content: vec![StoredInputMessageContent::ToolCall(ToolCall {
                 id: "test_call".to_string(),
                 name: "test_tool".to_string(),
-                arguments: json!({"arg": "value"}).to_string(),
+                arguments: serde_json::json!({"arg": "value"}).to_string(),
             })],
         });
 
         // Also add empty tool params to make it realistic
-        sample.tool_params = Some(ToolCallConfigDatabaseInsert {
-            tools_available: vec![],
-            tool_choice: ToolChoice::None,
+        sample.tool_params = DynamicToolParams {
+            allowed_tools: None,
+            additional_tools: None,
+            tool_choice: Some(ToolChoice::None),
             parallel_tool_calls: Some(false),
-        });
+            provider_tools: None,
+        };
 
         sample
     }
 
     fn create_test_rendered_sample_with_tool_result() -> RenderedSample {
-        use crate::{
-            inference::types::{Role, StoredInputMessage, StoredInputMessageContent},
-            tool::{ToolCallConfigDatabaseInsert, ToolChoice, ToolResult},
-        };
-
         let mut sample = create_test_rendered_sample();
 
         // Add a message with tool result content
@@ -1076,11 +1131,13 @@ mod tests {
         });
 
         // Also add empty tool params to make it realistic
-        sample.tool_params = Some(ToolCallConfigDatabaseInsert {
-            tools_available: vec![],
-            tool_choice: ToolChoice::None,
+        sample.tool_params = DynamicToolParams {
+            allowed_tools: None,
+            additional_tools: None,
+            tool_choice: Some(ToolChoice::None),
             parallel_tool_calls: Some(false),
-        });
+            provider_tools: None,
+        };
 
         sample
     }
@@ -1112,13 +1169,10 @@ mod tests {
 
     #[test]
     fn test_validate_train_examples_rejects_tools_available() {
-        use crate::tool::Tool;
-        use serde_json::json;
-
         let tool = Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
-            parameters: json!({"type": "object", "properties": {}}),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
             strict: false,
         };
 
@@ -1159,15 +1213,12 @@ mod tests {
 
     #[test]
     fn test_validate_train_examples_multiple_samples() {
-        use crate::tool::Tool;
-        use serde_json::json;
-
         let valid_sample = create_test_rendered_sample();
 
         let tool = Tool {
             name: "test_tool".to_string(),
             description: "A test tool".to_string(),
-            parameters: json!({"type": "object", "properties": {}}),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
             strict: false,
         };
         let invalid_sample = create_test_rendered_sample_with_tools(vec![tool]);
@@ -1206,9 +1257,6 @@ mod tests {
     }
 
     fn create_test_chat_function_config_no_tools() -> FunctionConfig {
-        use crate::{config::SchemaData, function::FunctionConfigChat, tool::ToolChoice};
-        use std::collections::HashMap;
-
         FunctionConfig::Chat(FunctionConfigChat {
             variants: HashMap::new(),
             schemas: SchemaData::default(),
@@ -1216,14 +1264,13 @@ mod tests {
             tool_choice: ToolChoice::None,
             parallel_tool_calls: None,
             description: None,
+
             all_explicit_templates_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         })
     }
 
     fn create_test_chat_function_config_with_tools() -> FunctionConfig {
-        use crate::{config::SchemaData, function::FunctionConfigChat, tool::ToolChoice};
-        use std::collections::HashMap;
-
         FunctionConfig::Chat(FunctionConfigChat {
             variants: HashMap::new(),
             schemas: SchemaData::default(),
@@ -1232,18 +1279,12 @@ mod tests {
             parallel_tool_calls: None,
             description: None,
             all_explicit_templates_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         })
     }
 
     fn create_test_json_function_config() -> FunctionConfig {
-        use crate::{
-            config::SchemaData, function::FunctionConfigJson, jsonschema_util::StaticJSONSchema,
-            tool::create_implicit_tool_call_config,
-        };
-        use serde_json::json;
-        use std::collections::HashMap;
-
-        let output_schema = StaticJSONSchema::from_value(json!({
+        let output_schema = StaticJSONSchema::from_value(serde_json::json!({
             "type": "object",
             "properties": {
                 "answer": {"type": "string"}
@@ -1260,21 +1301,13 @@ mod tests {
             output_schema,
             implicit_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         })
     }
 
     fn create_test_json_function_config_invalid_tools() -> FunctionConfig {
-        use crate::{
-            config::SchemaData,
-            function::FunctionConfigJson,
-            jsonschema_util::StaticJSONSchema,
-            tool::{ToolCallConfig, ToolChoice},
-        };
-        use serde_json::json;
-        use std::collections::HashMap;
-
-        let output_schema = StaticJSONSchema::from_value(json!({
+        let output_schema = StaticJSONSchema::from_value(serde_json::json!({
             "type": "object",
             "properties": {
                 "answer": {"type": "string"}
@@ -1284,11 +1317,7 @@ mod tests {
         .unwrap();
 
         // Create an invalid config with no tools (should have exactly 1)
-        let invalid_tool_call_config = ToolCallConfig {
-            tools_available: vec![], // Invalid: should have exactly 1 implicit tool
-            tool_choice: ToolChoice::None,
-            parallel_tool_calls: None,
-        };
+        let invalid_tool_call_config = ToolCallConfig::default();
 
         FunctionConfig::Json(FunctionConfigJson {
             variants: HashMap::new(),
@@ -1296,7 +1325,8 @@ mod tests {
             output_schema,
             implicit_tool_call_config: invalid_tool_call_config,
             description: None,
-            all_template_names: HashSet::new(),
+            all_explicit_template_names: HashSet::new(),
+            experimentation: ExperimentationConfig::default(),
         })
     }
 

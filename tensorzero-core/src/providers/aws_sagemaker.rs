@@ -67,7 +67,7 @@ impl InferenceProvider for AWSSagemakerProvider {
         _dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = self.hosted_provider.make_body(request)?;
+        let request_body = self.hosted_provider.make_body(request).await?;
         let InterceptorAndRawBody {
             interceptor,
             get_raw_request,
@@ -82,16 +82,10 @@ impl InferenceProvider for AWSSagemakerProvider {
         // This ensures that our HTTP proxy (TENSORZERO_E2E_PROXY) is used
         // here when it's enabled.
 
-        // We need to use the `aws_http_client::Client` wrapper type, which currently
-        // doesn't work with the `TensorzeroHttpClient` type.
-        // This causes us to lose out on things like connection pooling and outgoing OTEL headers.
-        // TODO: make this use `TensorzeroHttpClient`
         let new_config = self
             .base_config
             .clone()
-            .http_client(super::aws_http_client::Client::new(
-                http_client.dangerous_get_fallback_client().clone(),
-            ));
+            .http_client(super::aws_http_client::Client::new(http_client.clone()));
         let start_time = Instant::now();
         let res = self
             .client
@@ -142,6 +136,8 @@ impl InferenceProvider for AWSSagemakerProvider {
             raw_request,
             raw_response_string,
             latency,
+            request.model_name,
+            request.provider_name,
         )
     }
 
@@ -152,7 +148,7 @@ impl InferenceProvider for AWSSagemakerProvider {
         _dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = self.hosted_provider.make_body(request)?;
+        let request_body = self.hosted_provider.make_body(request).await?;
 
         let InterceptorAndRawBody {
             interceptor,
@@ -165,17 +161,10 @@ impl InferenceProvider for AWSSagemakerProvider {
         );
 
         // See `infer` for more details
-
-        // We need to use the `aws_http_client::Client` wrapper type, which currently
-        // doesn't work with the `TensorzeroHttpClient` type.
-        // This causes us to lose out on things like connection pooling and outgoing OTEL headers.
-        // TODO: make this use `TensorzeroHttpClient`
         let new_config = self
             .base_config
             .clone()
-            .http_client(super::aws_http_client::Client::new(
-                http_client.dangerous_get_fallback_client().clone(),
-            ));
+            .http_client(super::aws_http_client::Client::new(http_client.clone()));
         let start_time = Instant::now();
         let res = self
             .client

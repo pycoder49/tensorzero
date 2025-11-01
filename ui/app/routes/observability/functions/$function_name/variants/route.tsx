@@ -17,10 +17,8 @@ import {
   queryInferenceTableBoundsByVariantName,
   queryInferenceTableByVariantName,
 } from "~/utils/clickhouse/inference.server";
-import {
-  getVariantPerformances,
-  type TimeWindowUnit,
-} from "~/utils/clickhouse/function";
+import { getVariantPerformances } from "~/utils/clickhouse/function";
+import type { TimeWindow } from "tensorzero-node";
 import { useMemo, useState } from "react";
 import { VariantPerformance } from "~/components/function/variant/VariantPerformance";
 import { MetricSelector } from "~/components/function/variant/MetricSelector";
@@ -37,7 +35,10 @@ import {
 import { logger } from "~/utils/logger";
 
 export const handle: RouteHandle = {
-  crumb: (match) => ["Variants", match.params.variant_name!],
+  crumb: (match) => [
+    "Variants",
+    { label: match.params.variant_name!, isIdentifier: true },
+  ],
 };
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
@@ -92,7 +93,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
           function_config,
           metric_name,
           metric_config: config.metrics[metric_name],
-          time_window_unit: time_granularity as TimeWindowUnit,
+          time_window_unit: time_granularity as TimeWindow,
           variant_name,
         })
       : undefined;
@@ -200,14 +201,6 @@ export default function VariantDetails({ loaderData }: Route.ComponentProps) {
     [metricsWithFeedback],
   );
 
-  const [time_granularity, setTimeGranularity] =
-    useState<TimeWindowUnit>("week");
-  const handleTimeGranularityChange = (granularity: TimeWindowUnit) => {
-    setTimeGranularity(granularity);
-    const searchParams = new URLSearchParams(window.location.search);
-    searchParams.set("time_granularity", granularity);
-    navigate(`?${searchParams.toString()}`, { preventScrollReset: true });
-  };
   const function_type = function_config.type;
   return (
     <PageLayout>
@@ -233,8 +226,7 @@ export default function VariantDetails({ loaderData }: Route.ComponentProps) {
             <VariantPerformance
               variant_performances={variant_performances}
               metric_name={metric_name}
-              time_granularity={time_granularity}
-              onTimeGranularityChange={handleTimeGranularityChange}
+              singleVariantMode
             />
           )}
         </SectionLayout>

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::sync::OnceLock;
 
+use futures::future::try_join_all;
 use futures::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -25,11 +25,11 @@ use crate::inference::types::{
     ProviderInferenceResponse, ProviderInferenceResponseArgs,
 };
 use crate::inference::{InferenceProvider, TensorZeroEventError};
-use crate::model::{build_creds_caching_default, Credential, CredentialLocation, ModelProvider};
+use crate::model::{Credential, ModelProvider};
 use crate::providers::helpers::{
     inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
-use crate::providers::openai::check_api_base_suffix;
+use crate::providers::openai::{check_api_base_suffix, OpenAIMessagesConfig};
 
 const PROVIDER_NAME: &str = "vLLM";
 pub const PROVIDER_TYPE: &str = "vllm";
@@ -44,29 +44,16 @@ pub struct VLLMProvider {
     credentials: VLLMCredentials,
 }
 
-static DEFAULT_CREDENTIALS: OnceLock<VLLMCredentials> = OnceLock::new();
-
 impl VLLMProvider {
-    pub fn new(
-        model_name: String,
-        api_base: Url,
-        api_key_location: Option<CredentialLocation>,
-    ) -> Result<Self, Error> {
-        let credentials = build_creds_caching_default(
-            api_key_location,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-            &DEFAULT_CREDENTIALS,
-        )?;
-
+    pub fn new(model_name: String, api_base: Url, credentials: VLLMCredentials) -> Self {
         // Check if the api_base has the `/chat/completions` suffix and warn if it does
         check_api_base_suffix(&api_base);
 
-        Ok(VLLMProvider {
+        VLLMProvider {
             model_name,
             api_base,
             credentials,
-        })
+        }
     }
 
     pub fn model_name(&self) -> &str {
@@ -74,14 +61,14 @@ impl VLLMProvider {
     }
 }
 
-fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::Env("VLLM_API_KEY".to_string())
-}
-
 #[derive(Clone, Debug)]
 pub enum VLLMCredentials {
     Static(SecretString),
     Dynamic(String),
+    WithFallback {
+        default: Box<VLLMCredentials>,
+        fallback: Box<VLLMCredentials>,
+    },
     None,
 }
 
@@ -93,6 +80,10 @@ impl TryFrom<Credential> for VLLMCredentials {
             Credential::Static(key) => Ok(VLLMCredentials::Static(key)),
             Credential::Dynamic(key_name) => Ok(VLLMCredentials::Dynamic(key_name)),
             Credential::None => Ok(VLLMCredentials::None),
+            Credential::WithFallback { default, fallback } => Ok(VLLMCredentials::WithFallback {
+                default: Box::new((*default).try_into()?),
+                fallback: Box::new((*fallback).try_into()?),
+            }),
             #[cfg(any(test, feature = "e2e_tests"))]
             Credential::Missing => Ok(VLLMCredentials::None),
             _ => Err(Error::new(ErrorDetails::Config {
@@ -101,7 +92,6 @@ impl TryFrom<Credential> for VLLMCredentials {
         }
     }
 }
-
 impl VLLMCredentials {
     fn get_api_key<'a>(
         &'a self,
@@ -116,6 +106,16 @@ impl VLLMCredentials {
                         message: format!("Dynamic api key `{key_name}` is missing"),
                     })
                 })?))
+            }
+            VLLMCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                default.get_api_key(dynamic_api_keys).or_else(|_| {
+                    tracing::info!(
+                        "Default credential for {} is unavailable, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    fallback.get_api_key(dynamic_api_keys)
+                })
             }
             VLLMCredentials::None => Ok(None),
         }
@@ -133,12 +133,13 @@ impl InferenceProvider for VLLMProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(VLLMRequest::new(&self.model_name, request)?)
+        let request_body = serde_json::to_value(VLLMRequest::new(&self.model_name, request).await?)
             .map_err(|e| {
                 Error::new(ErrorDetails::Serialization {
                     message: format!(
@@ -221,12 +222,13 @@ impl InferenceProvider for VLLMProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(VLLMRequest::new(&self.model_name, request)?)
+        let request_body = serde_json::to_value(VLLMRequest::new(&self.model_name, request).await?)
             .map_err(|e| {
                 Error::new(ErrorDetails::Serialization {
                     message: format!(
@@ -322,7 +324,7 @@ struct VLLMRequest<'a> {
 }
 
 impl<'a> VLLMRequest<'a> {
-    pub fn new(
+    pub async fn new(
         model: &'a str,
         request: &'a ModelInferenceRequest<'_>,
     ) -> Result<VLLMRequest<'a>, Error> {
@@ -340,7 +342,16 @@ impl<'a> VLLMRequest<'a> {
         } else {
             None
         };
-        let messages = prepare_vllm_messages(request)?;
+        let messages = prepare_vllm_messages(
+            request,
+            OpenAIMessagesConfig {
+                json_mode: Some(&request.json_mode),
+                provider_type: PROVIDER_TYPE,
+                fetch_and_encode_input_files_before_inference: request
+                    .fetch_and_encode_input_files_before_inference,
+            },
+        )
+        .await?;
 
         let (tools, tool_choice, parallel_tool_calls) = prepare_openai_tools(request);
 
@@ -414,6 +425,7 @@ impl<'a> TryFrom<VLLMResponseWithMetadata<'a>> for ProviderInferenceResponse {
             content.push(ContentBlockOutput::Thought(Thought {
                 text: Some(reasoning),
                 signature: None,
+                summary: None,
                 provider_type: Some(PROVIDER_TYPE.to_string()),
             }));
         }
@@ -442,13 +454,20 @@ impl<'a> TryFrom<VLLMResponseWithMetadata<'a>> for ProviderInferenceResponse {
     }
 }
 
-pub(super) fn prepare_vllm_messages<'a>(
+pub(super) async fn prepare_vllm_messages<'a>(
     request: &'a ModelInferenceRequest<'_>,
+    config: OpenAIMessagesConfig<'a>,
 ) -> Result<Vec<OpenAIRequestMessage<'a>>, Error> {
-    let mut messages = Vec::with_capacity(request.messages.len());
-    for message in &request.messages {
-        messages.extend(tensorzero_to_openai_messages(message, PROVIDER_TYPE)?);
-    }
+    let mut messages: Vec<_> = try_join_all(
+        request
+            .messages
+            .iter()
+            .map(|msg| tensorzero_to_openai_messages(msg, config)),
+    )
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
     if let Some(system_msg) = tensorzero_to_vllm_system_message(request.system.as_deref()) {
         messages.insert(0, system_msg);
     }
@@ -486,8 +505,8 @@ mod tests {
 
     use crate::tool::{ToolCallConfig, ToolChoice};
 
-    #[test]
-    fn test_vllm_request_new() {
+    #[tokio::test]
+    async fn test_vllm_request_new() {
         let model_name = "llama-v3-8b";
         let output_schema = json!({
             "type": "object",
@@ -519,7 +538,9 @@ mod tests {
             ..Default::default()
         };
 
-        let vllm_request = VLLMRequest::new(model_name, &request_with_tools).unwrap();
+        let vllm_request = VLLMRequest::new(model_name, &request_with_tools)
+            .await
+            .unwrap();
 
         assert_eq!(vllm_request.model, model_name);
         assert_eq!(vllm_request.messages.len(), 1);
@@ -559,7 +580,9 @@ mod tests {
             ..Default::default()
         };
 
-        let vllm_request = VLLMRequest::new(model_name, &request_with_tools).unwrap();
+        let vllm_request = VLLMRequest::new(model_name, &request_with_tools)
+            .await
+            .unwrap();
         assert_eq!(vllm_request.model, model_name);
         assert_eq!(vllm_request.messages.len(), 1);
         assert_eq!(vllm_request.temperature, Some(0.5));
@@ -600,8 +623,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_vllm_response_with_metadata_try_into() {
+    #[tokio::test]
+    async fn test_vllm_response_with_metadata_try_into() {
         let valid_response = OpenAIResponse {
             choices: vec![OpenAIResponseChoice {
                 index: 0,
@@ -615,7 +638,6 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
-                total_tokens: 30,
             },
         };
         let generic_request = ModelInferenceRequest {
@@ -646,7 +668,9 @@ mod tests {
                 response_time: Duration::from_secs(0),
             },
             raw_request: serde_json::to_string(
-                &VLLMRequest::new("test-model", &generic_request).unwrap(),
+                &VLLMRequest::new("test-model", &generic_request)
+                    .await
+                    .unwrap(),
             )
             .unwrap(),
             generic_request: &generic_request,
@@ -674,31 +698,27 @@ mod tests {
     #[traced_test]
     fn test_vllm_provider_new_api_base_check() {
         let model_name = "test-model".to_string();
-        let api_key_location = Some(CredentialLocation::None);
 
         // Valid cases (should not warn)
         let _ = VLLMProvider::new(
             model_name.clone(),
             Url::parse("http://localhost:1234/v1/").unwrap(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            VLLMCredentials::None,
+        );
 
         let _ = VLLMProvider::new(
             model_name.clone(),
             Url::parse("http://localhost:1234/v1").unwrap(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            VLLMCredentials::None,
+        );
 
         // Invalid cases (should warn)
         let invalid_url_1 = Url::parse("http://localhost:1234/chat/completions").unwrap();
         let _ = VLLMProvider::new(
             model_name.clone(),
             invalid_url_1.clone(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            VLLMCredentials::None,
+        );
         assert!(logs_contain("automatically appends `/chat/completions`"));
         assert!(logs_contain(invalid_url_1.as_ref()));
 
@@ -706,15 +726,14 @@ mod tests {
         let _ = VLLMProvider::new(
             model_name.clone(),
             invalid_url_2.clone(),
-            api_key_location.clone(),
-        )
-        .unwrap();
+            VLLMCredentials::None,
+        );
         assert!(logs_contain("automatically appends `/chat/completions`"));
         assert!(logs_contain(invalid_url_2.as_ref()));
     }
 
-    #[test]
-    fn test_vllm_tools() {
+    #[tokio::test]
+    async fn test_vllm_tools() {
         let model_name = PROVIDER_TYPE.to_string();
         let request_with_tools = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
@@ -738,7 +757,9 @@ mod tests {
             ..Default::default()
         };
 
-        let vllm_request = VLLMRequest::new(&model_name, &request_with_tools).unwrap();
+        let vllm_request = VLLMRequest::new(&model_name, &request_with_tools)
+            .await
+            .unwrap();
 
         let tools = vllm_request.tools.unwrap();
         assert_eq!(tools.len(), 2);
@@ -754,9 +775,9 @@ mod tests {
         let parallel_tool_calls = vllm_request.parallel_tool_calls.unwrap();
         assert!(parallel_tool_calls);
         let tool_config = ToolCallConfig {
-            tools_available: vec![],
             tool_choice: ToolChoice::Required,
             parallel_tool_calls: Some(true),
+            ..Default::default()
         };
 
         // Test no tools but a tool choice and make sure tool choice output is None
@@ -781,7 +802,9 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let vllm_request = VLLMRequest::new(&model_name, &request_without_tools).unwrap();
+        let vllm_request = VLLMRequest::new(&model_name, &request_without_tools)
+            .await
+            .unwrap();
         assert!(vllm_request.tools.is_none());
         assert!(vllm_request.tool_choice.is_none());
         assert!(vllm_request.parallel_tool_calls.is_none());

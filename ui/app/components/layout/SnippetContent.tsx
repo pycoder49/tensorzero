@@ -10,11 +10,12 @@ import {
   FileText,
   FileAudio,
   AlignLeftIcon,
-  BlocksIcon,
+  FileCode,
 } from "lucide-react";
 import { useBase64UrlToBlobUrl } from "~/hooks/use-blob-url";
 import { CodeEditor, useFormattedJson } from "../ui/code-editor";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import { Input } from "../ui/input";
 
 export function EmptyMessage({ message = "No content" }: { message?: string }) {
   return (
@@ -25,16 +26,18 @@ export function EmptyMessage({ message = "No content" }: { message?: string }) {
 }
 
 interface LabelProps {
-  text?: string;
+  children?: React.ReactNode;
   icon?: React.ReactNode;
+  action?: React.ReactNode;
 }
 
-export function Label({ text, icon }: LabelProps) {
+function Label({ children, icon, action }: LabelProps) {
   return (
-    text && (
+    children && (
       <div className="flex flex-row items-center gap-1">
         {icon}
-        <span className="text-fg-tertiary text-xs font-medium">{text}</span>
+        <span className="text-fg-tertiary text-xs font-medium">{children}</span>
+        <div>{action}</div>
       </div>
     )
   );
@@ -43,72 +46,99 @@ export function Label({ text, icon }: LabelProps) {
 interface TextMessageProps {
   label?: string;
   content?: string;
+  footer?: string | React.ReactNode | null;
   emptyMessage?: string;
   isEditing?: boolean;
   onChange?: (value: string) => void;
+  action?: ReactNode;
 }
 
 export function TextMessage({
   label,
   content,
+  footer,
   emptyMessage,
   isEditing,
   onChange,
+  action,
 }: TextMessageProps) {
   const formattedContent = useFormattedJson(content || "");
 
-  return !content ? (
+  return content === undefined && !isEditing ? (
     <EmptyMessage message={emptyMessage} />
   ) : (
     <div className="flex max-w-240 min-w-80 flex-col gap-1">
       <Label
-        text={label}
         icon={<AlignLeftIcon className="text-fg-muted h-3 w-3" />}
-      />
+        action={action}
+      >
+        {label}
+      </Label>
       <CodeEditor
         value={formattedContent}
         readOnly={!isEditing}
         onChange={onChange}
       />
+      {footer ? (
+        <div className="text-fg-tertiary text-xs font-medium">{footer}</div>
+      ) : null}
     </div>
   );
 }
 
-export function ParameterizedMessage({
-  parameters,
+export function TemplateMessage({
   templateName,
+  templateArguments,
   isEditing,
   onChange,
+  action,
 }: {
-  parameters?: unknown;
-  templateName?: string;
+  templateName: string;
+  templateArguments: unknown;
   isEditing?: boolean;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  onChange?: (value: any) => void;
+  onChange?: (templateName: string, value: any) => void;
+  action?: ReactNode;
 }) {
-  const formattedJson = useFormattedJson(parameters ?? {});
+  const formattedJson = useFormattedJson(templateArguments ?? {});
   const [jsonError, setJsonError] = useState<string | null>(null);
-
-  const labelText = templateName
-    ? `Template: ${templateName}`
-    : "Template Arguments";
 
   return (
     <div className="flex max-w-240 min-w-80 flex-col gap-1">
       <Label
-        text={labelText}
-        icon={<BlocksIcon className="text-fg-muted h-3 w-3" />}
-      />
+        icon={<FileCode className="text-fg-muted h-3 w-3" />}
+        action={action}
+      >
+        <div className="inline-flex items-center gap-1">
+          {!isEditing || templateName === "system" ? (
+            <>
+              Template:{" "}
+              <span className="font-mono text-xs">{templateName}</span>
+            </>
+          ) : (
+            <>
+              Template:
+              <Input
+                type="text"
+                className="inline-block"
+                value={templateName}
+                onChange={(e) => {
+                  onChange?.(e.target.value, templateArguments);
+                }}
+              />
+            </>
+          )}
+        </div>
+      </Label>
       <CodeEditor
         allowedLanguages={["json"]}
         value={formattedJson}
         readOnly={!isEditing}
         onChange={(updatedJson) => {
           try {
-            // TODO: does is satisfy the schema?
             const parsedJson = JSON.parse(updatedJson);
             setJsonError(null);
-            onChange?.(parsedJson);
+            onChange?.(templateName, parsedJson);
           } catch {
             setJsonError("Invalid JSON format");
           }
@@ -147,10 +177,34 @@ function ToolDetails({
   return (
     <div className="border-border bg-bg-tertiary/50 grid grid-flow-row grid-cols-[min-content_1fr] grid-rows-[repeat(3,min-content)] place-content-center gap-x-4 gap-y-1 rounded-sm px-3 py-2 text-xs">
       <p className="text-fg-secondary font-medium">{nameLabel}</p>
-      <p className="self-center truncate font-mono text-[0.6875rem]">{name}</p>
+      {!isEditing ? (
+        <p className="self-center truncate font-mono text-[0.6875rem]">
+          {name}
+        </p>
+      ) : (
+        <Input
+          type="text"
+          value={name}
+          data-testid="tool-name-input"
+          onChange={(e) => {
+            onChange?.(id, e.target.value, payload);
+          }}
+        />
+      )}
 
       <p className="text-fg-secondary font-medium">ID</p>
-      <p className="self-center truncate font-mono text-[0.6875rem]">{id}</p>
+      {!isEditing ? (
+        <p className="self-center truncate font-mono text-[0.6875rem]">{id}</p>
+      ) : (
+        <Input
+          type="text"
+          value={id}
+          data-testid="tool-id-input"
+          onChange={(e) => {
+            onChange?.(e.target.value, name, payload);
+          }}
+        />
+      )}
 
       <p className="text-fg-secondary font-medium">{payloadLabel}</p>
       <CodeEditor
@@ -178,6 +232,7 @@ interface ToolCallMessageProps {
     toolName: string,
     toolArguments: string,
   ) => void;
+  action?: ReactNode;
 }
 
 interface ModelInferenceToolCallMessageProps {
@@ -209,9 +264,11 @@ export function ToolCallMessage(
   return (
     <div className="flex max-w-240 min-w-80 flex-col gap-1">
       <Label
-        text="Tool Call"
         icon={<Terminal className="text-fg-muted h-3 w-3" />}
-      />
+        action={"action" in toolCall ? toolCall.action : undefined}
+      >
+        Tool Call
+      </Label>
       <ToolDetails
         name={toolName}
         nameLabel={nameLabel}
@@ -236,6 +293,7 @@ interface ToolResultMessageProps {
     toolName: string,
     toolResult: string,
   ) => void;
+  action?: ReactNode;
 }
 
 export function ToolResultMessage({
@@ -244,13 +302,16 @@ export function ToolResultMessage({
   toolResultId,
   isEditing,
   onChange,
+  action,
 }: ToolResultMessageProps) {
   return (
     <div className="flex max-w-240 min-w-80 flex-col gap-1">
       <Label
-        text="Tool Result"
         icon={<ArrowRight className="text-fg-muted h-3 w-3" />}
-      />
+        action={action}
+      >
+        Tool Result
+      </Label>
       <ToolDetails
         name={toolName}
         nameLabel="Name"
@@ -272,10 +333,9 @@ interface ImageMessageProps {
 export function ImageMessage({ url, downloadName }: ImageMessageProps) {
   return (
     <div className="flex flex-col gap-1">
-      <Label
-        text="Image"
-        icon={<ImageIcon className="text-fg-muted h-3 w-3" />}
-      />
+      <Label icon={<ImageIcon className="text-fg-muted h-3 w-3" />}>
+        Image
+      </Label>
       <div>
         <Link
           to={url}
@@ -299,10 +359,9 @@ interface FileErrorMessageProps {
 export function FileErrorMessage({ error }: FileErrorMessageProps) {
   return (
     <div className="flex flex-col gap-1">
-      <Label
-        text="Image (Error)"
-        icon={<ImageIcon className="text-fg-muted h-3 w-3" />}
-      />
+      <Label icon={<ImageIcon className="text-fg-muted h-3 w-3" />}>
+        Image (Error)
+      </Label>
       <div className="border-border bg-bg-tertiary relative aspect-video w-60 min-w-60 rounded-md border">
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-2">
           <ImageOff className="text-fg-muted h-4 w-4" />
@@ -380,24 +439,23 @@ function FileMetadata({
 
 interface FileMessageProps {
   /** Base64-encoded "data:" URL containing the file data */
-  fileData: string;
+  data: string;
   filePath: string;
   mimeType: string;
 }
 
 export const AudioMessage: React.FC<FileMessageProps> = ({
-  fileData,
+  data,
   mimeType,
   filePath,
 }) => {
-  const url = useBase64UrlToBlobUrl(fileData, mimeType);
+  const url = useBase64UrlToBlobUrl(data, mimeType);
 
   return (
     <div className="flex flex-col gap-1">
-      <Label
-        text="Audio"
-        icon={<FileAudio className="text-fg-muted h-3 w-3" />}
-      />
+      <Label icon={<FileAudio className="text-fg-muted h-3 w-3" />}>
+        Audio
+      </Label>
 
       <div className="border-border flex w-80 flex-col gap-4 rounded-md border p-3">
         <FileMetadata mimeType={mimeType} filePath={filePath} />
@@ -409,26 +467,19 @@ export const AudioMessage: React.FC<FileMessageProps> = ({
   );
 };
 
-export function FileMessage({
-  fileData,
-  filePath,
-  mimeType,
-}: FileMessageProps) {
-  const url = useBase64UrlToBlobUrl(fileData, mimeType);
+export function FileMessage({ data, filePath, mimeType }: FileMessageProps) {
+  const url = useBase64UrlToBlobUrl(data, mimeType);
 
   return (
     <div className="flex flex-col gap-1">
-      <Label
-        text="File"
-        icon={<FileText className="text-fg-muted h-3 w-3" />}
-      />
+      <Label icon={<FileText className="text-fg-muted h-3 w-3" />}>File</Label>
       <div className="border-border flex w-80 flex-row gap-3 rounded-md border p-3">
         <div className="flex-1">
           <FileMetadata filePath={filePath} mimeType={mimeType} />
         </div>
 
         <Link
-          to={fileData}
+          to={data}
           download={`tensorzero_${filePath}`}
           aria-label={`Download ${filePath}`}
         >

@@ -26,14 +26,14 @@ slow-timeout = { period = "20s", terminate-after = 3 }
 # We also define cargo aliases for common use-cases (e.g. `cargo test-e2e`)
 [profile.e2e]
 retries = { backoff = "exponential", count = 4, delay = "5s", jitter = true, max-delay = "60s" }
-default-filter = "not (test(batch)) and not (test(test_dummy_only) | test(clickhouse))"
+default-filter = "not (test(batch)) and not (test(test_dummy_only) | test(clickhouse) | test(db::))"
 junit.path = "junit.xml"
 
 [profile.batch]
 default-filter = 'test(batch)'
 
 [profile.clickhouse]
-default-filter = 'test(test_dummy_only) | test(clickhouse)'
+default-filter = 'test(test_dummy_only) | test(clickhouse) | test(db::)'
 junit.path = "junit.xml"
 
 [profile.optimization]
@@ -70,6 +70,10 @@ clickhouse_migration = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'test(test_otel_export)'
 slow-timeout = { period = "60s", terminate-after = 2 }
+# We sleep long enough that these tests should pass 100% of the time.
+# Any flakiness indicates a potential bug that could cause us to lose spans,
+# so we don't want to retry.
+retries = 0
 
 [[profile.default.overrides]]
 filter = 'binary(e2e) and test(providers::aws_bedrock::)'
@@ -98,6 +102,16 @@ filter = 'binary(e2e) and test(providers::vllm::)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# Web search is very slow
+filter = 'test(websearch)'
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# Image inference seems to be slow on GCP Vertex Gemini, so we give it a longer timeout
+[[profile.default.overrides]]
+filter = 'test(providers::gcp_vertex_gemini::test_image_inference)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 filter = 'binary(e2e) and test(providers::sglang::)'
 # The model we run on SGLang often fails to emit valid tool calls, so we need many retries
 retries = { backoff = "fixed", count = 8, delay = "10s", jitter = true }
@@ -122,7 +136,7 @@ slow-timeout = { period = "900s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = 'test(test_concurrent_requests)'
 # This test creates and uses lots of `reqwest::Client`s, which can be slow
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "60s", terminate-after = 1 }
 
 [[profile.default.overrides]]
 # Settings for running unit tests

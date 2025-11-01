@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use axum::body::Body;
 use axum::debug_handler;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -35,15 +34,19 @@ use crate::endpoints::inference::{
     inference, ChatCompletionInferenceParams, InferenceParams, Params,
 };
 use crate::error::{Error, ErrorDetails};
-use crate::gateway_util::{AppState, AppStateData, StructuredJson};
 use crate::inference::types::extra_body::UnfilteredInferenceExtraBody;
 use crate::inference::types::extra_headers::UnfilteredInferenceExtraHeaders;
 use crate::inference::types::file::filename_to_mime_type;
 use crate::inference::types::{
-    current_timestamp, ContentBlockChatOutput, ContentBlockChunk, File, FinishReason, Input,
-    InputMessage, InputMessageContent, Role, TextKind, Usage,
+    current_timestamp, Arguments, Base64File, ContentBlockChatOutput, ContentBlockChunk, File,
+    FinishReason, Input, InputMessage, InputMessageContent, RawText, Role, System, Template, Text,
+    UrlFile, Usage,
 };
-use crate::tool::{DynamicToolParams, Tool, ToolCallInput, ToolCallOutput, ToolChoice, ToolResult};
+
+use crate::tool::{
+    DynamicToolParams, ProviderTool, Tool, ToolCallInput, ToolCallOutput, ToolChoice, ToolResult,
+};
+use crate::utils::gateway::{AppState, AppStateData, StructuredJson};
 use crate::variant::JsonMode;
 use serde::Deserializer;
 
@@ -53,8 +56,24 @@ use super::inference::{
     InferenceStream,
 };
 use crate::embeddings::EmbeddingEncodingFormat;
+use crate::endpoints::RouteHandlers;
 use axum::routing::post;
 use axum::Router;
+
+/// Constructs (but does not register) all of our OpenAI-compatible endpoints.
+/// The `RouterExt::register_openai_compatible_routes` is a convenience method
+/// to register all of the routes on a router.
+///
+/// Alternatively, the returned `RouteHandlers` can be inspected (e.g. to allow middleware to see the route paths)
+/// and then manually registered on a router.
+pub fn build_openai_compatible_routes() -> RouteHandlers {
+    RouteHandlers {
+        routes: vec![
+            ("/openai/v1/chat/completions", post(inference_handler)),
+            ("/openai/v1/embeddings", post(embeddings_handler)),
+        ],
+    }
+}
 
 pub trait RouterExt {
     /// Applies our OpenAI-compatible endpoints to the router.
@@ -64,9 +83,11 @@ pub trait RouterExt {
 }
 
 impl RouterExt for Router<AppStateData> {
-    fn register_openai_compatible_routes(self) -> Self {
-        self.route("/openai/v1/chat/completions", post(inference_handler))
-            .route("/openai/v1/embeddings", post(embeddings_handler))
+    fn register_openai_compatible_routes(mut self) -> Self {
+        for (path, handler) in build_openai_compatible_routes().routes {
+            self = self.route(path, handler);
+        }
+        self
     }
 }
 
@@ -77,9 +98,10 @@ pub async fn inference_handler(
         config,
         http_client,
         clickhouse_connection_info,
+        postgres_connection_info,
+        deferred_tasks,
         ..
     }): AppState,
-    headers: HeaderMap,
     StructuredJson(openai_compatible_params): StructuredJson<OpenAICompatibleParams>,
 ) -> Result<Response<Body>, Error> {
     if !openai_compatible_params.unknown_fields.is_empty() {
@@ -106,7 +128,7 @@ pub async fn inference_handler(
         );
     }
     let stream_options = openai_compatible_params.stream_options;
-    let params = Params::try_from_openai(headers, openai_compatible_params)?;
+    let params = Params::try_from_openai(openai_compatible_params)?;
 
     // The prefix for the response's `model` field depends on the inference target
     // (We run this disambiguation deep in the `inference` call below but we don't get the decision out, so we duplicate it here)
@@ -125,7 +147,15 @@ pub async fn inference_handler(
         .into()),
     }?;
 
-    let response = inference(config, &http_client, clickhouse_connection_info, params).await?;
+    let response = inference(
+        config,
+        &http_client,
+        clickhouse_connection_info,
+        postgres_connection_info,
+        deferred_tasks,
+        params,
+    )
+    .await?;
 
     match response {
         InferenceOutput::NonStreaming(response) => {
@@ -234,6 +264,8 @@ pub async fn embeddings_handler(
         config,
         http_client,
         clickhouse_connection_info,
+        postgres_connection_info,
+        deferred_tasks,
         ..
     }): AppState,
     StructuredJson(openai_compatible_params): StructuredJson<OpenAICompatibleEmbeddingParams>,
@@ -243,6 +275,8 @@ pub async fn embeddings_handler(
         config,
         &http_client,
         clickhouse_connection_info,
+        postgres_connection_info,
+        deferred_tasks,
         embedding_params,
     )
     .await?;
@@ -321,21 +355,8 @@ enum OpenAICompatibleMessage {
 #[serde(rename_all = "snake_case")]
 enum OpenAICompatibleResponseFormat {
     Text,
-    JsonSchema { json_schema: JsonSchemaInfoOption },
+    JsonSchema { json_schema: JsonSchemaInfo },
     JsonObject,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(untagged)]
-enum JsonSchemaInfoOption {
-    JsonSchema(JsonSchemaInfo),
-    DeprecatedJsonSchema(Value),
-}
-
-impl std::fmt::Display for JsonSchemaInfoOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -566,6 +587,8 @@ pub struct OpenAICompatibleParams {
     tensorzero_credentials: InferenceCredentials,
     #[serde(rename = "tensorzero::internal_dynamic_variant_config")]
     tensorzero_internal_dynamic_variant_config: Option<UninitializedVariantInfo>,
+    #[serde(default, rename = "tensorzero::provider_tools")]
+    tensorzero_provider_tools: Option<Vec<ProviderTool>>,
     #[serde(flatten)]
     unknown_fields: HashMap<String, Value>,
 }
@@ -598,7 +621,7 @@ enum OpenAICompatibleFinishReason {
     Length,
     ContentFilter,
     ToolCalls,
-    // FunctionCall, we never generate this and it is deprecated
+    // FunctionCall: we never generate this and it is deprecated
 }
 
 impl From<FinishReason> for OpenAICompatibleFinishReason {
@@ -632,10 +655,7 @@ const TENSORZERO_MODEL_NAME_PREFIX: &str = "tensorzero::model_name::";
 const TENSORZERO_EMBEDDING_MODEL_NAME_PREFIX: &str = "tensorzero::embedding_model_name::";
 
 impl Params {
-    fn try_from_openai(
-        headers: HeaderMap,
-        openai_compatible_params: OpenAICompatibleParams,
-    ) -> Result<Self, Error> {
+    fn try_from_openai(openai_compatible_params: OpenAICompatibleParams) -> Result<Self, Error> {
         let (function_name, model_name) = if let Some(function_name) = openai_compatible_params
             .model
             .strip_prefix(TENSORZERO_FUNCTION_NAME_PREFIX)
@@ -646,14 +666,6 @@ impl Params {
             .strip_prefix(TENSORZERO_MODEL_NAME_PREFIX)
         {
             (None, Some(model_name.to_string()))
-        } else if let Some(function_name) =
-            openai_compatible_params.model.strip_prefix("tensorzero::")
-        {
-            tracing::warn!(
-                function_name = function_name,
-                "Deprecation Warning: Please set the `model` parameter to `tensorzero::function_name::your_function` instead of `tensorzero::your_function.` The latter will be removed in a future release."
-            );
-            (Some(function_name.to_string()), None)
         } else {
             return Err(Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
                 message: "`model` field must start with `tensorzero::function_name::` or `tensorzero::model_name::`. For example, `tensorzero::function_name::my_function` for a function `my_function` defined in your config, `tensorzero::model_name::my_model` for a model `my_model` defined in your config, or default functions like `tensorzero::model_name::openai::gpt-4o-mini`.".to_string(),
@@ -680,26 +692,6 @@ impl Params {
             }
         }
 
-        let header_episode_id = headers
-            .get("episode_id")
-            .map(|h| {
-                tracing::warn!("Deprecation Warning: Please use the `tensorzero::episode_id` field instead of the `episode_id` header. The header will be removed in a future release.");
-                h.to_str()
-                    .map_err(|_| {
-                        Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
-                            message: "episode_id header is not valid UTF-8".to_string(),
-                        })
-                    })
-                    .and_then(|s| {
-                        Uuid::parse_str(s).map_err(|_| {
-                            Error::new(ErrorDetails::InvalidTensorzeroUuid {
-                                kind: "Episode".to_string(),
-                                message: "episode_id header is not a valid UUID".to_string(),
-                            })
-                        })
-                    })
-            })
-            .transpose()?;
         // If both max_tokens and max_completion_tokens are provided, we use the minimum of the two.
         // Otherwise, we use the provided value, or None if neither is provided.
         let max_tokens = match (
@@ -735,38 +727,6 @@ impl Params {
         let inference_params = InferenceParams {
             chat_completion: chat_completion_inference_params,
         };
-        let header_variant_name = headers
-            .get("variant_name")
-            .map(|h| {
-                tracing::warn!("Deprecation Warning: Please use the `tensorzero::variant_name` field instead of the `variant_name` header. The header will be removed in a future release.");
-                h.to_str()
-                    .map_err(|_| {
-                        Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
-                            message: "variant_name header is not valid UTF-8".to_string(),
-                        })
-                    })
-                    .map(str::to_string)
-            })
-            .transpose()?;
-        let header_dryrun = headers
-            .get("dryrun")
-            .map(|h| {
-                tracing::warn!("Deprecation Warning: Please use the `tensorzero::dryrun` field instead of the `dryrun` header. The header will be removed in a future release.");
-                h.to_str()
-                    .map_err(|_| {
-                        Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
-                            message: "dryrun header is not valid UTF-8".to_string(),
-                        })
-                    })
-                    .and_then(|s| {
-                        s.parse::<bool>().map_err(|_| {
-                            Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
-                                message: "dryrun header is not a valid boolean".to_string(),
-                            })
-                        })
-                    })
-            })
-            .transpose()?;
         let OpenAICompatibleToolChoiceParams {
             allowed_tools,
             tool_choice,
@@ -781,30 +741,21 @@ impl Params {
                 .map(|tools| tools.into_iter().map(OpenAICompatibleTool::into).collect()),
             tool_choice,
             parallel_tool_calls: openai_compatible_params.parallel_tool_calls,
+            provider_tools: openai_compatible_params.tensorzero_provider_tools,
         };
         let output_schema = match openai_compatible_params.response_format {
-            Some(OpenAICompatibleResponseFormat::JsonSchema { json_schema }) => match json_schema {
-                JsonSchemaInfoOption::JsonSchema(json_schema) => json_schema.schema,
-                JsonSchemaInfoOption::DeprecatedJsonSchema(value) => {
-                    tracing::warn!("Deprecation Warning: Please provide the correct `name`, `description`, `schema`, and `strict` fields in the `json_schema` field in the response format. Simply providing a JSON schema in this field will be rejected in a future TensorZero release.");
-                    Some(value)
-                }
-            },
+            Some(OpenAICompatibleResponseFormat::JsonSchema { json_schema }) => json_schema.schema,
             _ => None,
         };
         Ok(Params {
             function_name,
             model_name,
-            episode_id: openai_compatible_params
-                .tensorzero_episode_id
-                .or(header_episode_id),
+            episode_id: openai_compatible_params.tensorzero_episode_id,
             input,
             stream: openai_compatible_params.stream,
             params: inference_params,
-            variant_name: openai_compatible_params
-                .tensorzero_variant_name
-                .or(header_variant_name),
-            dryrun: openai_compatible_params.tensorzero_dryrun.or(header_dryrun),
+            variant_name: openai_compatible_params.tensorzero_variant_name,
+            dryrun: openai_compatible_params.tensorzero_dryrun,
             dynamic_tool_params,
             output_schema,
             credentials: openai_compatible_params.tensorzero_credentials,
@@ -829,7 +780,7 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
     fn try_from(
         openai_compatible_messages: Vec<OpenAICompatibleMessage>,
     ) -> Result<Self, Self::Error> {
-        let mut system_messages = Vec::new();
+        let mut system_message = None;
         let mut messages = Vec::new();
         let mut tool_call_id_to_name = HashMap::new();
         let first_system = matches!(
@@ -839,37 +790,67 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
         for message in openai_compatible_messages {
             match message {
                 OpenAICompatibleMessage::System(msg) => {
-                    let system_content = convert_openai_message_content(msg.content.clone())?;
+                    let had_prior_system = system_message.is_some();
+                    let system_content =
+                        convert_openai_message_content("system".to_string(), msg.content.clone())?;
+
                     for content in system_content {
-                        system_messages.push(match content {
-                            InputMessageContent::Text(TextKind::LegacyValue { value }) => value,
-                            InputMessageContent::Text(TextKind::Text { text }) => {
-                                Value::String(text)
+                        let text = match content {
+                            InputMessageContent::Text(t) => Some(t.text),
+                            InputMessageContent::RawText(rt) => Some(rt.value),
+                            InputMessageContent::Template(t) => {
+                                if system_message.is_some() {
+                                    return Err(ErrorDetails::InvalidOpenAICompatibleRequest {
+                                        message: "System message cannot contain template with other content".to_string(),
+                                    }.into());
+                                }
+                                system_message = Some(System::Template(t.arguments));
+                                None
                             }
-                            InputMessageContent::Text(TextKind::Arguments { arguments }) => {
-                                Value::Object(arguments)
-                            }
-                            InputMessageContent::RawText { value } => Value::String(value),
                             _ => {
                                 return Err(ErrorDetails::InvalidOpenAICompatibleRequest {
-                                    message: "System message must be a text content block"
-                                        .to_string(),
-                                }
-                                .into())
+                                    message: "System message must contain only text or template content blocks".to_string(),
+                                }.into())
                             }
-                        });
+                        };
+
+                        if let Some(text) = text {
+                            match &mut system_message {
+                                None => system_message = Some(System::Text(text)),
+                                Some(System::Text(s)) => {
+                                    s.push('\n');
+                                    s.push_str(&text);
+                                }
+                                Some(System::Template(_)) => {
+                                    return Err(ErrorDetails::InvalidOpenAICompatibleRequest {
+                                        message: "Cannot add text after template system message"
+                                            .to_string(),
+                                    }
+                                    .into());
+                                }
+                            }
+                        }
+                    }
+
+                    if had_prior_system {
+                        tracing::warn!("Multiple system messages provided. They will be concatenated and moved to the start of the conversation.");
+                    } else if !first_system {
+                        tracing::warn!("Moving system message to the start of the conversation.");
                     }
                 }
                 OpenAICompatibleMessage::User(msg) => {
                     messages.push(InputMessage {
                         role: Role::User,
-                        content: convert_openai_message_content(msg.content)?,
+                        content: convert_openai_message_content("user".to_string(), msg.content)?,
                     });
                 }
                 OpenAICompatibleMessage::Assistant(msg) => {
                     let mut message_content = Vec::new();
                     if let Some(content) = msg.content {
-                        message_content.extend(convert_openai_message_content(content)?);
+                        message_content.extend(convert_openai_message_content(
+                            "assistant".to_string(),
+                            content,
+                        )?);
                     }
                     if let Some(tool_calls) = msg.tool_calls {
                         for tool_call in tool_calls {
@@ -904,36 +885,10 @@ impl TryFrom<Vec<OpenAICompatibleMessage>> for Input {
             }
         }
 
-        if system_messages.len() <= 1 {
-            if system_messages.len() == 1 && !first_system {
-                tracing::warn!("Moving system message to the start of the conversation");
-            }
-            Ok(Input {
-                system: system_messages.pop(),
-                messages,
-            })
-        } else {
-            let mut output = String::new();
-            for (i, system_message) in system_messages.iter().enumerate() {
-                if let Value::String(msg) = system_message {
-                    if i > 0 {
-                        output.push('\n');
-                    }
-                    output.push_str(msg);
-                } else {
-                    return Err(ErrorDetails::InvalidOpenAICompatibleRequest {
-                        message: "Multiple system messages provided, but not all were strings"
-                            .to_string(),
-                    }
-                    .into());
-                }
-            }
-            tracing::warn!("Multiple system messages provided - they will be concatenated and moved to the start of the conversation");
-            Ok(Input {
-                system: Some(Value::String(output)),
-                messages,
-            })
-        }
+        Ok(Input {
+            system: system_message,
+            messages,
+        })
     }
 }
 
@@ -948,15 +903,17 @@ enum OpenAICompatibleContentBlock {
         file: OpenAICompatibleFile,
     },
     #[serde(rename = "tensorzero::raw_text")]
-    RawText {
-        value: String,
-    },
+    RawText(RawText),
+    #[serde(rename = "tensorzero::template")]
+    Template(Template),
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "snake_case")]
 struct OpenAICompatibleImageUrl {
     url: Url,
+    #[serde(rename = "tensorzero::mime_type")]
+    mime_type: Option<MediaType>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -973,9 +930,7 @@ pub enum TextContent {
     /// A normal openai text content block: `{"type": "text", "text": "Some content"}`. The `type` key comes from the parent `OpenAICompatibleContentBlock`
     Text { text: String },
     /// A special TensorZero mode: `{"type": "text", "tensorzero::arguments": {"custom_key": "custom_val"}}`.
-    TensorZeroArguments {
-        tensorzero_arguments: Map<String, Value>,
-    },
+    TensorZeroArguments { tensorzero_arguments: Arguments },
 }
 
 impl<'de> Deserialize<'de> for TextContent {
@@ -994,7 +949,7 @@ impl<'de> Deserialize<'de> for TextContent {
             }),
             (None, Some(arguments)) => Ok(TextContent::TensorZeroArguments {
                 tensorzero_arguments: match arguments {
-                    Value::Object(arguments) => arguments,
+                    Value::Object(arguments) => Arguments(arguments),
                     _ => return Err(serde::de::Error::custom(
                         "`tensorzero::arguments` must be an object when using `\"type\": \"text\"`",
                     )),
@@ -1029,28 +984,35 @@ fn parse_base64_image_data_url(url: &str) -> Result<(MediaType, &str), Error> {
     Ok((image_type, data))
 }
 
-fn convert_openai_message_content(content: Value) -> Result<Vec<InputMessageContent>, Error> {
+fn convert_openai_message_content(
+    role: String,
+    content: Value,
+) -> Result<Vec<InputMessageContent>, Error> {
     match content {
-        Value::String(s) => Ok(vec![InputMessageContent::Text(TextKind::Text { text: s })]),
+        Value::String(s) => Ok(vec![InputMessageContent::Text(Text { text: s })]),
         Value::Array(a) => {
             let mut outputs = Vec::with_capacity(a.len());
             for val in a {
                 let block = serde_json::from_value::<OpenAICompatibleContentBlock>(val.clone());
                 let output = match block {
-                    Ok(OpenAICompatibleContentBlock::RawText{ value }) => InputMessageContent::RawText { value },
-                    Ok(OpenAICompatibleContentBlock::Text(TextContent::Text { text })) => InputMessageContent::Text(TextKind::Text {text }),
-                    Ok(OpenAICompatibleContentBlock::Text(TextContent::TensorZeroArguments { tensorzero_arguments })) => InputMessageContent::Text(TextKind::Arguments { arguments: tensorzero_arguments }),
+                    Ok(OpenAICompatibleContentBlock::RawText(raw_text)) => InputMessageContent::RawText(raw_text),
+                    Ok(OpenAICompatibleContentBlock::Template(template)) => InputMessageContent::Template(template),
+                    Ok(OpenAICompatibleContentBlock::Text(TextContent::Text { text })) => InputMessageContent::Text(Text { text }),
+                    Ok(OpenAICompatibleContentBlock::Text(TextContent::TensorZeroArguments { tensorzero_arguments })) => {
+                        tracing::warn!("Deprecation Warning: Using `tensorzero::arguments` in text content blocks is deprecated. Please use `{{\"type\": \"tensorzero::template\", \"name\": \"role\", \"arguments\": {{...}}}}` instead.");
+                        InputMessageContent::Template(Template { name: role.clone(), arguments: tensorzero_arguments })
+                    }
                     Ok(OpenAICompatibleContentBlock::ImageUrl { image_url }) => {
                         if image_url.url.scheme() == "data" {
                             let url_str = image_url.url.to_string();
                             let (mime_type, data) = parse_base64_image_data_url(&url_str)?;
-                            InputMessageContent::File(File::Base64 { mime_type, data: data.to_string() })
+                            InputMessageContent::File(File::Base64(Base64File { source_url: None, mime_type, data: data.to_string() }))
                         } else {
-                            InputMessageContent::File(File::Url { url: image_url.url, mime_type: None })
+                            InputMessageContent::File(File::Url(UrlFile { url: image_url.url, mime_type: image_url.mime_type }))
                         }
                     }
                     Ok(OpenAICompatibleContentBlock::File { file }) => {
-                        InputMessageContent::File(File::Base64 { mime_type: filename_to_mime_type(&file.filename)?, data: file.file_data })
+                        InputMessageContent::File(File::Base64(Base64File { source_url: None, mime_type: filename_to_mime_type(&file.filename)?, data: file.file_data }))
                     }
                     Err(e) => {
                         if let Some(obj) = val.as_object() {
@@ -1070,9 +1032,9 @@ fn convert_openai_message_content(content: Value) -> Result<Vec<InputMessageCont
                                 }));
                             }
                         }
-                        tracing::warn!(r#"Deprecation Warning: Content block `{val}` was not a valid OpenAI content block. Please use `{{"type": "text", "tensorzero::arguments": {{"custom": "data"}}` to pass arbitrary JSON values to TensorZero: {e}"#);
+                        tracing::warn!(r#"Deprecation Warning: Content block `{val}` was not a valid OpenAI content block. Please use `{{"type": "tensorzero::template", "name": "role", "arguments": {{"custom": "data"}}}}` to pass arbitrary JSON values to TensorZero: {e}"#);
                         if let Value::Object(obj) = val {
-                            InputMessageContent::Text(TextKind::Arguments { arguments: obj })
+                            InputMessageContent::Template(Template { name: role.clone(), arguments: Arguments(obj) })
                         } else {
                             return Err(Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
                                 message: format!("Content block `{val}` is not an object"),
@@ -1353,6 +1315,13 @@ fn process_chat_content_chunk(
                     "Ignoring 'thought' content block chunk when constructing OpenAI-compatible response"
                 );
             }
+            ContentBlockChunk::Unknown { .. } => {
+                // OpenAI compatible endpoint does not support unknown blocks
+                // Users of this endpoint will need to check observability to see them
+                tracing::warn!(
+                    "Ignoring 'unknown' content block chunk when constructing OpenAI-compatible response"
+                );
+            }
         }
     }
     (content_str, tool_calls)
@@ -1465,63 +1434,50 @@ fn prepare_serialized_openai_compatible_events(
 mod tests {
 
     use super::*;
-    use axum::http::header::{HeaderName, HeaderValue};
     use serde_json::json;
     use tracing_test::traced_test;
 
     use crate::cache::CacheEnabledMode;
-    use crate::inference::types::{Text, TextChunk};
+    use crate::inference::types::{System, Text, TextChunk};
     use crate::tool::ToolCallChunk;
 
     #[test]
     fn test_try_from_openai_compatible_params() {
         let episode_id = Uuid::now_v7();
-        let headers = HeaderMap::from_iter(vec![
-            (
-                HeaderName::from_static("episode_id"),
-                HeaderValue::from_str(&episode_id.to_string()).unwrap(),
-            ),
-            (
-                HeaderName::from_static("variant_name"),
-                HeaderValue::from_static("test_variant"),
-            ),
-        ]);
         let messages = vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
             content: Value::String("Hello, world!".to_string()),
         })];
         let tensorzero_tags = HashMap::from([("test".to_string(), "test".to_string())]);
-        let params = Params::try_from_openai(
-            headers,
-            OpenAICompatibleParams {
-                messages,
-                model: "tensorzero::test_function".into(),
-                frequency_penalty: Some(0.5),
-                max_tokens: Some(100),
-                max_completion_tokens: Some(50),
-                presence_penalty: Some(0.5),
-                response_format: None,
-                seed: Some(23),
-                stream: None,
-                temperature: Some(0.5),
-                tools: None,
-                tool_choice: None,
-                top_p: Some(0.5),
-                parallel_tool_calls: None,
-                tensorzero_episode_id: None,
-                tensorzero_variant_name: None,
-                tensorzero_dryrun: None,
-                tensorzero_cache_options: None,
-                tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
-                tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
-                tensorzero_tags: tensorzero_tags.clone(),
-                tensorzero_deny_unknown_fields: false,
-                tensorzero_credentials: InferenceCredentials::default(),
-                unknown_fields: Default::default(),
-                stream_options: None,
-                stop: None,
-                tensorzero_internal_dynamic_variant_config: None,
-            },
-        )
+        let params = Params::try_from_openai(OpenAICompatibleParams {
+            messages,
+            model: "tensorzero::function_name::test_function".into(),
+            frequency_penalty: Some(0.5),
+            max_tokens: Some(100),
+            max_completion_tokens: Some(50),
+            presence_penalty: Some(0.5),
+            response_format: None,
+            seed: Some(23),
+            stream: None,
+            temperature: Some(0.5),
+            tools: None,
+            tool_choice: None,
+            top_p: Some(0.5),
+            parallel_tool_calls: None,
+            tensorzero_episode_id: Some(episode_id),
+            tensorzero_variant_name: Some("test_variant".to_string()),
+            tensorzero_dryrun: None,
+            tensorzero_cache_options: None,
+            tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
+            tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
+            tensorzero_tags: tensorzero_tags.clone(),
+            tensorzero_deny_unknown_fields: false,
+            tensorzero_credentials: InferenceCredentials::default(),
+            unknown_fields: Default::default(),
+            stream_options: None,
+            stop: None,
+            tensorzero_internal_dynamic_variant_config: None,
+            tensorzero_provider_tools: None,
+        })
         .unwrap();
         assert_eq!(params.function_name, Some("test_function".to_string()));
         assert_eq!(params.episode_id, Some(episode_id));
@@ -1530,7 +1486,7 @@ mod tests {
         assert_eq!(params.input.messages[0].role, Role::User);
         assert_eq!(
             params.input.messages[0].content[0],
-            InputMessageContent::Text(TextKind::Text {
+            InputMessageContent::Text(Text {
                 text: "Hello, world!".to_string(),
             })
         );
@@ -1553,7 +1509,7 @@ mod tests {
         assert_eq!(input.messages[0].role, Role::User);
         assert_eq!(
             input.messages[0].content[0],
-            InputMessageContent::Text(TextKind::Text {
+            InputMessageContent::Text(Text {
                 text: "Hello, world!".to_string(),
             })
         );
@@ -1571,7 +1527,7 @@ mod tests {
         assert_eq!(input.messages[0].role, Role::User);
         assert_eq!(
             input.system,
-            Some(Value::String("You are a helpful assistant".to_string()))
+            Some(System::Text("You are a helpful assistant".to_string()))
         );
         // Now try some messages with structured content
         let messages = vec![
@@ -1607,7 +1563,9 @@ mod tests {
         let input: Input = messages.try_into().unwrap();
         assert_eq!(
             input.system,
-            Some("You are a helpful assistant 1.\nYou are a helpful assistant 2.".into())
+            Some(System::Text(
+                "You are a helpful assistant 1.\nYou are a helpful assistant 2.".to_string()
+            ))
         );
         assert_eq!(input.messages.len(), 0);
 
@@ -1626,14 +1584,17 @@ mod tests {
         assert_eq!(input.messages[0].role, Role::Assistant);
         assert_eq!(
             input.messages[0].content[0],
-            InputMessageContent::Text(TextKind::Arguments {
-                arguments: json!({
-                    "country": "Japan",
-                    "city": "Tokyo",
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
+            InputMessageContent::Template(Template {
+                name: "assistant".to_string(),
+                arguments: Arguments(
+                    json!({
+                        "country": "Japan",
+                        "city": "Tokyo",
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                ),
             })
         );
 
@@ -1656,7 +1617,7 @@ mod tests {
         assert_eq!(input.messages[0].role, Role::Assistant);
         assert_eq!(input.messages[0].content.len(), 2);
 
-        let expected_text = InputMessageContent::Text(TextKind::Text {
+        let expected_text = InputMessageContent::Text(Text {
             text: "Hello, world!".to_string(),
         });
         let expected_tool_call = InputMessageContent::ToolCall(ToolCallInput {
@@ -1686,15 +1647,198 @@ mod tests {
             }),
         ];
         let result: Input = out_of_order_messages.try_into().unwrap();
-        assert_eq!(result.system, Some("System message".into()));
+        assert_eq!(
+            result.system,
+            Some(System::Text("System message".to_string()))
+        );
         assert_eq!(
             result.messages,
             vec![InputMessage {
                 role: Role::Assistant,
-                content: vec![InputMessageContent::Text(TextKind::Text {
+                content: vec![InputMessageContent::Text(Text {
                     text: "Assistant message".to_string(),
                 })],
             }]
+        );
+
+        // Try a system message with legacy template format (tensorzero::arguments)
+        let messages = vec![OpenAICompatibleMessage::System(
+            OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "text",
+                    "tensorzero::arguments": {
+                        "assistant_name": "Alfred Pennyworth"
+                    }
+                }]),
+            },
+        )];
+        let input: Input = messages.try_into().unwrap();
+        assert_eq!(
+            input.system,
+            Some(System::Template(Arguments(
+                json!({"assistant_name": "Alfred Pennyworth"})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            )))
+        );
+        assert_eq!(input.messages.len(), 0);
+
+        // Try a system message with new template format
+        let messages = vec![OpenAICompatibleMessage::System(
+            OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "tensorzero::template",
+                    "name": "system",
+                    "arguments": {
+                        "assistant_name": "Jarvis"
+                    }
+                }]),
+            },
+        )];
+        let input: Input = messages.try_into().unwrap();
+        assert_eq!(
+            input.system,
+            Some(System::Template(Arguments(
+                json!({"assistant_name": "Jarvis"})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            )))
+        );
+
+        // Error: system message with template and text content (multiple content blocks)
+        let messages = vec![OpenAICompatibleMessage::System(
+            OpenAICompatibleSystemMessage {
+                content: json!([
+                    {"type": "text", "text": "Hello"},
+                    {
+                        "type": "text",
+                        "tensorzero::arguments": {
+                            "assistant_name": "Alfred"
+                        }
+                    }
+                ]),
+            },
+        )];
+        let result: Result<Input, Error> = messages.try_into();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(
+            *error.get_details(),
+            ErrorDetails::InvalidOpenAICompatibleRequest {
+                message: "System message cannot contain template with other content".to_string(),
+            }
+        );
+
+        // Error: text system message followed by template system message
+        let messages = vec![
+            OpenAICompatibleMessage::System(OpenAICompatibleSystemMessage {
+                content: Value::String("You are helpful.".to_string()),
+            }),
+            OpenAICompatibleMessage::System(OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "text",
+                    "tensorzero::arguments": {
+                        "assistant_name": "Alfred"
+                    }
+                }]),
+            }),
+        ];
+        let result: Result<Input, Error> = messages.try_into();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(
+            *error.get_details(),
+            ErrorDetails::InvalidOpenAICompatibleRequest {
+                message: "System message cannot contain template with other content".to_string(),
+            }
+        );
+
+        // Error: template system message followed by text system message
+        let messages = vec![
+            OpenAICompatibleMessage::System(OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "text",
+                    "tensorzero::arguments": {
+                        "assistant_name": "Alfred"
+                    }
+                }]),
+            }),
+            OpenAICompatibleMessage::System(OpenAICompatibleSystemMessage {
+                content: Value::String("You are helpful.".to_string()),
+            }),
+        ];
+        let result: Result<Input, Error> = messages.try_into();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(
+            *error.get_details(),
+            ErrorDetails::InvalidOpenAICompatibleRequest {
+                message: "Cannot add text after template system message".to_string(),
+            }
+        );
+
+        // Error: multiple template system messages
+        let messages = vec![
+            OpenAICompatibleMessage::System(OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "text",
+                    "tensorzero::arguments": {
+                        "assistant_name": "Alfred"
+                    }
+                }]),
+            }),
+            OpenAICompatibleMessage::System(OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "tensorzero::template",
+                    "name": "system",
+                    "arguments": {
+                        "assistant_name": "Jarvis"
+                    }
+                }]),
+            }),
+        ];
+        let result: Result<Input, Error> = messages.try_into();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(
+            *error.get_details(),
+            ErrorDetails::InvalidOpenAICompatibleRequest {
+                message: "System message cannot contain template with other content".to_string(),
+            }
+        );
+
+        // Success: system message with multiple text content blocks (should concatenate within single message)
+        let messages = vec![OpenAICompatibleMessage::System(
+            OpenAICompatibleSystemMessage {
+                content: json!([
+                    {"type": "text", "text": "You are helpful."},
+                    {"type": "text", "text": "You are concise."}
+                ]),
+            },
+        )];
+        let input: Input = messages.try_into().unwrap();
+        assert_eq!(
+            input.system,
+            Some(System::Text(
+                "You are helpful.\nYou are concise.".to_string()
+            ))
+        );
+
+        // Success: system message with tensorzero::raw_text
+        let messages = vec![OpenAICompatibleMessage::System(
+            OpenAICompatibleSystemMessage {
+                content: json!([{
+                    "type": "tensorzero::raw_text",
+                    "value": "Raw system text"
+                }]),
+            },
+        )];
+        let input: Input = messages.try_into().unwrap();
+        assert_eq!(
+            input.system,
+            Some(System::Text("Raw system text".to_string()))
         );
     }
 
@@ -1702,46 +1846,52 @@ mod tests {
     fn test_convert_openai_message_content() {
         // text content
         let content = "Hello, world!".to_string();
-        let value = convert_openai_message_content(Value::String(content.clone())).unwrap();
+        let value =
+            convert_openai_message_content("user".to_string(), Value::String(content.clone()))
+                .unwrap();
         assert_eq!(
             value,
-            vec![InputMessageContent::Text(TextKind::Text { text: content })]
+            vec![InputMessageContent::Text(Text { text: content })]
         );
         // tensorzero::raw_text
         let content = json!([{
             "type": "tensorzero::raw_text",
             "value": "This is raw text"
         }]);
-        let value = convert_openai_message_content(content.clone()).unwrap();
+        let value = convert_openai_message_content("user".to_string(), content.clone()).unwrap();
         assert_eq!(
             value,
-            vec![InputMessageContent::RawText {
+            vec![InputMessageContent::RawText(RawText {
                 value: "This is raw text".to_string()
-            }]
+            })]
         );
         // tensorzero::arguments
         let content = json!([{
             "country": "Japan",
             "city": "Tokyo",
         }]);
-        let value = convert_openai_message_content(content.clone()).unwrap();
+        let value = convert_openai_message_content("user".to_string(), content.clone()).unwrap();
         assert_eq!(
             value,
-            vec![InputMessageContent::Text(TextKind::Arguments {
-                arguments: json!({
-                    "country": "Japan",
-                    "city": "Tokyo",
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
+            vec![InputMessageContent::Template(Template {
+                name: "user".to_string(),
+                arguments: Arguments(
+                    json!({
+                        "country": "Japan",
+                        "city": "Tokyo",
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                ),
             })]
         );
         let content = json!({
             "country": "Japan",
             "city": "Tokyo",
         });
-        let error = convert_openai_message_content(content.clone()).unwrap_err();
+        let error =
+            convert_openai_message_content("user".to_string(), content.clone()).unwrap_err();
         let details = error.get_details();
         assert_eq!(
             *details,
@@ -1750,7 +1900,7 @@ mod tests {
             }
         );
         let content = json!([]);
-        let messages = convert_openai_message_content(content).unwrap();
+        let messages = convert_openai_message_content("user".to_string(), content).unwrap();
         assert_eq!(messages, vec![]);
 
         let arguments_block = json!([{
@@ -1759,16 +1909,40 @@ mod tests {
                 "custom_key": "custom_val"
             }
         }]);
-        let value = convert_openai_message_content(arguments_block).unwrap();
+        let value = convert_openai_message_content("user".to_string(), arguments_block).unwrap();
         assert_eq!(
             value,
-            vec![InputMessageContent::Text(TextKind::Arguments {
-                arguments: json!({
-                    "custom_key": "custom_val",
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
+            vec![InputMessageContent::Template(Template {
+                name: "user".to_string(),
+                arguments: Arguments(
+                    json!({
+                        "custom_key": "custom_val",
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                ),
+            })]
+        );
+
+        let template_block = json!([{
+            "type": "tensorzero::template",
+            "name": "my_template",
+            "arguments": {
+                "custom_key": "custom_val",
+            }
+        }]);
+        let value = convert_openai_message_content("user".to_string(), template_block).unwrap();
+        assert_eq!(
+            value,
+            vec![InputMessageContent::Template(Template {
+                name: "my_template".to_string(),
+                arguments: Arguments(
+                    json!({ "custom_key": "custom_val" })
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                )
             })]
         );
     }
@@ -1780,17 +1954,20 @@ mod tests {
             "country": "Japan",
             "city": "Tokyo",
         }]);
-        let value = convert_openai_message_content(content.clone()).unwrap();
+        let value = convert_openai_message_content("user".to_string(), content.clone()).unwrap();
         assert_eq!(
             value,
-            vec![InputMessageContent::Text(TextKind::Arguments {
-                arguments: json!({
-                    "country": "Japan",
-                    "city": "Tokyo",
-                })
-                .as_object()
-                .unwrap()
-                .clone(),
+            vec![InputMessageContent::Template(Template {
+                name: "user".to_string(),
+                arguments: Arguments(
+                    json!({
+                        "country": "Japan",
+                        "city": "Tokyo",
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                ),
             })]
         );
         assert!(logs_contain(
@@ -1801,7 +1978,7 @@ mod tests {
             "type": "text",
             "my_custom_arg": 123
         }]);
-        let err = convert_openai_message_content(other_content.clone())
+        let err = convert_openai_message_content("user".to_string(), other_content.clone())
             .expect_err("Should not accept invalid block");
         assert_eq!(err.to_string(), "Invalid request to OpenAI-compatible endpoint: Invalid content block: Either `text` or `tensorzero::arguments` must be set when using `\"type\": \"text\"`");
     }
@@ -1964,84 +2141,78 @@ mod tests {
 
     #[test]
     fn test_cache_options() {
-        let headers = HeaderMap::new();
-
         // Test default cache options (should be write-only)
-        let params = Params::try_from_openai(
-            headers.clone(),
-            OpenAICompatibleParams {
-                messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
-                    content: Value::String("test".to_string()),
-                })],
-                model: "tensorzero::function_name::test_function".into(),
-                frequency_penalty: None,
-                max_tokens: None,
-                max_completion_tokens: None,
-                presence_penalty: None,
-                response_format: None,
-                seed: None,
-                stream: None,
-                temperature: None,
-                tools: None,
-                tool_choice: None,
-                top_p: None,
-                parallel_tool_calls: None,
-                tensorzero_variant_name: None,
-                tensorzero_dryrun: None,
-                tensorzero_episode_id: None,
-                tensorzero_cache_options: None,
-                tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
-                tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
-                tensorzero_tags: HashMap::new(),
-                tensorzero_credentials: InferenceCredentials::default(),
-                unknown_fields: Default::default(),
-                stream_options: None,
-                stop: None,
-                tensorzero_deny_unknown_fields: false,
-                tensorzero_internal_dynamic_variant_config: None,
-            },
-        )
+        let params = Params::try_from_openai(OpenAICompatibleParams {
+            messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+                content: Value::String("test".to_string()),
+            })],
+            model: "tensorzero::function_name::test_function".into(),
+            frequency_penalty: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            response_format: None,
+            seed: None,
+            stream: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            top_p: None,
+            parallel_tool_calls: None,
+            tensorzero_variant_name: None,
+            tensorzero_dryrun: None,
+            tensorzero_episode_id: None,
+            tensorzero_cache_options: None,
+            tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
+            tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
+            tensorzero_tags: HashMap::new(),
+            tensorzero_credentials: InferenceCredentials::default(),
+            unknown_fields: Default::default(),
+            stream_options: None,
+            stop: None,
+            tensorzero_deny_unknown_fields: false,
+            tensorzero_internal_dynamic_variant_config: None,
+            tensorzero_provider_tools: None,
+        })
         .unwrap();
         assert_eq!(params.cache_options, CacheParamsOptions::default());
 
         // Test explicit cache options
-        let params = Params::try_from_openai(
-            headers.clone(),
-            OpenAICompatibleParams {
-                messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
-                    content: Value::String("test".to_string()),
-                })],
-                model: "tensorzero::function_name::test_function".into(),
-                frequency_penalty: None,
-                max_tokens: None,
-                max_completion_tokens: None,
-                presence_penalty: None,
-                response_format: None,
-                seed: None,
-                stream: None,
-                temperature: None,
-                tools: None,
-                tool_choice: None,
-                top_p: None,
-                parallel_tool_calls: None,
-                tensorzero_variant_name: None,
-                tensorzero_dryrun: None,
-                tensorzero_episode_id: None,
-                tensorzero_cache_options: Some(CacheParamsOptions {
-                    max_age_s: Some(3600),
-                    enabled: CacheEnabledMode::On,
-                }),
-                tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
-                tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
-                tensorzero_tags: HashMap::new(),
-                tensorzero_credentials: InferenceCredentials::default(),
-                unknown_fields: Default::default(),
-                stream_options: None,
-                stop: None,
-                tensorzero_deny_unknown_fields: false,
-                tensorzero_internal_dynamic_variant_config: None,
-            },
-        )
+        let params = Params::try_from_openai(OpenAICompatibleParams {
+            messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+                content: Value::String("test".to_string()),
+            })],
+            model: "tensorzero::function_name::test_function".into(),
+            frequency_penalty: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            response_format: None,
+            seed: None,
+            stream: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            top_p: None,
+            parallel_tool_calls: None,
+            tensorzero_variant_name: None,
+            tensorzero_dryrun: None,
+            tensorzero_episode_id: None,
+            tensorzero_cache_options: Some(CacheParamsOptions {
+                max_age_s: Some(3600),
+                enabled: CacheEnabledMode::On,
+            }),
+            tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
+            tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
+            tensorzero_tags: HashMap::new(),
+            tensorzero_credentials: InferenceCredentials::default(),
+            unknown_fields: Default::default(),
+            stream_options: None,
+            stop: None,
+            tensorzero_deny_unknown_fields: false,
+            tensorzero_internal_dynamic_variant_config: None,
+            tensorzero_provider_tools: None,
+        })
         .unwrap();
         assert_eq!(
             params.cache_options,
@@ -2052,43 +2223,41 @@ mod tests {
         );
 
         // Test interaction with dryrun
-        let params = Params::try_from_openai(
-            headers.clone(),
-            OpenAICompatibleParams {
-                messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
-                    content: Value::String("test".to_string()),
-                })],
-                model: "tensorzero::function_name::test_function".into(),
-                frequency_penalty: None,
-                max_tokens: None,
-                max_completion_tokens: None,
-                presence_penalty: None,
-                response_format: None,
-                seed: None,
-                stream: None,
-                temperature: None,
-                tools: None,
-                tool_choice: None,
-                top_p: None,
-                parallel_tool_calls: None,
-                tensorzero_variant_name: None,
-                tensorzero_dryrun: Some(true),
-                tensorzero_episode_id: None,
-                tensorzero_cache_options: Some(CacheParamsOptions {
-                    max_age_s: Some(3600),
-                    enabled: CacheEnabledMode::On,
-                }),
-                tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
-                tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
-                tensorzero_tags: HashMap::new(),
-                tensorzero_credentials: InferenceCredentials::default(),
-                unknown_fields: Default::default(),
-                stream_options: None,
-                stop: None,
-                tensorzero_deny_unknown_fields: false,
-                tensorzero_internal_dynamic_variant_config: None,
-            },
-        )
+        let params = Params::try_from_openai(OpenAICompatibleParams {
+            messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+                content: Value::String("test".to_string()),
+            })],
+            model: "tensorzero::function_name::test_function".into(),
+            frequency_penalty: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            response_format: None,
+            seed: None,
+            stream: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            top_p: None,
+            parallel_tool_calls: None,
+            tensorzero_variant_name: None,
+            tensorzero_dryrun: Some(true),
+            tensorzero_episode_id: None,
+            tensorzero_cache_options: Some(CacheParamsOptions {
+                max_age_s: Some(3600),
+                enabled: CacheEnabledMode::On,
+            }),
+            tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
+            tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
+            tensorzero_tags: HashMap::new(),
+            tensorzero_credentials: InferenceCredentials::default(),
+            unknown_fields: Default::default(),
+            stream_options: None,
+            stop: None,
+            tensorzero_deny_unknown_fields: false,
+            tensorzero_internal_dynamic_variant_config: None,
+            tensorzero_provider_tools: None,
+        })
         .unwrap();
         assert_eq!(
             params.cache_options,
@@ -2099,43 +2268,41 @@ mod tests {
         );
 
         // Test write-only with dryrun (should become Off)
-        let params = Params::try_from_openai(
-            headers,
-            OpenAICompatibleParams {
-                messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
-                    content: Value::String("test".to_string()),
-                })],
-                model: "tensorzero::function_name::test_function".into(),
-                frequency_penalty: None,
-                max_tokens: None,
-                max_completion_tokens: None,
-                presence_penalty: None,
-                response_format: None,
-                seed: None,
-                stream: None,
-                temperature: None,
-                tools: None,
-                tool_choice: None,
-                top_p: None,
-                parallel_tool_calls: None,
-                tensorzero_variant_name: None,
-                tensorzero_dryrun: Some(true),
-                tensorzero_episode_id: None,
-                tensorzero_cache_options: Some(CacheParamsOptions {
-                    max_age_s: None,
-                    enabled: CacheEnabledMode::WriteOnly,
-                }),
-                tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
-                tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
-                tensorzero_tags: HashMap::new(),
-                tensorzero_credentials: InferenceCredentials::default(),
-                unknown_fields: Default::default(),
-                stream_options: None,
-                stop: None,
-                tensorzero_deny_unknown_fields: false,
-                tensorzero_internal_dynamic_variant_config: None,
-            },
-        )
+        let params = Params::try_from_openai(OpenAICompatibleParams {
+            messages: vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+                content: Value::String("test".to_string()),
+            })],
+            model: "tensorzero::function_name::test_function".into(),
+            frequency_penalty: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            presence_penalty: None,
+            response_format: None,
+            seed: None,
+            stream: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            top_p: None,
+            parallel_tool_calls: None,
+            tensorzero_variant_name: None,
+            tensorzero_dryrun: Some(true),
+            tensorzero_episode_id: None,
+            tensorzero_cache_options: Some(CacheParamsOptions {
+                max_age_s: None,
+                enabled: CacheEnabledMode::WriteOnly,
+            }),
+            tensorzero_extra_body: UnfilteredInferenceExtraBody::default(),
+            tensorzero_extra_headers: UnfilteredInferenceExtraHeaders::default(),
+            tensorzero_tags: HashMap::new(),
+            tensorzero_credentials: InferenceCredentials::default(),
+            unknown_fields: Default::default(),
+            stream_options: None,
+            stop: None,
+            tensorzero_deny_unknown_fields: false,
+            tensorzero_internal_dynamic_variant_config: None,
+            tensorzero_provider_tools: None,
+        })
         .unwrap();
         assert_eq!(
             params.cache_options,

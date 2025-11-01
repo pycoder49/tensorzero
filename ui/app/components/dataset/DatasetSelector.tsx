@@ -16,34 +16,7 @@ import {
   CommandList,
 } from "~/components/ui/command";
 import clsx from "clsx";
-import { z } from "zod";
-import { useQuery } from "@tanstack/react-query";
-
-const useDatasetCounts = (functionName?: string) => {
-  return useQuery({
-    queryKey: ["DATASETS_COUNT", functionName],
-    queryFn: async ({ signal }) => {
-      const url = new URL("/api/datasets/counts", window.location.origin);
-      if (functionName) {
-        url.searchParams.append("function", functionName);
-      }
-      const response = await fetch(url.toString(), { signal });
-      const data = await response.json();
-      const parsedData = DatasetCountResponse.parse(data);
-      return parsedData.datasets;
-    },
-  });
-};
-
-export const DatasetCountResponse = z.object({
-  datasets: z.array(
-    z.object({
-      name: z.string(),
-      count: z.number(),
-      lastUpdated: z.string().datetime(),
-    }),
-  ),
-});
+import { useDatasetCounts } from "~/hooks/use-dataset-counts";
 
 interface DatasetSelectorProps {
   selected?: string;
@@ -182,6 +155,7 @@ export function DatasetSelector({
                           setOpen(false);
                         }}
                         className="group flex w-full items-center gap-2"
+                        data-dataset-name={dataset.name}
                       >
                         <div className="flex min-w-0 flex-1 items-center gap-2">
                           {selected === dataset.name ? (

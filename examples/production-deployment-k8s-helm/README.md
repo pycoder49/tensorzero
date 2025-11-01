@@ -14,6 +14,7 @@ This example shows how to deploy the TensorZero (including the TensorZero Gatewa
 - Ingress controller installed in your cluster (e.g. `traefik-ingress-controller-v3`)
 - StorageClass configured for persistent volumes (e.g. `ebs-gp3-retain`)
 - Sufficient resources for running ClickHouse and TensorZero services (recommend at least 4GB memory for minikube)
+- If `monitoring.metrics.enabled` is set, [Prometheus Operator](https://prometheus-operator.dev/) needs to be installed in your cluster
 
 ## Installing the Chart
 
@@ -65,36 +66,38 @@ The following table lists the configurable parameters of the chart and their def
 
 ### Gateway Configuration
 
-| Parameter                    | Description                | Default                         |
-| ---------------------------- | -------------------------- | ------------------------------- |
-| `gateway.replicaCount`       | Number of gateway replicas | `1`                             |
-| `gateway.image.repository`   | Gateway image repository   | `tensorzero/gateway`            |
-| `gateway.image.tag`          | Gateway image tag          | `latest`                        |
-| `gateway.image.pullPolicy`   | Gateway image pull policy  | `IfNotPresent`                  |
-| `gateway.service.type`       | Gateway service type       | `ClusterIP`                     |
-| `gateway.service.port`       | Gateway service port       | `3000`                          |
-| `gateway.resources.limits`   | Gateway resource limits    | `cpu: 2000m, memory: 4096Mi`    |
-| `gateway.resources.requests` | Gateway resource requests  | `cpu: 2000m, memory: 4096Mi`    |
-| `gateway.ingress.enabled`    | Enable gateway ingress     | `true`                          |
-| `gateway.ingress.className`  | Gateway ingress class      | `traefik-ingress-controller-v3` |
-| `gateway.ingress.hosts`      | Gateway ingress hosts      | `tensorzero-gateway.local`      |
+| Parameter                    | Description                      | Default                         |
+| ---------------------------- | -------------------------------- | ------------------------------- |
+| `gateway.replicaCount`       | Number of gateway replicas       | `1`                             |
+| `gateway.serviceAccountName` | Service account for gateway pods | `""`                            |
+| `gateway.image.repository`   | Gateway image repository         | `tensorzero/gateway`            |
+| `gateway.image.tag`          | Gateway image tag                | `latest`                        |
+| `gateway.image.pullPolicy`   | Gateway image pull policy        | `IfNotPresent`                  |
+| `gateway.service.type`       | Gateway service type             | `ClusterIP`                     |
+| `gateway.service.port`       | Gateway service port             | `3000`                          |
+| `gateway.resources.limits`   | Gateway resource limits          | `cpu: 2000m, memory: 4096Mi`    |
+| `gateway.resources.requests` | Gateway resource requests        | `cpu: 2000m, memory: 4096Mi`    |
+| `gateway.ingress.enabled`    | Enable gateway ingress           | `true`                          |
+| `gateway.ingress.className`  | Gateway ingress class            | `traefik-ingress-controller-v3` |
+| `gateway.ingress.hosts`      | Gateway ingress hosts            | `tensorzero-gateway.local`      |
 
 ### UI Configuration
 
-| Parameter               | Description              | Default                         |
-| ----------------------- | ------------------------ | ------------------------------- |
-| `ui.deploy`             | Whether to deploy the UI | `true`                          |
-| `ui.replicaCount`       | Number of UI replicas    | `1`                             |
-| `ui.image.repository`   | UI image repository      | `tensorzero/ui`                 |
-| `ui.image.tag`          | UI image tag             | `latest`                        |
-| `ui.image.pullPolicy`   | UI image pull policy     | `IfNotPresent`                  |
-| `ui.service.type`       | UI service type          | `ClusterIP`                     |
-| `ui.service.port`       | UI service port          | `4000`                          |
-| `ui.resources.limits`   | UI resource limits       | `cpu: 1000m, memory: 1024Mi`    |
-| `ui.resources.requests` | UI resource requests     | `cpu: 500m, memory: 512Mi`      |
-| `ui.ingress.enabled`    | Enable UI ingress        | `true`                          |
-| `ui.ingress.className`  | UI ingress class         | `traefik-ingress-controller-v3` |
-| `ui.ingress.hosts`      | UI ingress hosts         | `tensorzero-ui.local`           |
+| Parameter               | Description                 | Default                         |
+|-------------------------|-----------------------------|---------------------------------|
+| `ui.deploy`             | Whether to deploy the UI    | `true`                          |
+| `ui.replicaCount`       | Number of UI replicas       | `1`                             |
+| `ui.serviceAccountName` | Service account for UI pods | `""`                            |
+| `ui.image.repository`   | UI image repository         | `tensorzero/ui`                 |
+| `ui.image.tag`          | UI image tag                | `latest`                        |
+| `ui.image.pullPolicy`   | UI image pull policy        | `IfNotPresent`                  |
+| `ui.service.type`       | UI service type             | `ClusterIP`                     |
+| `ui.service.port`       | UI service port             | `4000`                          |
+| `ui.resources.limits`   | UI resource limits          | `cpu: 1000m, memory: 1024Mi`    |
+| `ui.resources.requests` | UI resource requests        | `cpu: 500m, memory: 512Mi`      |
+| `ui.ingress.enabled`    | Enable UI ingress           | `true`                          |
+| `ui.ingress.className`  | UI ingress class            | `traefik-ingress-controller-v3` |
+| `ui.ingress.hosts`      | UI ingress hosts            | `tensorzero-ui.local`           |
 
 ### Persistence Configuration
 
@@ -105,6 +108,14 @@ The following table lists the configurable parameters of the chart and their def
 | `persistence.accessModes`    | Access modes               | `["ReadWriteOnce"]`             |
 | `persistence.storageClass`   | Storage class name         | `""`                            |
 | `persistence.mountPath`      | Mount path in containers   | `/app/storage`                  |
+
+### Monitoring Configuration
+
+| Parameter                     | Description                                   | Default |
+|-------------------------------|-----------------------------------------------|---------|
+| `monitoring.metrics.enabled`  | Enable ServiceMonitor creation                | `false` |
+| `monitoring.metrics.interval` | Scrape interval                               | `"30s"` |
+| `monitoring.metrics.labels`   | Additional labels to attach to ServiceMonitor | `{}`    |
 
 ### ClickHouse Configuration
 

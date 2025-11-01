@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http;
+use futures::future::try_join_all;
 use futures::StreamExt;
 use google_cloud_auth::credentials::{CacheableResource, Credentials};
 use http::{HeaderMap, HeaderValue};
@@ -29,7 +30,7 @@ use super::helpers::{
     inject_extra_request_data_and_send, inject_extra_request_data_and_send_eventsource,
 };
 use crate::cache::ModelProviderRequest;
-use crate::config::{
+use crate::config::provider_types::{
     GCPBatchConfigCloudStorage, GCPBatchConfigType, GCPProviderTypeConfig, ProviderTypesConfig,
 };
 use crate::endpoints::inference::InferenceCredentials;
@@ -42,10 +43,9 @@ use crate::inference::types::batch::{
     BatchRequestRow, BatchStatus, PollBatchInferenceResponse, ProviderBatchInferenceOutput,
     ProviderBatchInferenceResponse,
 };
-use crate::inference::types::resolved_input::FileWithPath;
 use crate::inference::types::{
     batch::StartBatchProviderInferenceResponse, serialize_or_log, ModelInferenceRequest,
-    PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
+    ObjectStorageFile, PeekableProviderInferenceResponseStream, ProviderInferenceResponse,
     ProviderInferenceResponseChunk, RequestMessage, Usage,
 };
 use crate::inference::types::{
@@ -55,14 +55,12 @@ use crate::inference::types::{
 };
 use crate::inference::InferenceProvider;
 use crate::model::{
-    build_creds_caching_default_with_fn, fully_qualified_name, Credential, CredentialLocation,
-    ModelProvider,
+    fully_qualified_name, Credential, CredentialLocationWithFallback, ModelProvider,
 };
+use crate::model_table::{GCPVertexGeminiKind, ProviderType, ProviderTypeDefaultCredentials};
 use crate::tool::{Tool, ToolCall, ToolCallChunk, ToolChoice, ToolConfig};
 
-use super::gcp_vertex_anthropic::make_gcp_sdk_credentials;
-use super::helpers::{parse_jsonl_batch_file, JsonlBatchFileInfo};
-use super::openai::convert_stream_error;
+use super::helpers::{convert_stream_error, parse_jsonl_batch_file, JsonlBatchFileInfo};
 
 const PROVIDER_NAME: &str = "GCP Vertex Gemini";
 pub const PROVIDER_TYPE: &str = "gcp_vertex_gemini";
@@ -260,6 +258,21 @@ pub async fn make_gcp_object_store(
                 }));
             }
         }
+        GCPVertexCredentials::WithFallback { default, fallback } => {
+            // Try default first, fall back to fallback if it fails
+            // We need to recursively call this function with each credential
+            match Box::pin(make_gcp_object_store(gs_url, default, dynamic_api_keys)).await {
+                Ok(store) => return Ok(store),
+                Err(_) => {
+                    tracing::info!(
+                        "Default credential for {} is unavailable for GCS, attempting fallback",
+                        PROVIDER_NAME
+                    );
+                    return Box::pin(make_gcp_object_store(gs_url, fallback, dynamic_api_keys))
+                        .await;
+                }
+            }
+        }
         GCPVertexCredentials::None => {
             return Err(Error::new(ErrorDetails::ApiKeyMissing {
                 provider_name: PROVIDER_NAME.to_string(),
@@ -431,24 +444,18 @@ pub fn location_subdomain_prefix(location: &str) -> String {
 }
 
 impl GCPVertexGeminiProvider {
-    pub async fn build_credentials(
-        cred_location: Option<CredentialLocation>,
-    ) -> Result<GCPVertexCredentials, Error> {
-        GCPVertexCredentials::new(
-            cred_location,
-            &DEFAULT_CREDENTIALS,
-            default_api_key_location(),
-            PROVIDER_TYPE,
-        )
-        .await
-    }
     // Constructs a provider from a shorthand string of the form:
     // * 'projects/<project_id>/locations/<location>/publishers/google/models/XXX'
     // * 'projects/<project_id>/locations/<location>/endpoints/XXX'
     //
     // This is *not* a full url - we append ':generateContent' or ':streamGenerateContent' to the end of the path as needed.
-    pub async fn new_shorthand(project_url_path: String) -> Result<Self, Error> {
-        let credentials = Self::build_credentials(None).await?;
+    pub async fn new_shorthand(
+        project_url_path: String,
+        default_credentials: &ProviderTypeDefaultCredentials,
+    ) -> Result<Self, Error> {
+        let credentials = GCPVertexGeminiKind
+            .get_defaulted_credential(None, default_credentials)
+            .await?;
 
         let shorthand_url = parse_shorthand_url(&project_url_path, "google")?;
         let (location, model_id, endpoint_id, model_or_endpoint_id) = match shorthand_url {
@@ -503,12 +510,13 @@ impl GCPVertexGeminiProvider {
         endpoint_id: Option<String>,
         location: String,
         project_id: String,
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
         provider_types: &ProviderTypesConfig,
+        default_credentials: &ProviderTypeDefaultCredentials,
     ) -> Result<Self, Error> {
-        let default_location = default_api_key_location();
-        let cred_location = api_key_location.as_ref().unwrap_or(&default_location);
-        let credentials = Self::build_credentials(Some(cred_location.clone())).await?;
+        let credentials = GCPVertexGeminiKind
+            .get_defaulted_credential(api_key_location.as_ref(), default_credentials)
+            .await?;
 
         let location_prefix = location_subdomain_prefix(&location);
 
@@ -531,10 +539,10 @@ impl GCPVertexGeminiProvider {
         let audience = format!("https://{location_prefix}aiplatform.googleapis.com/");
 
         let batch_config = match &provider_types.gcp_vertex_gemini {
-            Some(GCPProviderTypeConfig { batch: Some(GCPBatchConfigType::CloudStorage(GCPBatchConfigCloudStorage {
+            GCPProviderTypeConfig { batch: Some(GCPBatchConfigType::CloudStorage(GCPBatchConfigCloudStorage {
                 input_uri_prefix,
                 output_uri_prefix,
-            }))}) => {
+            })), .. } => {
                 Some(BatchConfig {
                     input_uri_prefix: input_uri_prefix.clone(),
                     output_uri_prefix: output_uri_prefix.clone(),
@@ -626,10 +634,6 @@ impl GCPVertexGeminiProvider {
     }
 }
 
-pub fn default_api_key_location() -> CredentialLocation {
-    CredentialLocation::PathFromEnv("GCP_VERTEX_CREDENTIALS_PATH".to_string())
-}
-
 #[derive(Clone, Debug)]
 pub enum GCPVertexCredentials {
     Static {
@@ -639,35 +643,15 @@ pub enum GCPVertexCredentials {
     Dynamic(String),
     Sdk(Credentials),
     None,
+    WithFallback {
+        default: Box<GCPVertexCredentials>,
+        fallback: Box<GCPVertexCredentials>,
+    },
 }
 
-impl GCPVertexCredentials {
-    /// Helper method to build credentials for a GCP-based provider
-    /// You should call either `GCPVertexGeminiProvider::build_credentials` or
-    /// `GCPVertexAnthropicProvider::build_credentials` rather than calling this directly.
-    pub async fn new(
-        cred_location: Option<CredentialLocation>,
-        cache: &'static OnceLock<GCPVertexCredentials>,
-        default_location: CredentialLocation,
-        provider_type: &'static str,
-    ) -> Result<Self, Error> {
-        if matches!(cred_location, Some(CredentialLocation::Sdk)) {
-            make_gcp_sdk_credentials(provider_type).await
-        } else {
-            build_creds_caching_default_with_fn(
-                cred_location,
-                default_location,
-                provider_type,
-                cache,
-                |creds| build_non_sdk_credentials(creds, provider_type),
-            )
-        }
-    }
-}
-
-fn build_non_sdk_credentials(
+pub fn build_gcp_non_sdk_credentials(
     credentials: Credential,
-    provider_type: &str,
+    provider_type: &ProviderType,
 ) -> Result<GCPVertexCredentials, Error> {
     match credentials {
         Credential::FileContents(file_content) => Ok(GCPVertexCredentials::Static {
@@ -681,6 +665,10 @@ fn build_non_sdk_credentials(
         }),
         Credential::Dynamic(key_name) => Ok(GCPVertexCredentials::Dynamic(key_name)),
         Credential::Missing => Ok(GCPVertexCredentials::None),
+        Credential::WithFallback { default, fallback } => Ok(GCPVertexCredentials::WithFallback {
+            default: Box::new(build_gcp_non_sdk_credentials(*default, provider_type)?),
+            fallback: Box::new(build_gcp_non_sdk_credentials(*fallback, provider_type)?),
+        }),
         _ => Err(Error::new(ErrorDetails::GCPCredentials {
             message: format!("Invalid credential_location for {provider_type} provider"),
         }))?,
@@ -851,6 +839,20 @@ impl GCPVertexCredentials {
                     }
                 }
             }
+            GCPVertexCredentials::WithFallback { default, fallback } => {
+                // Try default first, fall back to fallback if it fails
+                match Box::pin(default.get_auth_headers(audience, dynamic_api_keys)).await {
+                    Ok(headers) => return Ok(headers),
+                    Err(_) => {
+                        tracing::info!(
+                            "Default credential for {} is unavailable, attempting fallback",
+                            PROVIDER_NAME
+                        );
+                        return Box::pin(fallback.get_auth_headers(audience, dynamic_api_keys))
+                            .await;
+                    }
+                }
+            }
             GCPVertexCredentials::None => {
                 return Err(Error::new(ErrorDetails::ApiKeyMissing {
                     provider_name: PROVIDER_NAME.to_string(),
@@ -1009,11 +1011,14 @@ impl InferenceProvider for GCPVertexGeminiProvider {
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<ProviderInferenceResponse, Error> {
-        let request_body = serde_json::to_value(GCPVertexGeminiRequest::new(
-            provider_request.request,
-            self.model_or_endpoint_id(),
-            false,
-        )?)
+        let request_body = serde_json::to_value(
+            GCPVertexGeminiRequest::new(
+                provider_request.request,
+                self.model_or_endpoint_id(),
+                false,
+            )
+            .await?,
+        )
         .map_err(|e| {
             Error::new(ErrorDetails::Serialization {
                 message: format!(
@@ -1109,16 +1114,15 @@ impl InferenceProvider for GCPVertexGeminiProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
         model_provider: &'a ModelProvider,
     ) -> Result<(PeekableProviderInferenceResponseStream, String), Error> {
-        let request_body = serde_json::to_value(GCPVertexGeminiRequest::new(
-            request,
-            self.model_or_endpoint_id(),
-            false,
-        )?)
+        let request_body = serde_json::to_value(
+            GCPVertexGeminiRequest::new(request, self.model_or_endpoint_id(), false).await?,
+        )
         .map_err(|e| {
             Error::new(ErrorDetails::Serialization {
                 message: format!(
@@ -1179,7 +1183,8 @@ impl InferenceProvider for GCPVertexGeminiProvider {
         let mut raw_requests = Vec::with_capacity(requests.len());
         let mut jsonl_data = Vec::new();
         for request in requests {
-            let body = GCPVertexGeminiRequest::new(request, self.model_or_endpoint_id(), true)?;
+            let body =
+                GCPVertexGeminiRequest::new(request, self.model_or_endpoint_id(), true).await?;
             let line =
                 serde_json::to_string(&GCPVertexBatchLine { request: body }).map_err(|e| {
                     Error::new(ErrorDetails::Serialization {
@@ -1583,15 +1588,14 @@ pub struct GCPVertexGeminiContent<'a> {
     parts: Vec<FlattenUnknown<'a, GCPVertexGeminiContentPart<'a>>>,
 }
 
-impl<'a> TryFrom<&'a RequestMessage> for GCPVertexGeminiContent<'a> {
-    type Error = Error;
-
-    fn try_from(message: &'a RequestMessage) -> Result<Self, Error> {
+impl<'a> GCPVertexGeminiContent<'a> {
+    async fn from_request_message(message: &'a RequestMessage) -> Result<Self, Error> {
         tensorzero_to_gcp_vertex_gemini_content(
             message.role.into(),
             Cow::Borrowed(&message.content),
             PROVIDER_TYPE,
         )
+        .await
     }
 }
 
@@ -1804,7 +1808,7 @@ struct GCPVertexGeminiRequest<'a> {
 }
 
 impl<'a> GCPVertexGeminiRequest<'a> {
-    pub fn new(
+    pub async fn new(
         request: &'a ModelInferenceRequest<'a>,
         model_name: &'a str,
         attach_label: bool,
@@ -1822,12 +1826,16 @@ impl<'a> GCPVertexGeminiRequest<'a> {
                 .map(|system_instruction| GCPVertexGeminiContentPart::Text {
                     text: Cow::Borrowed(system_instruction),
                 });
-        let contents: Vec<GCPVertexGeminiContent> = request
-            .messages
-            .iter()
-            .map(GCPVertexGeminiContent::try_from)
-            .filter_ok(|m| !m.parts.is_empty())
-            .collect::<Result<_, _>>()?;
+        let contents: Vec<GCPVertexGeminiContent> = try_join_all(
+            request
+                .messages
+                .iter()
+                .map(GCPVertexGeminiContent::from_request_message),
+        )
+        .await?
+        .into_iter()
+        .filter(|m| !m.parts.is_empty())
+        .collect();
         let (tools, tool_config) = prepare_tools(request, model_name);
         let (response_mime_type, response_schema) = match request.json_mode {
             ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
@@ -1878,18 +1886,17 @@ impl<'a> GCPVertexGeminiRequest<'a> {
     }
 }
 
-pub fn prepare_gcp_vertex_gemini_messages<'a>(
+// Clippy gives a false positive on Rust 1.86
+#[allow(clippy::needless_lifetimes, clippy::allow_attributes)]
+pub async fn prepare_gcp_vertex_gemini_messages<'a>(
     messages: &'a [RequestMessage],
-    provider_type: &str,
 ) -> Result<Vec<GCPVertexGeminiContent<'a>>, Error> {
-    let mut gcp_vertex_gemini_messages = Vec::with_capacity(messages.len());
-    for message in messages {
-        gcp_vertex_gemini_messages.push(tensorzero_to_gcp_vertex_gemini_content(
-            message.role.into(),
-            Cow::Borrowed(&message.content),
-            provider_type,
-        )?);
-    }
+    let gcp_vertex_gemini_messages = try_join_all(
+        messages
+            .iter()
+            .map(GCPVertexGeminiContent::from_request_message),
+    )
+    .await?;
     Ok(gcp_vertex_gemini_messages)
 }
 
@@ -1902,10 +1909,15 @@ fn prepare_tools<'a>(
 ) {
     match &request.tool_config {
         Some(tool_config) => {
-            if tool_config.tools_available.is_empty() {
+            if !tool_config.any_tools_available() {
                 return (None, None);
             }
-            let tools = Some(vec![(&tool_config.tools_available).into()]);
+            let tools = Some(vec![GCPVertexGeminiTool::FunctionDeclarations(
+                tool_config
+                    .tools_available()
+                    .map(GCPVertexGeminiFunctionDeclaration::from)
+                    .collect(),
+            )]);
             let tool_config = Some((&tool_config.tool_choice, model_name).into());
             (tools, tool_config)
         }
@@ -1913,7 +1925,7 @@ fn prepare_tools<'a>(
     }
 }
 
-pub fn tensorzero_to_gcp_vertex_gemini_content<'a>(
+pub async fn tensorzero_to_gcp_vertex_gemini_content<'a>(
     role: GCPVertexGeminiRole,
     content_blocks: Cow<'a, [ContentBlock]>,
     provider_type: &str,
@@ -2042,31 +2054,27 @@ pub fn tensorzero_to_gcp_vertex_gemini_content<'a>(
                 ));
             }
             Cow::Borrowed(ContentBlock::File(file)) => {
-                let FileWithPath {
-                    file,
-                    storage_path: _,
-                } = &**file;
+                let resolved_file = file.resolve().await?;
+                let ObjectStorageFile { file, data } = &*resolved_file;
 
                 model_content_blocks.push(FlattenUnknown::Normal(
                     GCPVertexGeminiContentPart::InlineData {
                         inline_data: GCPVertexInlineData {
                             mime_type: file.mime_type.to_string(),
-                            data: Cow::Borrowed(file.data()?),
+                            data: Cow::Owned(data.to_string()),
                         },
                     },
                 ));
             }
             Cow::Owned(ContentBlock::File(file)) => {
-                let FileWithPath {
-                    file,
-                    storage_path: _,
-                } = &*file;
+                let resolved_file = file.resolve().await?;
+                let ObjectStorageFile { file, data } = &*resolved_file;
 
                 model_content_blocks.push(FlattenUnknown::Normal(
                     GCPVertexGeminiContentPart::InlineData {
                         inline_data: GCPVertexInlineData {
                             mime_type: file.mime_type.to_string(),
-                            data: Cow::Owned(file.data()?.to_string()), // Convert to owned String
+                            data: Cow::Owned(data.to_string()), // Convert to owned String
                         },
                     },
                 ));
@@ -2166,6 +2174,8 @@ fn content_part_to_tensorzero_chunk(
                 return Ok(Some(ContentBlockChunk::Thought(ThoughtChunk {
                     id: "0".to_string(),
                     text: Some(text),
+                    summary_id: None,
+                    summary_text: None,
                     signature: part.thought_signature,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 })));
@@ -2177,6 +2187,8 @@ fn content_part_to_tensorzero_chunk(
                 return Ok(Some(ContentBlockChunk::Thought(ThoughtChunk {
                     id: "0".to_string(),
                     text: None,
+                    summary_id: None,
+                    summary_text: None,
                     signature: part.thought_signature,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 })));
@@ -2241,11 +2253,10 @@ fn content_part_to_tensorzero_chunk(
                 warn_discarded_unknown_chunk(PROVIDER_TYPE, &part.to_string());
                 return Ok(None);
             }
-            Err(Error::new(ErrorDetails::InferenceServer {
-                message: "Unknown content part in GCP Vertex Gemini response".to_string(),
-                provider_type: PROVIDER_TYPE.to_string(),
-                raw_request: None,
-                raw_response: Some(part.to_string()),
+            Ok(Some(ContentBlockChunk::Unknown {
+                id: "0".to_string(),
+                data: part.into_owned(),
+                provider_type: Some(PROVIDER_TYPE.to_string()),
             }))
         }
     }
@@ -2264,6 +2275,7 @@ fn convert_to_output(
                 return Ok(ContentBlockOutput::Thought(Thought {
                     signature: part.thought_signature,
                     text: Some(text),
+                    summary: None,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 }));
             }
@@ -2274,6 +2286,7 @@ fn convert_to_output(
                 return Ok(ContentBlockOutput::Thought(Thought {
                     signature: part.thought_signature,
                     text: None,
+                    summary: None,
                     provider_type: Some(PROVIDER_TYPE.to_string()),
                 }));
             }
@@ -2586,13 +2599,15 @@ mod tests {
     use crate::providers::test_helpers::{MULTI_TOOL_CONFIG, QUERY_TOOL, WEATHER_TOOL};
     use crate::tool::{ToolCallConfig, ToolResult};
 
-    #[test]
-    fn test_gcp_vertex_content_try_from() {
+    #[tokio::test]
+    async fn test_gcp_vertex_content_try_from() {
         let message = RequestMessage {
             role: Role::User,
             content: vec!["Hello, world!".to_string().into()],
         };
-        let content = GCPVertexGeminiContent::try_from(&message).unwrap();
+        let content = GCPVertexGeminiContent::from_request_message(&message)
+            .await
+            .unwrap();
         assert_eq!(content.role, GCPVertexGeminiRole::User);
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
@@ -2606,7 +2621,9 @@ mod tests {
             role: Role::Assistant,
             content: vec!["Hello, world!".to_string().into()],
         };
-        let content = GCPVertexGeminiContent::try_from(&message).unwrap();
+        let content = GCPVertexGeminiContent::from_request_message(&message)
+            .await
+            .unwrap();
         assert_eq!(content.role, GCPVertexGeminiRole::Model);
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
@@ -2626,7 +2643,10 @@ mod tests {
                 }),
             ],
         };
-        let content = GCPVertexGeminiContent::try_from(&message).unwrap();
+        let content = GCPVertexGeminiContent::from_request_message(&message)
+            .await
+            .unwrap();
+
         assert_eq!(content.role, GCPVertexGeminiRole::Model);
         assert_eq!(content.parts.len(), 2);
         assert_eq!(
@@ -2653,7 +2673,9 @@ mod tests {
                 result: r#"{"temperature": 25, "conditions": "sunny"}"#.to_string(),
             })],
         };
-        let content = GCPVertexGeminiContent::try_from(&message).unwrap();
+        let content = GCPVertexGeminiContent::from_request_message(&message)
+            .await
+            .unwrap();
         assert_eq!(content.role, GCPVertexGeminiRole::User);
         assert_eq!(content.parts.len(), 1);
         assert_eq!(
@@ -2672,19 +2694,21 @@ mod tests {
 
     #[test]
     fn test_from_vec_tool() {
-        let tool = GCPVertexGeminiTool::from(&MULTI_TOOL_CONFIG.tools_available);
+        let tools_vec: Vec<&ToolConfig> = MULTI_TOOL_CONFIG.tools_available().collect();
+        let tools_vec_owned: Vec<ToolConfig> = tools_vec.iter().map(|&t| t.clone()).collect();
+        let tool = GCPVertexGeminiTool::from(&tools_vec_owned);
         assert_eq!(
             tool,
             GCPVertexGeminiTool::FunctionDeclarations(vec![
                 GCPVertexGeminiFunctionDeclaration {
                     name: "get_temperature",
                     description: Some("Get the current temperature in a given location"),
-                    parameters: Some(MULTI_TOOL_CONFIG.tools_available[0].parameters().clone()),
+                    parameters: Some(tools_vec[0].parameters().clone()),
                 },
                 GCPVertexGeminiFunctionDeclaration {
                     name: "query_articles",
                     description: Some("Query articles from Wikipedia"),
-                    parameters: Some(MULTI_TOOL_CONFIG.tools_available[1].parameters().clone()),
+                    parameters: Some(tools_vec[1].parameters().clone()),
                 }
             ])
         );
@@ -2744,14 +2768,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_gcp_vertex_request_try_from() {
+    #[tokio::test]
+    async fn test_gcp_vertex_request_try_from() {
         // Test Case 1: Empty message list
-        let tool_config = ToolCallConfig {
-            tools_available: vec![],
-            tool_choice: ToolChoice::None,
-            parallel_tool_calls: None,
-        };
+        let tool_config = ToolCallConfig::default();
         let inference_request = ModelInferenceRequest {
             inference_id: Uuid::now_v7(),
             messages: vec![],
@@ -2770,7 +2790,7 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let result = GCPVertexGeminiRequest::new(&inference_request, "gemini-pro", false);
+        let result = GCPVertexGeminiRequest::new(&inference_request, "gemini-pro", false).await;
         let error = result.unwrap_err();
         let details = error.get_details();
         assert_eq!(
@@ -2809,7 +2829,7 @@ mod tests {
             extra_body: Default::default(),
             ..Default::default()
         };
-        let result = GCPVertexGeminiRequest::new(&inference_request, "gemini-pro", false);
+        let result = GCPVertexGeminiRequest::new(&inference_request, "gemini-pro", false).await;
         let request = result.unwrap();
         assert_eq!(request.contents.len(), 2);
         assert_eq!(request.contents[0].role, GCPVertexGeminiRole::User);
@@ -2864,7 +2884,8 @@ mod tests {
         };
         // JSON schema should be supported for Gemini Pro models
         let result =
-            GCPVertexGeminiRequest::new(&inference_request, "gemini-2.5-pro-preview-06-05", false);
+            GCPVertexGeminiRequest::new(&inference_request, "gemini-2.5-pro-preview-06-05", false)
+                .await;
         let request = result.unwrap();
         assert_eq!(request.contents.len(), 3);
         assert_eq!(request.contents[0].role, GCPVertexGeminiRole::User);
@@ -2936,7 +2957,7 @@ mod tests {
             ..Default::default()
         };
         // JSON mode should be supported for Gemini Flash models but without a schema
-        let result = GCPVertexGeminiRequest::new(&inference_request, "gemini-flash", false);
+        let result = GCPVertexGeminiRequest::new(&inference_request, "gemini-flash", false).await;
         let request = result.unwrap();
         assert_eq!(request.contents.len(), 3);
         assert_eq!(request.contents[0].role, GCPVertexGeminiRole::User);
@@ -3417,8 +3438,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_tensorzero_to_gcp_vertex_gemini_content() {
+    #[tokio::test]
+    async fn test_tensorzero_to_gcp_vertex_gemini_content() {
         // Test user message with text
         let content_blocks = vec!["Hello".to_string().into()];
         let gcp_content = tensorzero_to_gcp_vertex_gemini_content(
@@ -3426,6 +3447,7 @@ mod tests {
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
         )
+        .await
         .unwrap();
         assert_eq!(gcp_content.role, GCPVertexGeminiRole::User);
         assert_eq!(gcp_content.parts.len(), 1);
@@ -3446,6 +3468,7 @@ mod tests {
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
         )
+        .await
         .unwrap();
         assert_eq!(gcp_content.role, GCPVertexGeminiRole::User);
         assert_eq!(gcp_content.parts.len(), 2);
@@ -3474,6 +3497,7 @@ mod tests {
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
         )
+        .await
         .unwrap();
         assert_eq!(gcp_content.role, GCPVertexGeminiRole::Model);
         assert_eq!(gcp_content.parts.len(), 2);
@@ -3503,6 +3527,7 @@ mod tests {
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
         )
+        .await
         .unwrap();
         assert_eq!(gcp_content.role, GCPVertexGeminiRole::User);
         assert_eq!(gcp_content.parts.len(), 1);
@@ -3534,6 +3559,7 @@ mod tests {
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
         )
+        .await
         .unwrap();
         assert_eq!(gcp_content.role, GCPVertexGeminiRole::Model);
         assert_eq!(gcp_content.parts.len(), 1);
@@ -3556,7 +3582,8 @@ mod tests {
             GCPVertexGeminiRole::Model,
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
-        );
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let details = err.get_details();
@@ -3578,7 +3605,8 @@ mod tests {
             GCPVertexGeminiRole::Model,
             Cow::Borrowed(&content_blocks),
             PROVIDER_TYPE,
-        );
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let details = err.get_details();
@@ -3596,6 +3624,7 @@ mod tests {
             Cow::Owned(content_blocks),
             PROVIDER_TYPE,
         )
+        .await
         .unwrap();
         assert_eq!(gcp_content.role, GCPVertexGeminiRole::User);
         assert_eq!(gcp_content.parts.len(), 1);
@@ -3762,23 +3791,23 @@ mod tests {
             "universe_domain": "googleapis.com"
         }"#;
         let generic = Credential::FileContents(SecretString::from(json_content));
-        let creds = build_non_sdk_credentials(generic, "GCPVertexGemini").unwrap();
+        let creds = build_gcp_non_sdk_credentials(generic, &ProviderType::GCPVertexGemini).unwrap();
         assert!(matches!(creds, GCPVertexCredentials::Static { .. }));
 
         // Test Dynamic credential
         let generic = Credential::Dynamic("key_name".to_string());
-        let creds = build_non_sdk_credentials(generic, "GCPVertexGemini").unwrap();
+        let creds = build_gcp_non_sdk_credentials(generic, &ProviderType::GCPVertexGemini).unwrap();
         assert!(matches!(creds, GCPVertexCredentials::Dynamic(_)));
 
         // Test Missing credential
         let generic = Credential::Missing;
-        let creds = build_non_sdk_credentials(generic, "GCPVertexGemini").unwrap();
+        let creds = build_gcp_non_sdk_credentials(generic, &ProviderType::GCPVertexGemini).unwrap();
         assert!(matches!(creds, GCPVertexCredentials::None));
 
         // Test invalid JSON content
         let invalid_json = "invalid json";
         let generic = Credential::FileContents(SecretString::from(invalid_json));
-        let result = build_non_sdk_credentials(generic, "GCPVertexGemini");
+        let result = build_gcp_non_sdk_credentials(generic, &ProviderType::GCPVertexGemini);
         assert!(result.is_err());
         let error = result.unwrap_err();
         let err = error.get_details();
@@ -3788,7 +3817,7 @@ mod tests {
 
         // Test invalid credential type (Static)
         let generic = Credential::Static(SecretString::from("test"));
-        let result = build_non_sdk_credentials(generic, "GCPVertexGemini");
+        let result = build_gcp_non_sdk_credentials(generic, &ProviderType::GCPVertexGemini);
         assert!(result.is_err());
         let error = result.unwrap_err();
         let err = error.get_details();
@@ -3797,8 +3826,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_shorthand_url_parse() {
+    #[tokio::test]
+    async fn test_shorthand_url_parse() {
         use super::parse_shorthand_url;
 
         let err1 = parse_shorthand_url("bad-shorthand-url", "google")
@@ -3841,10 +3870,10 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_unknown_content_block_error() {
+    fn test_convert_unknown_content_block_returns_chunk() {
         use std::time::Duration;
 
-        // Test with text content
+        // Test with unknown content part
         let text_part = GCPVertexGeminiResponseContentPart {
             thought: false,
             thought_signature: None,
@@ -3868,7 +3897,7 @@ mod tests {
         let mut last_tool_name = None;
 
         let mut last_tool_idx = None;
-        let err = convert_stream_response_with_metadata_to_chunk(
+        let result = convert_stream_response_with_metadata_to_chunk(
             "raw_response".to_string(),
             response,
             latency,
@@ -3876,16 +3905,25 @@ mod tests {
             &mut last_tool_idx,
             false,
         )
-        .unwrap_err();
-        assert_eq!(
-            *err.get_details(),
-            ErrorDetails::InferenceServer {
-                message: "Unknown content part in GCP Vertex Gemini response".to_string(),
-                provider_type: "gcp_vertex_gemini".to_string(),
-                raw_request: None,
-                raw_response: Some(json!({"unknown_field": "unknown_value"}).to_string()),
+        .unwrap();
+
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            ContentBlockChunk::Unknown { id, data, .. } => {
+                assert_eq!(id, "0");
+                assert_eq!(
+                    data.get("unknown_field").and_then(|v| v.as_str()),
+                    Some("unknown_value")
+                );
             }
-        );
+            _ => panic!("Expected Unknown chunk"),
+        };
+
+        // Check that usage was captured
+        assert!(result.usage.is_some());
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
     }
 
     #[test]
@@ -4508,7 +4546,7 @@ mod tests {
             _ => panic!("Expected InferenceServer error"),
         }
 
-        // Test unknown content part (should return error)
+        // Test unknown content part (should return Unknown chunk)
         let unknown_part = GCPVertexGeminiResponseContentPart {
             thought: false,
             thought_signature: None,
@@ -4523,17 +4561,17 @@ mod tests {
             &mut last_tool_idx,
             false,
         );
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        let details = error.get_details();
-        match details {
-            ErrorDetails::InferenceServer { message, .. } => {
+        assert!(result.is_ok());
+        let chunk = result.unwrap();
+        match chunk {
+            Some(ContentBlockChunk::Unknown { id, data, .. }) => {
+                assert_eq!(id, "0");
                 assert_eq!(
-                    message,
-                    "Unknown content part in GCP Vertex Gemini response"
+                    data.get("unknown_field").and_then(|v| v.as_str()),
+                    Some("unknown_value")
                 );
             }
-            _ => panic!("Expected InferenceServer error"),
+            _ => panic!("Expected Unknown chunk"),
         }
         // Verify tool call tracking state - should remain None for error cases
         assert_eq!(last_tool_idx, None);

@@ -19,8 +19,16 @@ mimalloc = "0.1.48"
 clap = { workspace = true }
 serde = { workspace = true }
 tracing-opentelemetry-instrumentation-sdk = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["metrics"] }
 tokio-util = "0.7.15"
+metrics-exporter-prometheus = { workspace = true }
+http = { workspace = true }
+pin-project = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+tensorzero-auth = { path = "../internal/tensorzero-auth" }
+sqlx_alpha = { package = "sqlx", version = "0.9.0-alpha.1", features = ["postgres", "runtime-tokio"] }
+secrecy = { workspace = true }
 
 [lints]
 workspace = true
@@ -32,5 +40,9 @@ default = []
 [dev-dependencies]
 reqwest.workspace = true
 tempfile = "3.21.0"
-tensorzero = { path = "../clients/rust" }
+tensorzero = { path = "../clients/rust", features = ["e2e_tests"] }
 tracing-test = "0.2"
+serde_json = { workspace = true }
+reqwest-eventsource = { workspace = true }
+futures = { workspace = true }
+secrecy = { workspace = true }

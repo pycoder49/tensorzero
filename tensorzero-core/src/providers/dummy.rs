@@ -30,8 +30,10 @@ use crate::inference::types::{
 };
 use crate::inference::types::{ContentBlock, FinishReason, ProviderInferenceResponseStreamInner};
 use crate::inference::types::{Text, TextChunk, Thought, ThoughtChunk};
-use crate::model::{CredentialLocation, ModelProvider};
+use crate::model::{CredentialLocation, CredentialLocationWithFallback, ModelProvider};
 use crate::providers::helpers::inject_extra_request_data;
+use crate::rate_limiting::ActiveRateLimitKey;
+use crate::rate_limiting::FailedRateLimit;
 use crate::tool::{ToolCall, ToolCallChunk};
 
 const PROVIDER_NAME: &str = "Dummy";
@@ -49,9 +51,11 @@ pub struct DummyProvider {
 impl DummyProvider {
     pub fn new(
         model_name: String,
-        api_key_location: Option<CredentialLocation>,
+        api_key_location: Option<CredentialLocationWithFallback>,
     ) -> Result<Self, Error> {
-        let api_key_location = api_key_location.unwrap_or_else(default_api_key_location);
+        let api_key_location = api_key_location
+            .map(|loc| loc.default_location().clone())
+            .unwrap_or_else(default_api_key_location);
         match api_key_location {
             CredentialLocation::Dynamic(key_name) => Ok(DummyProvider {
                 model_name,
@@ -85,6 +89,10 @@ impl DummyProvider {
                 input_tokens: 0,
                 output_tokens: 0,
             },
+            "input_five_output_six" => Usage {
+                input_tokens: 5,
+                output_tokens: 6,
+            },
             _ => Usage {
                 input_tokens: 10,
                 output_tokens,
@@ -101,6 +109,8 @@ impl DummyProvider {
             ContentBlockChunk::Thought(ThoughtChunk {
                 text: Some(chunk.to_string()),
                 signature: None,
+                summary_id: None,
+                summary_text: None,
                 id: "0".to_string(),
                 provider_type: None,
             })
@@ -247,6 +257,7 @@ impl InferenceProvider for DummyProvider {
             request,
             provider_name: _,
             model_name,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         _http_client: &'a TensorzeroHttpClient,
         dynamic_api_keys: &'a InferenceCredentials,
@@ -269,6 +280,16 @@ impl InferenceProvider for DummyProvider {
 
             // Fail on even-numbered calls
             if *counter % 2 == 0 {
+                if self.model_name.contains("rate_limit") {
+                    return Err(ErrorDetails::RateLimitExceeded {
+                        failed_rate_limits: vec![FailedRateLimit {
+                            key: ActiveRateLimitKey(String::from("key")),
+                            requested: 100,
+                            available: 0,
+                        }],
+                    }
+                    .into());
+                }
                 return Err(ErrorDetails::InferenceClient {
                     raw_request: Some("raw request".to_string()),
                     raw_response: None,
@@ -350,6 +371,7 @@ impl InferenceProvider for DummyProvider {
                 ContentBlockOutput::Thought(Thought {
                     text: Some("hmmm".to_string()),
                     signature: None,
+                    summary: None,
                     provider_type: None,
                 }),
                 ContentBlockOutput::Text(Text {
@@ -360,6 +382,7 @@ impl InferenceProvider for DummyProvider {
                 ContentBlockOutput::Thought(Thought {
                     text: Some("hmmm".to_string()),
                     signature: Some("my_signature".to_string()),
+                    summary: None,
                     provider_type: None,
                 }),
                 ContentBlockOutput::Text(Text {
@@ -370,6 +393,7 @@ impl InferenceProvider for DummyProvider {
                 ContentBlockOutput::Thought(Thought {
                     text: Some("hmmm".to_string()),
                     signature: None,
+                    summary: None,
                     provider_type: None,
                 }),
                 ContentBlockOutput::Text(Text {
@@ -482,7 +506,8 @@ impl InferenceProvider for DummyProvider {
                     .collect();
                 let mut found_pdf = false;
                 for file in &files {
-                    if file.file.mime_type == mime::APPLICATION_PDF {
+                    let resolved_file = file.resolve().await?;
+                    if resolved_file.file.mime_type == mime::APPLICATION_PDF {
                         found_pdf = true;
                     }
                 }
@@ -566,6 +591,7 @@ impl InferenceProvider for DummyProvider {
             request: _,
             provider_name: _,
             model_name: _,
+            otlp_config: _,
         }: ModelProviderRequest<'a>,
         _http_client: &'a TensorzeroHttpClient,
         _dynamic_api_keys: &'a InferenceCredentials,
@@ -637,6 +663,7 @@ impl InferenceProvider for DummyProvider {
         }
 
         let err_in_stream = self.model_name == "err_in_stream";
+        let fatal_stream_error = self.model_name == "fatal_stream_error";
 
         let created = current_timestamp();
 
@@ -654,55 +681,68 @@ impl InferenceProvider for DummyProvider {
         };
         let split_tool_name = self.model_name == "tool_split_name";
         let slow_second_chunk = self.model_name == "slow_second_chunk";
-        let stream: ProviderInferenceResponseStreamInner = Box::pin(
-            tokio_stream::iter(content_chunks.into_iter().enumerate())
-                .then(move |(i, chunk)| async move {
-                    if slow_second_chunk && i == 1 {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                    if err_in_stream && i == 3 {
-                        return Err(Error::new(ErrorDetails::InferenceClient {
-                            message: "Dummy error in stream".to_string(),
-                            raw_request: Some("raw request".to_string()),
-                            raw_response: None,
-                            status_code: None,
-                            provider_type: PROVIDER_TYPE.to_string(),
-                        }));
-                    }
-                    // We want to simulate the tool name being in the first chunk, but not in the subsequent chunks.
-                    let tool_name = if i == 0 && !split_tool_name {
-                        Some("get_temperature".to_string())
-                    } else if split_tool_name {
-                        if i == 0 {
-                            Some("get_temp".to_string())
-                        } else if i == 1 {
-                            Some("erature".to_string())
-                        } else {
-                            None
-                        }
+        let stream = async_stream::stream! {
+            for (i, chunk) in content_chunks.into_iter().enumerate() {
+                if slow_second_chunk && i == 1 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                if fatal_stream_error && i == 2 {
+                    yield Err(Error::new(ErrorDetails::FatalStreamError {
+                        message: "Dummy fatal error".to_string(),
+                        provider_type: PROVIDER_TYPE.to_string(),
+                        raw_request: Some("raw request".to_string()),
+                        raw_response: None,
+                    }));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                if err_in_stream && i == 3 {
+                    yield Err(Error::new(ErrorDetails::InferenceClient {
+                        message: "Dummy error in stream".to_string(),
+                        raw_request: Some("raw request".to_string()),
+                        raw_response: None,
+                        status_code: None,
+                        provider_type: PROVIDER_TYPE.to_string(),
+                    }));
+                    continue;
+                }
+                // We want to simulate the tool name being in the first chunk, but not in the subsequent chunks.
+                let tool_name = if i == 0 && !split_tool_name {
+                    Some("get_temperature".to_string())
+                } else if split_tool_name {
+                    if i == 0 {
+                        Some("get_temp".to_string())
+                    } else if i == 1 {
+                        Some("erature".to_string())
                     } else {
                         None
-                    };
-                    Ok(ProviderInferenceResponseChunk {
-                        created,
-                        content: vec![if is_tool_call {
-                            ContentBlockChunk::ToolCall(ToolCallChunk {
-                                id: "0".to_string(),
-                                raw_name: tool_name,
-                                raw_arguments: chunk.to_string(),
-                            })
-                        } else {
-                            ContentBlockChunk::Text(crate::inference::types::TextChunk {
-                                text: chunk.to_string(),
-                                id: "0".to_string(),
-                            })
-                        }],
-                        usage: None,
-                        finish_reason: None,
-                        raw_response: chunk.to_string(),
-                        latency: Duration::from_millis(50 + 10 * (i as u64 + 1)),
-                    })
-                })
+                    }
+                } else {
+                    None
+                };
+                yield Ok(ProviderInferenceResponseChunk {
+                    created,
+                    content: vec![if is_tool_call {
+                        ContentBlockChunk::ToolCall(ToolCallChunk {
+                            id: "0".to_string(),
+                            raw_name: tool_name,
+                            raw_arguments: chunk.to_string(),
+                        })
+                    } else {
+                        ContentBlockChunk::Text(TextChunk {
+                            text: chunk.to_string(),
+                            id: "0".to_string(),
+                        })
+                    }],
+                    usage: None,
+                    finish_reason: None,
+                    raw_response: chunk.to_string(),
+                    latency: Duration::from_millis(50 + 10 * (i as u64 + 1)),
+                });
+            }
+        };
+        let stream: ProviderInferenceResponseStreamInner = Box::pin(
+            stream
                 .chain(tokio_stream::once(Ok(ProviderInferenceResponseChunk {
                     created,
                     content: vec![],
